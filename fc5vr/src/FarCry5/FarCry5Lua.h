@@ -21,6 +21,13 @@ namespace fc5::lua
     uint64_t    selected_throwable();
     // gamedraw, gameholster (tests): the game's own weapon change at the next game update: this item drawn, or the weapon put away.
     void        game_draw(uint64_t item, bool holster);
+    // slotcarried (FarCry5Lua.cpp): these items (at most 8; 0 ends the list; n 0 stops asking) asked every 150 ms on the script thread: does the player still
+    // carry each (the inventory's own lookup, as CheckPawnWeaponInventoryByDescriptorId). item_carried: 1 carried, 0 not, -1 unknown (not watched, not asked
+    // yet, the answer over 1 s old, unexpected code or a fault).
+    void        carried_watch(const uint64_t* items, int n);
+    // weaponcache (FarCry5Holster.cpp): the same for the sling's and hip's weapons kept from the last start (at most 4), asked beside the slots' items.
+    void        carried_watch_kept(const uint64_t* items, int n);
+    int         item_carried(uint64_t item);
     // spawncommand (FarCry5Spawn.cpp): at the next game update. item: added to the player's inventory and drawn, the held weapon dropped as its world entity; archetype: that entity on the ground. (fx, fy): ahead of the player.
     // The ground entity is turned to (fx, fy) plus yaw_add degrees (spawnfacing, spawnyaw); a dropped weapon is not turned.
     void        spawn_request(uint64_t item, uint64_t archetype, float fx, float fy, float yaw_add = 0.0f);
@@ -32,6 +39,9 @@ namespace fc5::lua
     uint64_t    spawned_vehicle_archetype(uint64_t id);
     // reloadnogame (FarCry5Reload.cpp): the held weapon's clip filled at the next script update, with no reload of the game's: its reserve goes down by what went in.
     void        clip_fill_request();
+    // reloadfullmag (FarCry5Reload.cpp): the weapon object in hand at the latest ammo read (inventory vtable +0x308), 0 with none or no
+    // answer in the last second. Only its address: read through FarCry5SwitchSpeed.cpp's checked reads, never dereferenced here.
+    uint64_t    weapon_object();
     void        reserve_take_request(int n);   // n rounds out of the weapon in hand's reserve (on the script thread, as RemoveItem does it)
     bool        clip_fill_failed();   // the game's calls did not fill the clip (this session): the manual reload taps the game's reload as before
     bool        clip_fill_short();    // this fill not made (fewer rounds left than the clip lacks, or no answer): this one reload is the game's, whose count is exact. Read once
@@ -64,6 +74,10 @@ namespace fc5::lua
     // pawn_down: -1 unknown (off, failed, no answer in the last second), 0, 1. down_failed: a fault or unexpected code (off for the session).
     void        down_query(bool on);
     int         pawn_down();
+    // qtehud: on: the game's IsInQTE asked for the player in the same poll. pawn_qte: -1 unknown (off, failed, no answer in the last
+    // second), 0, 1 (a struggle, a takedown or any other quick-time event).
+    void        qte_query(bool on);
+    int         pawn_qte();
     bool        down_failed();
     // GetPawnStance for the player while vehscript asks (same poll): 0 standing, 1 crouched, 4 downed, 18 seated in a vehicle; -1 unknown.
     int         pawn_stance();

@@ -244,6 +244,15 @@ void frame(const Steps& s)
         if ((done & (1 << i)) && !(r_done_was & (1 << i))) r_done_at[i] = t;
     r_done_was = done;
     g_done     = done;
+    // weaponcache (FarCry5Holster.cpp, 7 Nov): with the weapon in hand and the sidearm copied at an earlier start, nothing may be left to do: the
+    // waiting popup is dropped and the controllers given back at once (0.5 s into 3D, so loadslot has said whether it will take the slot).
+    if (!g_shown.load() && r_armed && s.allowed && done == kAll && (s.weapon_recorded || bare) && secs(now - r_3d_t0) >= 0.5f) {
+        spdlog::info("[LoadPopup] {}: nothing left to do {:.1f} s into 3D (weapon in hand {}, sidearm {}): no popup, controller input sent", r_armed == 1 ? "first play" : "back in play somewhere else",
+                     secs(now - r_3d_t0), s.weapon_recorded ? "copied" : "none", s.side_recorded ? "copied" : peek < 0 ? "off" : "looked at");
+        r_armed   = 0;
+        g_waiting = false;
+        return;
+    }
     if (!g_shown.load()) return;
     g_elapsed = t;
 

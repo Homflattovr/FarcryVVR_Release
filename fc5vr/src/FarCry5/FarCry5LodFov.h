@@ -25,6 +25,11 @@ namespace fc5::lodfov
     void        set_sun_ranges(const std::string& arg);
     std::string sun_ranges();         // the setting: "off" or "a/b/c"
     std::string sun_ranges_active();  // this run's, for the F11 hint
+    // lowsuncsm off|on (on by default since 7 Nov 19:47; saved; next start; lights-and-shadows 7 Nov): DisableShadowNightRange="1" in the Shadow presets, so the game
+    // keeps three sun cascades in the evening and at night (it merges cascades 1 and 2 into a 22 m one from 18:00-18:30 to 04:00-05:00).
+    void set_low_sun_csm(bool on);
+    bool low_sun_csm();          // the setting
+    bool low_sun_csm_active();   // this run's
     // perfleafshadow, perfgrassshadow, perflampshadow, perfsoftshadow, perfreflect, perffog on|off (saved; next start; performance
     // thread 6 Nov): one game render setting each, a step down in the same changed config. True when cmd was one of them.
     bool perf_command(const std::string& cmd, const std::string& arg);

@@ -109,6 +109,23 @@ bool FarCry5Stereo::vehtrans_command(const std::string& cmd, const std::string& 
     }
     if (cmd == "vehaimfrontnow") { veh_aim_front_arm(std::chrono::steady_clock::now(), "vehaimfrontnow"); return true; }   // test
     if (cmd == "exitpitch") { m_exit_pitch = on; persist = true; return true; }            // exitpitch on|off (saved)
+    if (cmd == "cullpitch") {                                                               // cullpitch N (deg, saved)
+        try {
+            m_cull_pitch_deg = std::clamp(std::stof(arg), 0.0f, 10.0f);
+        } catch (...) {
+            return false;
+        }
+        spdlog::info("[Cull] cullpitch {:.1f} deg: {}", m_cull_pitch_deg.load(),
+                     m_cull_pitch_deg.load() > 0.0f ? "the game's culled camera aimed that far below the head wherever the mod turns it" : "off (as before 7 Nov)");
+        persist = true;
+        return true;
+    }
+    if (cmd == "exityaw") {                                                                 // exityaw on|off (saved)
+        m_exit_yaw_ev = on;
+        spdlog::info("[Vehicle] exityaw {}", on ? "on (getting out, the culled camera follows the head's yaw through Extended View)" : "off (as before 7 Nov: pitch only)");
+        persist = true;
+        return true;
+    }
     if (cmd == "vehseathold") { m_veh_seat_hold = on; persist = true; return true; }       // vehseathold on|off (saved)
     if (cmd == "vehheadingkeep") {                                                          // vehheadingkeep on|off (saved)
         m_veh_heading_keep = on;
@@ -210,10 +227,13 @@ void FarCry5Stereo::veh_seat_learn(int frame)
     if (!r) {
         m_vsh_valid = false;
         m_vsh_side  = 99.0f;
+        m_vsh_count = 0;
         spdlog::info("[Vehicle] vehseathold: no vehicle model within 8 m of the camera: no seat learnt (the hands' pass alone tells in from out)");
         return;
     }
     m_vsh_seat      = r->cam;
+    m_vsh_count       = r->count;   // vehwheels: the vehicle model, with the seat, for its learnt wheel
+    m_vsh_learn_frame = frame;
     m_vsh_side      = r->cam.x;   // drivequadseat: a quad's driver on the centre line, a car's to the side
     m_vsh_valid     = true;
     m_vsh_near      = true;
@@ -245,22 +265,45 @@ bool FarCry5Stereo::veh_seat_update(int frame)
 }
 
 // One step of the view following the enter / exit animation (vehentryfollow), applied between pairs as m_body_yaw_pending.
+float FarCry5Stereo::cull_bias() const
+{
+    return glm::radians(std::clamp(m_cull_pitch_deg.load(), 0.0f, 10.0f));
+}
+
+glm::vec3 FarCry5Stereo::cull_target(const glm::vec3& head_world) const
+{
+    // The head's direction with its pitch lowered by cullpitch (yaw as yaw_of: 0 = +y, counter-clockwise; pitch = asin(z)).
+    const glm::vec3 h = glm::normalize(head_world);
+    const float     b = cull_bias();
+    if (b == 0.0f) return h;
+    const float y = std::atan2(-h.x, h.y), p = std::asin(std::clamp(h.z, -1.0f, 1.0f)) - b;
+    return glm::vec3{ -std::sin(y) * std::cos(p), std::cos(y) * std::cos(p), std::sin(p) };
+}
+
+float FarCry5Stereo::veh_anim_cam_yaw() const
+{
+    // exityaw: the camera carries the head's yaw handed through Extended View; the animation's own camera is the camera less it.
+    // On foot with the switch on, every frame (the head look's offset at the hand-over, then exityaw's), so the follow sees no turn there.
+    return (m_exit_yaw_ev.load() && !m_in_vehicle.load()) ? std::remainder(m_cine_game_yaw - m_exy_oy.load(), glm::two_pi<float>()) : m_cine_game_yaw;
+}
+
 void FarCry5Stereo::veh_follow_step(std::chrono::steady_clock::time_point now)
 {
+    const float cam = veh_anim_cam_yaw();
     if (!m_veh_follow_head.load()) {
         // As before 23 Oct: the view's heading held on the game camera's.
-        m_body_yaw_pending = std::remainder(m_cine_game_yaw - (m_body_yaw + m_head_rel_yaw), glm::two_pi<float>());
+        m_body_yaw_pending = std::remainder(cam - (m_body_yaw + m_head_rel_yaw), glm::two_pi<float>());
         return;
     }
     if (!m_vf_init) {
         m_vf_init     = true;
         m_vf_body0    = m_body_yaw + m_body_yaw_pending;
-        m_vf_cam_last = m_cine_game_yaw;
+        m_vf_cam_last = cam;
         m_vf_turn     = 0.0f;
         m_vf_snap_t   = now - std::chrono::seconds(1);
     }
-    m_vf_turn += std::remainder(m_cine_game_yaw - m_vf_cam_last, glm::two_pi<float>());   // unwrapped: a turn past 180 deg is kept
-    m_vf_cam_last = m_cine_game_yaw;
+    m_vf_turn += std::remainder(cam - m_vf_cam_last, glm::two_pi<float>());   // unwrapped: a turn past 180 deg is kept
+    m_vf_cam_last = cam;
     const float d = std::remainder(m_vf_body0 + m_vf_turn - m_body_yaw, glm::two_pi<float>());
     if (!m_veh_follow_snap.load()) {
         m_body_yaw_pending = d;
@@ -304,6 +347,22 @@ void FarCry5Stereo::draw_vehtrans_menu(const std::function<void(const char*, std
     }
     hint("On (default; author 29 Oct: getting out of a car while looking down, the lower part of the view was not drawn for a second): during the exit animation the "
          "game's head look tilts the camera the game draws with up or down with your head, as when getting in. Off: as before 29 Oct.");
+    float cp = m_cull_pitch_deg.load();
+    if (ImGui::SliderFloat("Culling: the game's view aimed below the head (deg, test)##cullpitch", &cp, 0.0f, 10.0f, "%.1f")) {
+        m_cull_pitch_deg = cp;
+        keep("cullpitch", fmt::format("cullpitch {:.1f}", cp));
+    }
+    hint("0 (default): as before 7 Nov. The game draws a little less below the centre of its view than above it, and the headset's eyes see further down "
+         "than up, so the bottom edge of the view is the first to be cut. N deg aims the camera the game draws with that far below where you look, wherever "
+         "the mod turns it (holding a weapon, the weapon wheel, in vehicles, getting in and out). 4.5 evens out the spare room at the top and bottom.");
+    v = m_exit_yaw_ev.load();
+    if (ImGui::Checkbox("Vehicles: getting out, the game draws where you look left or right", &v)) {
+        m_exit_yaw_ev = v;
+        keep("exityaw", v ? "exityaw on" : "exityaw off");
+    }
+    hint("On (default; author 7 Nov): during the exit animation the game's head look also turns the camera the game draws "
+         "with to where your head looks, so the edges of the view are not cut while the animation swings round (the view still follows the animation in snaps). "
+         "Off: as before 7 Nov.");
     v = m_veh_aim_front.load();
     if (ImGui::Checkbox("Vehicles: getting in, the game's camera turned to the vehicle's front", &v)) {
         m_veh_aim_front = v;

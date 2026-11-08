@@ -24,6 +24,8 @@ namespace fc5::sunshare
         constexpr int kSlices = 3;   // CSMSlice0..2 (census: 3 slices)
 
         uint32_t        g_S = 0;              // ShadowMapSize from the cascade buffer
+        uint32_t        g_target_S = 0;       // ShadowMapSize of the target's own buffers (FC5 also uploads a 1536 one; never touched)
+        int             g_size_logs = 0;
         ID3D11Resource* g_target = nullptr;   // held (AddRef) until forget()
         ID3D11Resource* g_prev   = nullptr;   // the target before the last forget() (not held; compared only)
         D3D11_TEXTURE2D_DESC g_desc{};
@@ -50,13 +52,18 @@ namespace fc5::sunshare
         bool     g_stashed = false;
         float    g_rows[kSlices * 12]{};     // the game's rows of this pair's left call (as the game wrote them)
         uint64_t g_rows_pair = 0;            // pair those rows belong to (0 = none)
+        uint32_t g_rows_size = 0;            // byte size of that buffer
+        // The target's cascade buffers in upload order, per call: which of the left call's held the rows the map is drawn with.
+        // The right call's buffer at the same place gets them, whatever fit the right call made (8 Nov: its first slice can be
+        // 7.7 % smaller than the left call's, past close_rows' 5 %, and was then left with its own rows on the left call's map).
+        uint32_t g_l_idx = 0, g_r_idx = 0, g_l_mask = 0;
         uint32_t g_seen_mask = 0;
         bool     g_seen_multi = false;
         uint32_t g_seen_draws = 0;
 
         // Counters (since the last report).
         uint64_t c_pairs = 0, c_skip_r_draw = 0, c_skip_r_clear = 0, c_skip_stale_draw = 0, c_skip_stale_clear = 0, c_split_clear = 0;
-        uint64_t c_cb_r = 0, c_cb_stale = 0, c_cb_other = 0, c_redraw[kSlices]{}, c_moved[kSlices]{};
+        uint64_t c_cb_r = 0, c_cb_stale = 0, c_cb_other = 0, c_cb_refit = 0, c_cb_size = 0, c_redraw[kSlices]{}, c_moved[kSlices]{};
         uint64_t c_checks = 0;
         uint64_t t_pairs = 0;                // since start
         std::string g_last_check = "none yet";
@@ -70,6 +77,15 @@ namespace fc5::sunshare
         }
 
         float len3(const float* v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); }
+
+        // The same sun: slice 0's depth axis (row 2) points the same way in both sets of rows.
+        bool same_sun(const float* x, const float* y)
+        {
+            const float* a = x + 8;
+            const float* b = y + 8;
+            const float  la = len3(a), lb = len3(b);
+            return la > 0.0f && lb > 0.0f && (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (la * lb) >= 0.9999f;
+        }
 
         // A cascade buffer: ShadowMapSize at c10 = (S, S, 1/S, 1/S), and c0-c8 three slices of one sun projection: the same depth
         // axis (row 2) in all three, and each wider than the one before (row 0's scale = 1 / width, smaller for the far slices).
@@ -163,13 +179,14 @@ namespace fc5::sunshare
         void report()
         {
             const double n = double(std::max<uint64_t>(1, c_pairs));
-            spdlog::info("[SunShare] last {} pairs: right call skipped {:.1f} draws and {:.2f} clears per pair, {:.2f} buffers set to the left rows; "
+            spdlog::info("[SunShare] last {} pairs: right call skipped {:.1f} draws and {:.2f} clears per pair, {:.2f} buffers set to the left rows "
+                         "({:.2f} of them with another fit of its own), {:.2f} buffers of another map size left alone; "
                          "stagger {} ({}): far slices redrawn {:.0f} % / {:.0f} % of pairs (moved {:.0f} % / {:.0f} %), {:.1f} stale draws and {:.2f} stale clears skipped per pair, "
                          "{:.2f} array clears split, {:.2f} buffers set to the drawn rows, {} other cascade buffers left alone; slices drawn in the last full pair 0x{:x}; checks {}, last {}",
-                         c_pairs, c_skip_r_draw / n, c_skip_r_clear / n, c_cb_r / n, g_stagger.load(), g_slices_ok ? "per slice" : "not per slice", 100.0 * c_redraw[1] / n,
+                         c_pairs, c_skip_r_draw / n, c_skip_r_clear / n, c_cb_r / n, c_cb_refit / n, c_cb_size / n, g_stagger.load(), g_slices_ok ? "per slice" : "not per slice", 100.0 * c_redraw[1] / n,
                          100.0 * c_redraw[2] / n, 100.0 * c_moved[1] / n, 100.0 * c_moved[2] / n, c_skip_stale_draw / n, c_skip_stale_clear / n, c_split_clear / n,
                          c_cb_stale / n, c_cb_other, g_mask_last, c_checks, g_last_check);
-            c_pairs = c_skip_r_draw = c_skip_r_clear = c_skip_stale_draw = c_skip_stale_clear = c_split_clear = c_cb_r = c_cb_stale = c_cb_other = c_checks = 0;
+            c_pairs = c_skip_r_draw = c_skip_r_clear = c_skip_stale_draw = c_skip_stale_clear = c_split_clear = c_cb_r = c_cb_stale = c_cb_other = c_cb_refit = c_cb_size = c_checks = 0;
             for (int k = 0; k < kSlices; ++k) c_redraw[k] = c_moved[k] = 0;
         }
     }
@@ -203,16 +220,23 @@ namespace fc5::sunshare
         if (!g_on.load() || call < 1 || call > 2) return;
         uint32_t S = 0;
         if (!is_csm(size, d, S)) return;
-        if (S != g_S) {
-            spdlog::info("[SunShare] cascade buffer: map size {} (was {})", S, g_S);
-            g_S = S;
+        if (!g_target) {
+            // Learning: the map size the next depth-only target is matched against. FC5 alternates a 3072 and a 1536 buffer,
+            // so keep the larger one (the sun cascades); a target of the small map's shape could otherwise be taken.
+            if (S > g_S) {
+                if (g_size_logs < 6) { g_size_logs++; spdlog::info("[SunShare] cascade buffer: map size {} (was {})", S, g_S); }
+                g_S = S;
+            }
+            return;
         }
-        if (!g_target) return;
+        if (S != g_target_S) { c_cb_size++; return; }   // another shadow map's buffer: never touched
         if (call == 1) {
+            const uint32_t idx = g_l_idx++;
             if (g_rows_pair != g_pair) {
                 // The pair's first cascade buffer: the game's rows for this frame; the slices drawn this pair keep them.
                 std::memcpy(g_rows, d, sizeof g_rows);
                 g_rows_pair = g_pair;
+                g_rows_size = size;
                 for (int k = 0; k < kSlices; ++k) {
                     if (g_fresh[k]) { std::memcpy(g_drawn[k], d + k * 12, 48); g_have_drawn[k] = true; }
                 }
@@ -220,6 +244,7 @@ namespace fc5::sunshare
                 c_cb_other++;
                 return;
             }
+            if (idx < 32) g_l_mask |= 1u << idx;
             if (!g_any_stale) return;
             for (int k = 0; k < kSlices; ++k) {
                 if (!g_fresh[k] && g_have_drawn[k]) std::memcpy(d + k * 12, g_drawn[k], 48);
@@ -227,9 +252,14 @@ namespace fc5::sunshare
             c_cb_stale++;
             return;
         }
-        // Right call: the map is the left call's, so the lighting gets the rows it was drawn with.
+        // Right call: the map is the left call's, so the lighting gets the rows it was drawn with. The buffer is matched by its
+        // place among the target's buffers (the left call's at that place held the drawn rows), its size and the sun, not by
+        // how close its fit is: the right call may fit its cascades differently, and its own rows on the left map misplace
+        // every shadow in the right eye.
+        const uint32_t idx = g_r_idx++;
         if (!g_share_pair || g_rows_pair != g_pair) return;
-        if (!close_rows(g_rows, d)) { c_cb_other++; return; }
+        if (idx >= 32 || !(g_l_mask & (1u << idx)) || size != g_rows_size || !same_sun(g_rows, d)) { c_cb_other++; return; }
+        if (!close_rows(g_rows, d)) c_cb_refit++;
         for (int k = 0; k < kSlices; ++k) {
             if (g_have_drawn[k]) std::memcpy(d + k * 12, g_drawn[k], 48);
         }
@@ -262,6 +292,7 @@ namespace fc5::sunshare
         if (g_target) return;   // one cascade target
         res->AddRef();
         g_target   = res;
+        g_target_S = S;
         g_desc     = d;
         g_is_array = array;
         g_shape    = shape;
@@ -289,6 +320,7 @@ namespace fc5::sunshare
         g_prev = g_target;
         if (g_target) g_target->Release();
         g_target = nullptr;
+        g_target_S = 0;
         drop_slice_views();
         g_share_pair = false;
         g_any_stale  = false;
@@ -303,6 +335,7 @@ namespace fc5::sunshare
         g_seen_mask  = 0;
         g_seen_multi = false;
         g_seen_draws = 0;
+        g_l_idx = g_r_idx = g_l_mask = 0;
         for (auto& f : g_fresh) f = true;
         g_any_stale = false;
         if (!g_on.load() || !g_target) { g_share_pair = g_check = false; return; }

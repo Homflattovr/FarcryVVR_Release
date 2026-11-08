@@ -20,6 +20,7 @@
 #include "FarCry5GameWeapon.h"
 #include "FarCry5ReloadParts.h"
 #include "FarCry5Gesture.h"
+#include "FarCry5SwitchSpeed.h"
 #include "ModPath.h"
 
 #include <mmsystem.h>
@@ -460,6 +461,10 @@ namespace
     constexpr float kRackLineZone   = 0.065f; // reloadrackzone: ... or this close to the handle's parts' line while it must be racked
     // reloadwellzone (author 5 Nov; until now 8, 6, 4.5, 5 cm): its handle stands out on the left, 15 cm ahead of the grip. Not the line when idle: it runs 6 cm from the fore-end, where the support hand is.
     constexpr float kMs16HandleZone = 0.13f, kMs16ZoneIdle = 0.09f, kMs16LineZone = 0.085f;
+    // All-weapons pass (8 Nov, simulator): the MP5's cocking handle sits on its fore-end, 4-6 cm from where the game draws the support hand,
+    // so the left grip put on the fore-end took the handle (a pull that only moves it) instead of the two-handed hold. Idle (nothing to rack),
+    // the MP5, MP5SD and MP5K's handle is taken this close only; when it must be racked, kHandleZone and kRackLineZone as on every gun.
+    constexpr float kMp5ZoneIdle = 0.035f;
     constexpr float kBusySecs      = 3.2f;   // the game's reload kept out of the view at most this long (the AR-C's longest: 2.75 s)
     // A pump shotgun (kTube): the shell's top held 4 cm above the left controller and 4 cm forward (between thumb and fingers); it goes up
     // into the loading port 0.6 times reloadtravel (3 cm); the pump comes back 1.3 times reloadrack (7.8 cm); the left grip takes the pump
@@ -468,6 +473,15 @@ namespace
     constexpr float kRoundHand[3]{ 0.0f, 0.03f, -0.05f };   // a revolver's round: its nose 3 cm above the left controller, 5 cm ahead
     constexpr float kPumpZone      = 0.12f;
     constexpr float kPumpFwd       = 0.2f;   // after a full pull, back under this much of the stroke: the pump has gone forward
+    // reloadpumpgrip (author 7 Nov 20:35; his log 21:28-21:30, the M133 29259): six left grip
+    // presses on the fore-end, 0.08-0.12 m from the two-handed hold's point, were all the two-handed hold and never the pump: the pump was
+    // taken only within kPumpZone of its parts' centre, (-0.050, -0.028, -0.164) in the controller's axes, which on the M133 is 36.5 cm of
+    // pump and action bars, so its centre sits back by the receiver, 15-17 cm behind where the hand holds the fore-end (reloadhandgrabw
+    // -0.308). Every cycle went by quick right B. Now a press within kPumpGripZone of the whole part's line takes it, and the fore-end
+    // already held (the grip kept from before the shot) takes it without a new press once the chamber needs it. The stroke is the left hand
+    // coming back towards the weapon hand (the distance between the controllers), not along the right controller's axis: with two hands the
+    // gun points from one hand to the other, and a turn of the right wrist moved the left hand along that axis without any stroke.
+    constexpr float kPumpGripZone  = 0.10f;
 
     // manualreload43 (author 3 Nov 14:45): the
     // defaults are the author's saved settings of 3 Nov: reloadmanual, reloadweaponsounds and reloadgamehold on (were off).
@@ -511,6 +525,10 @@ namespace
     // A pump being pulled by the left hand (manualreload31; author 3 Nov 08:10): the
     // two-handed hold's left hand then follows its controller (FarCry5Stereo.cpp), which is on the pump.
     std::atomic<bool>  g_pump_now{ false };
+    std::atomic<bool>  g_pump_grip{ true };    // reloadpumpgrip on|off (saved, default on): above, kPumpGripZone
+    std::atomic<bool>  g_pump_aim{ false };    // reloadpumpgrip: a stroke under way: the gun keeps its two-handed direction on the weapon hand (FarCry5Stereo.cpp)
+    float              g_pump_d0 = 0.0f;       // reloadpumpgrip: the controllers' distance with the pump forward (the stroke's start)
+    clock::time_point  g_pump_d_t{};
     // manualreload38 (author 3 Nov 11:54): a magazine, shell or round from the hip in the left hand (the pad poll's g_hand_mag, for the
     // render thread's two-handed hold).
     std::atomic<bool>  g_mag_hand_now{ false };
@@ -539,6 +557,13 @@ namespace
     // loaded), and the gun does not fire with one left in the game's clip while there is a reserve: load another first. Not the break actions,
     // the M79 nor the RPG (a clip of 1 or 2: their last round would never fire): the game's reload at their empty clip stays kept out of the view.
     std::atomic<bool>  g_keep_one{ true };
+    // reloadfullmag on|off (saved, default on; author 8 Nov 10:34): a
+    // magazine gun fires its whole magazine (the AR-C 30 of 30). Instead of reloadkeepone's round kept in the clip, the game's own reload at
+    // an empty clip is switched off in the gun's own data (bAutoReload, FarCry5SwitchSpeed.cpp autoreload_*). Until its block is found and
+    // written (about 250 ms after the gun comes into the hand), when it cannot be, and with no spare ammo (noautoswitch), the round is kept
+    // as before. If the game reloads by itself at empty anyway, it is put back and the round kept for the rest of the session (log [FullMag]).
+    std::atomic<bool>  g_full_mag{ true };
+    std::atomic<bool>  g_fm_want_now{ false };   // this poll: a magazine gun in hand that reloadfullmag applies to
     // noautoswitch on|off (saved, default on; author 7 Nov 08:53; his log
     // of 09:50:55: the AR-C's last round fired with no reserve, clip 0 reserve 0, and 260 ms later the game put the bow in his hands by itself):
     // reloadkeepone's kept round also with no reserve left, so the game's clip never reaches 0 with nothing to reload and the game never
@@ -1010,6 +1035,11 @@ namespace
         { 32472, "1887 (modern)", 5, { 3224516626u, 2703300039u, 2603587974u, 72867933u, 1621353718u }, { 0.97f, 1.02f, 2.32f, 2.32f, 2.46f }, { 0.920f, 0.945f, 1.670f, 2.390f, 2.510f } },
         { 39012, "Repeater (modern)", 4, { 813072728u, 3389542460u, 230258062u, 1752179380u }, { 0.50f, 2.31f, 2.37f, 2.42f }, { 0.450f, 0.475f, 1.405f, 2.395f, 2.470f } },
         { 25368, "Repeater (classic)", 4, { 813072728u, 3389542460u, 230258062u, 1752179380u }, { 0.50f, 2.31f, 2.37f, 2.42f }, { 0.450f, 0.475f, 1.405f, 2.395f, 2.470f } },
+        // All-weapons pass (8 Nov, simulator run2: "no game sound for rack_back / mag_in"): the other models of the same guns, their family's sequence.
+        { 39360, "Repeater (modern long)", 4, { 813072728u, 3389542460u, 230258062u, 1752179380u }, { 0.50f, 2.31f, 2.37f, 2.42f }, { 0.450f, 0.475f, 1.405f, 2.395f, 2.470f } },
+        { 25020, "Repeater (classic short)", 4, { 813072728u, 3389542460u, 230258062u, 1752179380u }, { 0.50f, 2.31f, 2.37f, 2.42f }, { 0.450f, 0.475f, 1.405f, 2.395f, 2.470f } },
+        { 24504, "1888 (short)", 5, { 3224516626u, 2703300039u, 2603587974u, 72867933u, 1621353718u }, { 0.97f, 1.02f, 2.32f, 2.32f, 2.46f }, { 0.920f, 0.945f, 1.670f, 2.390f, 2.510f } },
+        { 26211, "RPG-7 (classic)", 3, { 3633379800u, 3240498188u, 3621502332u }, { 0.34f, 0.53f, 0.81f }, { 0.290f, 0.315f, 0.670f, 0.670f, 0.860f } },
         { 35490, "Sledge (double barrel)", 5, { 607201573u, 1095402538u, 526173240u, 1277015305u, 4217591709u }, { 0.00f, 0.06f, 1.00f, 1.60f, 1.74f }, { 0.000f, 0.530f, 1.300f, 1.300f, 1.790f } },
         { 31470, "Sledge (sawed-off)", 5, { 607201573u, 1095402538u, 526173240u, 1277015305u, 4217591709u }, { 0.00f, 0.06f, 1.00f, 1.60f, 1.74f }, { 0.000f, 0.530f, 1.300f, 1.300f, 1.790f } },
         { 29850, "M79", 5, { 1523209242u, 2576125734u, 1609459330u, 2576125734u, 480803686u }, { 0.25f, 0.25f, 0.83f, 0.83f, 1.08f }, { 0.200f, 0.540f, 0.955f, 0.955f, 1.130f } },
@@ -1587,11 +1617,15 @@ bool hides_game_reload() { return g_hide.load(); }
 bool game_busy() { return g_busy_now.load(); }
 bool game_pending() { return g_pending_now.load(); }
 bool pump_held() { return g_pump_now.load(); }
+bool pump_aim_hold() { return g_pump_aim.load(); }
+bool pump_grip() { return g_pump_grip.load(); }
 bool mag_in_left_hand() { return g_mag_hand_now.load(); }
 bool b_heal_only() { return g_b_heal.load(); }
 bool keep_one() { return g_keep_one.load() && (g_empty_sig.load() == 0 || g_empty_sig.load() != g_sig_now.load()); }
 // reloadkeepone's round kept with this reserve: with a reserve, or with none while noautoswitch is on (the game then never sees the gun empty).
-static bool keep_res(int reserve) { return reserve > 0 || g_no_switch.load(); }
+// reloadfullmag: the gun in hand's data has the game's reload at empty off (written and read back), so no round need be kept with a reserve.
+static bool full_mag_now() { return g_full_mag.load() && g_keep_one.load() && g_on.load() && g_fm_want_now.load() && fc5::switchspeed::autoreload_off(fc5::lua::weapon_object()); }
+static bool keep_res(int reserve) { return reserve > 0 ? !full_mag_now() : g_no_switch.load(); }
 bool button_reload() { return g_btn_now.load(); }
 bool hides_game_casings() { return g_casing_now.load(); }
 bool relearn_armed(uint32_t sig, int item) { return sig != 0 && sig == g_relearn_sig.load() && (g_relearn_items.load() & (1u << item)); }
@@ -2298,11 +2332,14 @@ void update(const In& in_game, Out& out)
         g_busy_now = false;
         g_pending_now = false;
         g_pump_now = false;
+        g_pump_aim = false;
         g_mag_hand_now = false;
         g_casing_now = false;
         g_seat_hold = g_hand_was = false;
         g_btn_reload = false;
         g_btn_now    = false;
+        g_fm_want_now = false;
+        fc5::switchspeed::autoreload_want(g_full_mag.load() && g_keep_one.load() && g_on.load(), 0);   // reloadfullmag: nothing in hand to apply to
         // allreloadfire: another weapon while not active (the weapon wheel, the sling, a heal) starts the state again too. Without it the
         // next weapon kept the last one's chambers and clip (3 Nov 16:23 log: the 1887 came in with the M133's empty tube and chamber, and
         // the RPG-7 with the revolver's chambers known and the M249's clip 57, read as a shot that emptied it): held from firing for good.
@@ -2364,6 +2401,14 @@ void update(const In& in_game, Out& out)
         g_cyl_n = std::clamp(revolver_parts(in.sig, rvp) ? rvp.nround : 6, 1, 6);
         for (int i = g_cyl_n; i < 6; ++i) g_cyl[i] = 3;
     }
+    // reloadfullmag: a magazine or belt-fed gun (not a tube, a revolver or a break action), and not while its reload from empty is being
+    // learnt (g_empty_sig: that one is the game's own).
+    {
+        const bool fm_on = g_full_mag.load() && g_keep_one.load();   // (reloadkeepone off: the game's own reload at empty is wanted)
+        const bool fm    = fm_on && !tube && !rev && g_empty_sig.load() != in.sig;
+        g_fm_want_now    = fm;
+        fc5::switchspeed::autoreload_want(fm_on, fm ? uintptr_t(fc5::lua::weapon_object()) : 0);
+    }
     // allreload: the RPG-7 has nothing to open (always open for loading, a quick B does nothing), its rocket goes in at the muzzle and
     // leaves nothing when fired. The M79 is a break action of one chamber. A bolt action (the .308, reloadbolt) works its bolt after each shot.
     const bool     noopen = rev && rvp.noopen;
@@ -2393,7 +2438,8 @@ void update(const In& in_game, Out& out)
         if (!g_racking) g_rack = 0.0f;
     }
     const bool  ms16_h    = bt && std::strncmp(bt->name, "MS16", 4) == 0;   // reloadwellzone
-    const float zone_idle = pistol ? kSlideZoneIdle : tube ? kPumpZone : ms16_h ? kMs16ZoneIdle : kHandleZoneIdle;
+    const bool  mp5_h     = bt && std::strncmp(bt->name, "MP5", 3) == 0;   // MP5, MP5SD, MP5K: kMp5ZoneIdle
+    const float zone_idle = pistol ? kSlideZoneIdle : tube ? kPumpZone : ms16_h ? kMs16ZoneIdle : mp5_h ? kMp5ZoneIdle : kHandleZoneIdle;
     const float zone_rack = ms16_h ? kMs16HandleZone : kHandleZone;
 
     // reloadforce (test, no headset): dry = the clip ran out (a rack is needed after the next magazine), out = the magazine dropped,
@@ -2511,8 +2557,22 @@ void update(const In& in_game, Out& out)
                                  dry_at ? "one round kept in the game's clip (reloadkeepone): the game starts no reload of its own"
                                         : "the game's own reload kept out of the view");
             }
-            if (in.clip == 0)
+            if (in.clip == 0 && !full_mag_now())   // (reloadfullmag: no reload of the game's to keep out of the view)
                 g_busy_until = std::max(g_busy_until, now + std::chrono::milliseconds(int(std::max(kBusySecs, rev ? rvp.busy_s : 0.0f) * 1000.0f)));
+        }
+        // reloadfullmag: the clip ran to 0 with the game's reload at empty written off and then grew with no reload of the mod's asked (no
+        // fill or tap pending, not the reload button): the game reloaded by itself after all. Put back; the round is kept from now.
+        static uint32_t fm_dry_sig = 0;
+        if (fm_dry_sig != 0 && fm_dry_sig == in.sig && prev_clip == 0 && in.clip > 0 && !g_game_pending && !g_key_pending && !g_btn_reload) {
+            fc5::switchspeed::autoreload_failed();
+            if (g_log.load()) spdlog::info("[Reload] reloadfullmag: weapon {}'s clip 0 -> {} (reserve {}) with no reload asked: the game reloaded by itself; reloadkeepone's round from now", in.sig,
+                                           in.clip, in.reserve);
+        }
+        if (in.clip == 0 && prev_clip > 0) {
+            fm_dry_sig = full_mag_now() ? in.sig : 0;
+            if (fm_dry_sig != 0 && g_log.load()) spdlog::info("[Reload] reloadfullmag: weapon {} fired its whole magazine (reserve {}): the game's own reload at empty is off", in.sig, in.reserve);
+        } else if (in.clip > 0 || in.sig != fm_dry_sig) {
+            fm_dry_sig = 0;
         }
         if (g_game_pending && g_clip_at_tap >= 0 && in.clip > g_clip_at_tap) {
             g_game_pending = false;
@@ -2963,6 +3023,7 @@ void update(const In& in_game, Out& out)
                    (glm::length(in.hand_pos - (g_act_open ? handle + back * rack_len : handle)) < (g_need_rack || g_bolt_owed || g_act_open ? zone_rack : zone_idle) ||
                     (boltt && g_bolt_open && glm::length(in.hand_pos - (handle + back * (g_rack * rack_len))) < zone_rack) ||   // reloadboltturn: where it was left
                     ((g_need_rack || g_bolt_owed) && rack_line_d < (ms16_h ? kMs16LineZone : kRackLineZone)) ||   // reloadrackzone: anywhere on the glowing part
+                    (tube && g_pump_grip.load() && rack_line_d < kPumpGripZone) ||   // reloadpumpgrip: a pump anywhere along it, whatever the chamber holds
                     // reloadhandgame: or where the controller is with the drawn hand on the slide as the game has it (well behind the slide: the fingers reach forward)
                     (hg_on && hg.grab && (g_need_rack || g_bolt_owed) && glm::length(in.hand_pos - (in.gun_pos + in.gun_rot * hg.grab_c)) < kHandleZone))) {
             // Always taken (author 2 Nov 12:32): it moves with the pull; it chambers a round only after a fresh magazine once the clip ran dry.
@@ -2981,6 +3042,10 @@ void update(const In& in_game, Out& out)
                 g_rack_done = true;
                 g_rack_r0   = glm::transpose(in.gun_rot) * (in.hand_pos - back * rack_len - in.gun_pos);
             }
+            if (tube) {   // reloadpumpgrip: the stroke from here (left back: already a full stroke)
+                g_pump_d0  = glm::length(in.hand_pos - in.gun_pos) + g_rack * rack_len;
+                g_pump_d_t = now;
+            }
             if (boltt) {
                 // reloadboltturn: taken again where it was left, it goes on from there (the grab point put where the hand would have taken it locked).
                 g_rack      = rb0;
@@ -2990,7 +3055,8 @@ void update(const In& in_game, Out& out)
             }
             buzz(out, kHand, 0.35f, 0.03f);
             if (g_log.load() && tube)
-                spdlog::info("[Reload] pump taken ({:.2f} m from it; {} shell(s) in the tube, the chamber {})", glm::length(in.hand_pos - handle), g_tube,
+                spdlog::info("[Reload] pump taken ({:.2f} m from its centre, {} from its parts' line; {} shell(s) in the tube, the chamber {})", glm::length(in.hand_pos - handle),
+                             rack_line_d < 1e8f ? fmt::format("{:.2f} m", rack_line_d) : std::string{ "-" }, g_tube,
                              g_chamber == 1 ? "loaded" : g_chamber == 2 ? "holding a fired shell" : "empty");
             else if (g_log.load() && boltt)
                 spdlog::info("[Reload] bolt taken ({:.2f} m from it; up {:.0f} %, back {:.0f} %; {}): up, back to its stop, forward, down", glm::length(in.hand_pos - handle),
@@ -3000,7 +3066,28 @@ void update(const In& in_game, Out& out)
                              rack_line_d < 1e8f ? fmt::format(", {:.2f} m from its parts' line", rack_line_d) : std::string{},
                              !g_need_rack ? " (nothing to chamber: the pull only moves it)" : !g_mag_in_gun ? " (no magazine in: the pull only moves it)"
                                           : !g_mag_fresh ? " (the empty magazine still in: drop it first)" : "");
+        } else if (tube && !lever && !g_hand_mag && !g_racking && track && g_log.load()) {
+            // reloadpumpgrip: a press with a pump gun that took nothing of the reload's (the two-handed hold, a zone): where it was.
+            spdlog::info("[Reload] left grip pressed {:.2f} m from the pump's centre, {} from its parts' line (zones {:.2f} / {:.2f}{}): not the pump",
+                         glm::length(in.hand_pos - handle), rack_line_d < 1e8f ? fmt::format("{:.2f} m", rack_line_d) : std::string{ "-" }, kPumpZone, kPumpGripZone,
+                         g_pump_grip.load() ? "" : ", reloadpumpgrip off");
         }
+    }
+    // reloadpumpgrip: the fore-end already held (the two-handed hold kept from before the shot): the pump is the hand's without a new press
+    // once the chamber needs it (a fired shell in it, or empty with shells in the tube).
+    if (tube && !lever && g_pump_grip.load() && in.grip && !in.pressed && in.hand_ok && track && !g_racking && !g_hand_mag && !g_engaged && !g_seat_hold && !g_act_open &&
+        g_chamber != 1 && (g_chamber == 2 || g_tube > 0) && (rack_line_d < kPumpGripZone || glm::length(in.hand_pos - handle) < kPumpZone)) {
+        g_racking   = true;
+        g_rack_done = false;
+        g_rack      = 0.0f;
+        g_rack_cm   = 0;
+        g_rack_r0   = glm::transpose(in.gun_rot) * (in.hand_pos - in.gun_pos);
+        g_pump_d0   = glm::length(in.hand_pos - in.gun_pos);
+        g_pump_d_t  = now;
+        buzz(out, kHand, 0.35f, 0.03f);
+        if (g_log.load())
+            spdlog::info("[Reload] reloadpumpgrip: pump taken with the grip already held ({:.2f} m from its parts' line; {} shell(s) in the tube, the chamber {})",
+                         rack_line_d < 1e8f ? rack_line_d : -1.0f, g_tube, g_chamber == 2 ? "holding a fired shell" : "empty");
     }
     if (g_hand_mag && !in.grip && !(g_rat_on && g_rat_auto && g_engaged)) {   // (reloadratslide: sliding home by itself, it goes on)
         if (g_log.load()) spdlog::info("[Reload] left grip let go with the magazine {} ({:.2f} m from the well, {:.2f} off its axis){}", g_engaged ? "partly in" : "in the hand",
@@ -3482,7 +3569,18 @@ void update(const In& in_game, Out& out)
     // The charging handle: pulled back along the gun from where it was taken (that point moves with the gun).
     if (g_racking && track) {
         const glm::vec3 r0 = in.gun_pos + in.gun_rot * g_rack_r0;
-        g_rack             = std::clamp(glm::dot(in.hand_pos - r0, back) / rack_len, 0.0f, 1.0f);
+        if (tube && !lever && g_pump_grip.load()) {
+            // reloadpumpgrip: the pump's stroke is the left hand coming back towards the weapon hand. With the pump forward the start
+            // follows the hand out at once and in slowly (0.8 s), so arms easing while aiming do not count as a stroke (a stroke takes 0.2-0.4 s).
+            const float d  = glm::length(in.hand_pos - in.gun_pos);
+            const float dt = std::clamp(ms_since(g_pump_d_t, now) / 1000.0f, 0.0f, 0.1f);
+            g_pump_d_t     = now;
+            if (d > g_pump_d0) g_pump_d0 = d;
+            else if (!g_rack_done && g_pump_d0 - d < 0.4f * rack_len) g_pump_d0 += (d - g_pump_d0) * std::min(1.0f, dt / 0.8f);
+            g_rack = std::clamp((g_pump_d0 - d) / rack_len, 0.0f, 1.0f);
+        } else {
+            g_rack = std::clamp(glm::dot(in.hand_pos - r0, back) / rack_len, 0.0f, 1.0f);
+        }
         const int cm       = int(std::floor(g_rack * rack_len * 100.0f));
         if (cm > g_rack_cm && !g_rack_done) buzz(out, kHand, 0.14f, 0.012f);
         g_rack_cm = cm;
@@ -3667,6 +3765,7 @@ void update(const In& in_game, Out& out)
     g_busy_now      = busy;
     g_pending_now   = g_game_pending;
     g_pump_now      = tube && !lever && g_racking;
+    g_pump_aim      = g_pump_grip.load() && tube && !lever && g_racking && (g_rack > 0.05f || g_rack_done);
     g_mag_hand_now  = g_hand_mag || g_seat_hold;
     // reloadcasinghide: the fired shell leaves by the hand (the pump, the lever, the bolt), so the game's own casing is not shown.
     g_casing_now    = g_casing_on.load() && ((tube && !bt->semi && g_pump_shot.load()) || boltg);
@@ -4418,6 +4517,14 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
                                                                     : "off: the game reloads by itself when its clip runs dry (kept out of the view)");
         return true;
     }
+    if (cmd == "reloadfullmag") {
+        g_full_mag = arg.empty() || on;
+        persist    = true;
+        if (!g_full_mag.load()) fc5::switchspeed::autoreload_want(false, 0);   // put back at once
+        spdlog::info("[Reload] reloadfullmag {}", g_full_mag.load() ? "on: a magazine gun fires its whole magazine; the game's own reload at empty is switched off in its data instead of keeping a round"
+                                                                      : "off: reloadkeepone keeps one round in the game's clip (the AR-C fires 29 of 30)");
+        return true;
+    }
     if (cmd == "noautoswitch") {
         g_no_switch = arg.empty() || on;
         persist     = true;
@@ -4563,6 +4670,14 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
         if (k >= 0) sound(k);
         else if (const unsigned long id = std::strtoul(arg.c_str(), nullptr, 10); id != 0)
             spdlog::info("[Reload] reloadsoundtry {}: {}", id, fc5::gamesound::post(uint32_t(id), 15, 0.0f) ? "posted" : "the game's sound call not usable");
+        return true;
+    }
+    if (cmd == "reloadpumpgrip") {
+        g_pump_grip = arg.empty() || on;
+        persist     = true;
+        spdlog::info("[Reload] reloadpumpgrip {}", g_pump_grip.load() ? "on: the left grip takes a pump shotgun's pump anywhere along the fore-end, or held there already once the chamber needs it; "
+                                                                        "the stroke is the left hand coming back towards the right, and the gun keeps its aim on the right hand during it"
+                                                                      : "off: the pump taken only near its centre on a new press, pulled along the right controller (as before)");
         return true;
     }
     if (cmd == "reloadpumpshot") {
@@ -5165,6 +5280,12 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
              "round fires. Shotguns and revolvers too (3 Nov): the game holds one round more than you loaded by hand, and with one left in its clip "
              "the gun waits for the next shell or round. Not the double barrels, the M79 nor the RPG. Off: the game reloads by itself at empty, hidden. "
              "Command reloadkeepone on/off.");
+        bool fmg = g_full_mag.load();
+        if (ImGui::Checkbox("Fire the whole magazine (30 of 30 on the AR-C)##reloadfullmag", &fmg)) cmds += fmg ? "reloadfullmag on\n" : "reloadfullmag off\n";
+        hint("On (default, author 8 Nov): instead of keeping one round in the game's clip (the AR-C fired 29), the game's own reload at an empty "
+             "magazine is switched off in the gun's data, so every round fires and the game still starts no reload. Magazine and belt-fed guns. "
+             "Until the gun's data is found (a quarter second after it comes into your hand), or with no spare ammo left, the round is kept as "
+             "before. Needs the option above. Command reloadfullmag on/off.");
         bool nsw = g_no_switch.load();
         if (ImGui::Checkbox("Out of ammo: the game does not switch weapon by itself##noautoswitch", &nsw)) cmds += nsw ? "noautoswitch on\n" : "noautoswitch off\n";
         hint("On (default, author 7 Nov): with no spare ammo left, the last round stays in the gun unfired (the wrist shows 0), so the game never "
@@ -5211,6 +5332,12 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
         hint("On (default): after each shot a pump shotgun (the M133s, when ticked) does not fire again until you pull its pump back to the stop (the fired "
              "shell flies out) and push it forward. The SPAS-12 fires again by itself, as in the game. Off: the next shell is chambered by itself; the pump is needed only after loading an empty gun. Shells "
              "always go in one at a time from the left hip.");
+        bool pg = g_pump_grip.load();
+        if (ImGui::Checkbox("Pump shotguns: take the pump anywhere on the fore-end, grip held or not##reloadpumpgrip", &pg)) cmds += pg ? "reloadpumpgrip on\n" : "reloadpumpgrip off\n";
+        hint("On (default, author 7 Nov: the M133's pump did not work): the left grip on the fore-end takes the pump wherever you hold it along the gun, "
+             "and if you keep holding the fore-end after a shot, just pull it back and push it forward, no new press. The stroke is your left hand "
+             "coming back towards your right one, and while it moves the gun keeps its aim on your right hand (it no longer swings with the left). "
+             "Off: as before (a new press near the pump's middle, pulled along the right controller). Command reloadpumpgrip on/off.");
         bool ch = g_casing_on.load();
         if (ImGui::Checkbox("One shell only: hide the game's casing when the hand ejects##reloadcasinghide", &ch)) cmds += ch ? "reloadcasinghide on\n" : "reloadcasinghide off\n";
         hint("On (default, author 3 Nov): with a pump or lever shotgun worked after each shot (above), or a bolt action, the game's own spent casing "

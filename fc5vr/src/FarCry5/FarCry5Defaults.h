@@ -35,6 +35,7 @@
 // 6 Nov 14:31 (author): his manual
 // reload data and learnt reload sounds too (reloadgeom, reloadhandgrabw, reloadhandmagw, reloadhandlepart, reloadmagmesh, reloadsoundlearnt)
 // and bowarrowmesh with 25110; scopecal, scopeglassat, scopezoom and sightcal stay per player (they follow the optic fitted).
+// 7 Nov 19:47 (author): lowsuncsm on (three sun cascades in the evening and at night).
 namespace fc5 {
 inline constexpr const char* kReleaseSettings = R"FC5VR(
 # Far Cry 5 VR settings: the same commands as fc5vr_cmd.txt, replayed at start (edited by the mod).
@@ -88,6 +89,7 @@ gunstillrecoil off
 hands on
 hapticthread on
 hidetracers on
+hidmask on
 hipspread 0.00
 huddist 2.27
 hudfullres on
@@ -104,11 +106,13 @@ hudmode 1
 hudmul on
 hudprim on
 hudprimcam on
+hudprimworld on
 hudscreen on
 hudsize 40
 lakeoverscan 1.00
 lakeshared on
 logbuffered on
+lowsuncsm on
 manualbow on
 menulevel 1
 mipbias -0.5

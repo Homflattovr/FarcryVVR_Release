@@ -14,6 +14,8 @@ namespace fc5::gameweapon
     const fc5::weapons::Info* info(uint32_t sig);
     // The game's item seen for that weapon id, 0 none yet (gamedrawgrab).
     uint64_t item(uint32_t sig);
+    // weaponcache (FarCry5Holster.cpp): the item kept with a weapon's copy from an earlier start, until the game shows it held.
+    void seed(uint32_t sig, uint64_t item);
     // fistsnotmain (7 Nov): the weapon class of the game's fists and brass knuckles (Weapons/Melee/Fist/*).
     inline constexpr uint8_t kFistClass = 20;
     // The bare hands: the game's fists (class 20), or an id drawn while the game held no item (in a car it lowers the sidearm to them).

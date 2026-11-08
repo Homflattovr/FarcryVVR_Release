@@ -20,6 +20,10 @@
 // sunranges (shadow clarity, 7 Nov 2026, research\2026-11-07_shadow_clarity.md): the Shadow presets' SunShadowRange0/1/2, the far
 // distance of each sun cascade (game 4 / 11 / 30 m; only "low" names them, the others use the code's defaults), set or added in every
 // preset but the cinematic and editor ones. Test, off by default; saved; next start.
+// lowsuncsm (lights-and-shadows thread, author 7 Nov 18:48, research\2026-11-07_lights_shadows\lab\lowsun_cascades.md): from 18:00-18:30
+// game time until 04:00-05:00 the game merges sun cascades 1 and 2 into one ending at SunShadowNightRange (22 m, a 77 m box), so the
+// hand-over to the blocky far shadows (ASM) comes 25-50 m out: the evening shadow squares. On: DisableShadowNightRange="1" in the same
+// presets, so the three cascades of SunShadowRange0/1/2 stay at every hour. On by default since 7 Nov 19:47 (author; FarCry5Defaults.h); still saved, so it can be unticked (F11 Debug > Sun shadows); next start.
 #include "FarCry5LodFov.h"
 
 #include "FarCry5Defaults.h"
@@ -63,6 +67,8 @@ namespace
     std::mutex         g_ranges_mx;                      // guards g_ranges (commands and the F11 menu)
     std::string        g_ranges        = "off";          // sunranges: the setting (next start), "off" or "a/b/c"
     std::string        g_ranges_active = "off";          // this run's (written once at the start)
+    std::atomic<bool>  g_lowsun{ true };                 // lowsuncsm: the setting (next start); on by default
+    bool               g_lowsun_active = false;          // this run's
     int                g_perf_active   = 0;              // this run's
     bool               g_built         = false;          // this run's config is the changed one
     std::string        g_why    = "off";
@@ -428,7 +434,7 @@ namespace
     }
 
     // lodfov, shadowres, vtbias and the perf switches, those set. Returns the changes made, empty with g_why set when one could not be made.
-    std::string change_all(std::string& t, float s, int shadow, float vt, int perf, const std::string& ranges)
+    std::string change_all(std::string& t, float s, int shadow, float vt, int perf, const std::string& ranges, bool lowsun)
     {
         std::string log;
         if (s > 0.0f && std::abs(s - 1.0f) >= 1e-3f) {
@@ -456,6 +462,11 @@ namespace
                 if (c == "!") { g_why = "the config has no Shadow section (sunranges)"; return {}; }
                 log += c;
             }
+        }
+        if (lowsun) {
+            const std::string c = set_section(t, "Shadow", "DisableShadowNightRange", "1");
+            if (c == "!") { g_why = "the config has no Shadow section (lowsuncsm)"; return {}; }
+            log += c.empty() ? std::string{ " lowsuncsm: nothing to change;" } : c;
         }
         for (const auto& k : kPerf) {
             if (!(perf & k.bit)) continue;
@@ -489,7 +500,7 @@ namespace
         return t.size() == want;
     }
 
-    bool build(float s, int shadow, float vt, int perf, const std::string& ranges)
+    bool build(float s, int shadow, float vt, int perf, const std::string& ranges, bool lowsun)
     {
         const std::wstring dir = std::filesystem::path{ fc5::exe_dir() }.parent_path().parent_path().wstring() + L"\\data_final\\pc\\";
         // patch.dat would override common.dat: the entry is looked for there first.
@@ -501,7 +512,7 @@ namespace
         std::vector<uint8_t> plain;
         if (comp.size() != g_csize || !lz4_decode(comp.data(), comp.size(), plain, g_usize)) { g_why = "the config entry did not decompress"; return false; }
         std::string t{ plain.begin(), plain.end() };
-        const std::string changes = change_all(t, s, shadow, vt, perf, ranges);
+        const std::string changes = change_all(t, s, shadow, vt, perf, ranges, lowsun);
         if (changes.empty()) return false;
         if (!fit_text(t, g_usize)) { g_why = "no room in the config's comments"; return false; }
         std::vector<uint8_t> nt{ t.begin(), t.end() };
@@ -513,9 +524,9 @@ namespace
         g_block = lz4_write(q, nt);
         std::vector<uint8_t> check;
         if (g_block.size() != g_csize || !lz4_decode(g_block.data(), g_block.size(), check, g_usize) || check != nt) { g_why = "the changed config did not check out"; g_block.clear(); return false; }
-        g_why = fmt::format("lodfov {}, shadowres {}, vtbias {}, perf {}, sunranges {} ({}):{}", s > 0.0f ? "x" + fmt_scale(s) : std::string{ "off" },
+        g_why = fmt::format("lodfov {}, shadowres {}, vtbias {}, perf {}, sunranges {}, lowsuncsm {} ({}):{}", s > 0.0f ? "x" + fmt_scale(s) : std::string{ "off" },
                             shadow > 0 ? std::to_string(shadow) : std::string{ "off" }, vt != 0.0f ? fmt::format("{:+.2f}", vt) : std::string{ "off" },
-                            perf_names(perf), ranges, std::filesystem::path{ g_dat }.filename().string(), changes);
+                            perf_names(perf), ranges, lowsun ? "on" : "off", std::filesystem::path{ g_dat }.filename().string(), changes);
         return true;
     }
 
@@ -679,6 +690,7 @@ void install_early()
         if (cmd == "lodfov") g_scale = parse(arg);
         else if (cmd == "shadowres") g_shadow_res = parse_shadow(arg);
         else if (cmd == "sunranges") { std::lock_guard lk{ g_ranges_mx }; g_ranges = parse_ranges(arg); }
+        else if (cmd == "lowsuncsm") g_lowsun = arg == "on";
         else if (cmd == "mipbias") vt_mip = parse_vt(arg);
         else if (cmd == "vtbias") vt_old = parse_vt(arg);
         else for (const auto& k : kPerf) if (cmd == k.cmd) g_perf = arg == "on" ? (g_perf.load() | k.bit) : (g_perf.load() & ~k.bit);
@@ -691,16 +703,19 @@ void install_early()
     if (s <= 0.0f || std::abs(s - 1.0f) < 1e-3f) s = 0.0f;
     std::string rg;
     { std::lock_guard lk{ g_ranges_mx }; rg = g_ranges; }
-    if (s <= 0.0f && sh <= 0 && vt == 0.0f && pf == 0 && rg == "off") { spdlog::info("[LodFov] lodfov, shadowres, vtbias, sunranges and the perf switches off: the game's own render config"); return; }
-    if (!build(s, sh, vt, pf, rg)) {
-        spdlog::warn("[LodFov] lodfov {} / shadowres {} / vtbias {:+.2f} / perf {} / sunranges {}: not used, {}", fmt_scale(s), sh, vt, perf_names(pf), rg, g_why);
-        if (rg == "off") return;
-        // sunranges is a test: without it the other settings still get their changed config.
+    const bool ls = g_lowsun.load();
+    if (s <= 0.0f && sh <= 0 && vt == 0.0f && pf == 0 && rg == "off" && !ls) { spdlog::info("[LodFov] lodfov, shadowres, vtbias, sunranges, lowsuncsm and the perf switches off: the game's own render config"); return; }
+    if (!build(s, sh, vt, pf, rg, ls)) {
+        spdlog::warn("[LodFov] lodfov {} / shadowres {} / vtbias {:+.2f} / perf {} / sunranges {} / lowsuncsm {}: not used, {}", fmt_scale(s), sh, vt, perf_names(pf), rg,
+                     ls ? "on" : "off", g_why);
+        if (rg == "off" && !ls) return;
+        // sunranges and lowsuncsm are tests: without them the other settings still get their changed config.
         if (s <= 0.0f && sh <= 0 && vt == 0.0f && pf == 0) return;
-        if (!build(s, sh, vt, pf, "off")) { spdlog::warn("[LodFov] without sunranges: not used either, {}", g_why); return; }
-        spdlog::info("[LodFov] built without sunranges");
+        if (!build(s, sh, vt, pf, "off", false)) { spdlog::warn("[LodFov] without sunranges and lowsuncsm: not used either, {}", g_why); return; }
+        spdlog::info("[LodFov] built without sunranges and lowsuncsm");
     } else {
         g_ranges_active = rg;
+        g_lowsun_active = ls;
     }
     if (std::string hw; !hook_read(hw)) { spdlog::warn("[LodFov] the read hook was not made ({}): not used, the game's own render config", hw); return; }
     g_active        = s;
@@ -739,6 +754,13 @@ std::string sun_ranges()
     std::lock_guard lk{ g_ranges_mx };
     return g_ranges;
 }
+void set_low_sun_csm(bool on)
+{
+    g_lowsun = on;
+    spdlog::info("[LodFov] lowsuncsm {} saved: used from the next game start (this run: {})", on ? "on" : "off", g_lowsun_active ? "on" : "off");
+}
+bool low_sun_csm() { return g_lowsun.load(); }
+bool low_sun_csm_active() { return g_lowsun_active; }
 std::string sun_ranges_active() { return g_ranges_active == "off" ? std::string{ "the game's (4 / 11 / 30 m)" } : g_ranges_active + " m"; }
 int shadow_res_active() { return g_shadow_active; }
 
@@ -779,6 +801,7 @@ std::string describe()
     if (g_vt_active != 0.0f) s += fmt::format(", ground texture bias {:+.2f}", g_vt_active);
     if (g_perf_active != 0) s += ", " + perf_names(g_perf_active);
     if (g_ranges_active != "off") s += ", sun cascades end at " + g_ranges_active + " m";
+    if (g_lowsun_active) s += ", three sun cascades in the evening and at night (lowsuncsm)";
     return fmt::format("{}, given to the game {} times", s, g_patched.load());
 }
 }

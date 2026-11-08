@@ -53,6 +53,17 @@
 //    arm hair, an ordinary draw, followed the controllers; since patch 7 the hair takes the skin's move, so neither showed. auto: each drive the
 //    skin's palm is set against the hair's hand of the same side in the same frame for each kind, and the kind that puts it there is used
 //    (FarCry5VehHands.cpp, space_check); the skin is not drawn for up to 45 frames while it is found. The others force a kind (test).
+//  - drivehandsmodel on|off (default on, saved; F11 Layout > Vehicles under the hands; author 7 Nov 21:30). The game still animates its own hands on the vehicle's wheel, bars or stick (drivehands hands) before the
+//    mod moves them onto the controllers, and the car's wheel model turns as the game steers (eased, later than the stick:
+//    research\2026-11-07_steerlag). On: (1) the drive's wheel, bars or stick is placed where the game's hands say the vehicle's own is (the wheel:
+//    its centre, axis and grip radius from a game hand's rigid turn of 30 deg or more, confirmed by a second one; until then the drive's own
+//    place), so a grip on the car's wheel takes it; (2) a hand that holds the wheel is turned about the wheel's axis as far as the game turns
+//    its wheel model (read from the game hand that holds the rim: in the simulator run of 8 Nov the game's left hand turned with the wheel
+//    and the right one stayed put, round 2); a hand on the bars rides the game hand of its side; a hand on the stick rides the game hand on
+//    it (the one nearer the drive's stick, within 45 cm). With the game's sidearm out, the other game hand carries the bars. Off: the hand
+//    turns with the drive's own wheel, as before.
+//    vehwheels (FarCry5VehHands.cpp; author 8 Nov 10:35): each vehicle's learnt wheel kept by its model and seat (bin\fc5vr_vehwheels.txt, and the built-in
+//    FarCry5VehWheelTable.h from a simulator pass), so the ring is on that vehicle's own wheel from the moment you sit.
 //  - drivequadseat M (default 0.15, saved; 0 = off; author 7 Nov 10:58): the game
 //    calls a quad wheeled (type 0) like a car, and only a quad spawned from F11 had its archetype. vehseathold learns where the camera sits
 //    on the vehicle's model: the quad's driver on its centre line (11:41: 0.00 m), a car's 0.39-0.46 m to the side. Type 0 with the seat
@@ -116,6 +127,8 @@ namespace fc5::drive
         float twist{ 0.0f };
         bool  right_brake{ false };    // the right hand holds a wheel or bars: its trigger brakes (LT) instead of shooting (LB)
         float buzz[2]{};               // haptic pulse on that hand this poll (taking or letting go)
+        float dist[2]{ 1e3f, 1e3f };   // drivereadyaway: each hand's distance from the control this poll (m; 1e3: no control, or not tracked)
+        float since_let_go[2]{ 1e3f, 1e3f };   // drivereadyaway: s since that hand last let go of the control (1e3: never)
         bool  log{ false };            // drivelog: ModConfig.cpp logs the pad values sent (once a second while in use)
     };
 
@@ -166,11 +179,33 @@ namespace fc5::drive
         bool      direct{ false };     // drivehandsdirect: the bare arms' indirect draws drawn directly, one instance (the game's culling skipped; test)
         bool      ontop{ false };      // drivehandsontop: the bare arms drawn over everything (depth test always passes, depth still written; test)
         int       space{ -1 };         // drivehandsspace: -1 auto, 0 object (VS b1), 1 the arm hair's b1, 2 world, 3 camera-relative, 4 view
+        bool      model{ true };       // drivehandsmodel: a held hand rides the game's own hand on the vehicle's wheel, bars or stick
     };
     HandOpts hand_opts();
+    // drivehandsmodel (FarCry5VehHands.cpp -> here): the vehicle's own control, found from the game's hands on it, in the recentred reference
+    // (the drive's own space: m, x right, y up, z back, origin at the head at the last recentre). The drive's wheel, bars or stick is moved
+    // there while no hand holds it, so a grip on the car's own wheel takes it.
+    struct Model
+    {
+        int       style{ kNone };              // kWheel: centre, n (towards the driver), radius; kBars: centre, radius = half width; kStick: centre = the grip
+        glm::vec3 centre{ 0.0f };
+        glm::vec3 n{ 0.0f, 0.0f, 1.0f };
+        float     radius{ 0.0f };
+        bool      axis_learnt{ false };        // wheel: its axis from the game hand's own turn (always, since round 2)
+    };
+    void set_model(const Model& m);
+    // drivemodelctrl (test): the point on the drive's control (the vehicle's own once found) a testctrl hand of that side takes it at (ref, m).
+    bool model_point(int side, glm::vec3& p);
+    // drivewheelscan S (test, not saved): for S seconds, the vehicle's draws near the driver logged with their turn in the vehicle's axes
+    // (FarCry5VehHands.cpp, veh_wheel_scan), to find the steering wheel's own draw or bone.
+    bool wheel_scan_active();
     // driveready (author 7 Nov 08:54): 0 off, 1 the right grip taps the pad's Y (the game's change weapon in a vehicle: the sidearm drawn, no shot),
     // 2 it taps LB instead (test: the game's shoot, which draws first). ModConfig.cpp sends it.
     int      ready_mode();
+    // drivereadyaway (patch 15): m from the wheel or bars a right grip's press must start for driveready to draw (and over 1 s after that hand
+    // let go of them). drivegunthrottle: 0 off (right A sends no RT while the sidearm is out), 1 stick (test: it pushes the left stick instead).
+    float    ready_away();
+    int      gun_throttle();
     // drivemenu (author 7 Nov 12:02, 12:15): 0 off, 1 in vehicles, 2 everywhere (default); drivemenuhold: ms that make a press long. ModConfig.cpp sends it.
     int      menu_mode();
     int      menu_hold_ms();

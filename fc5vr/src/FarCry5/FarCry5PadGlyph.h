@@ -50,7 +50,8 @@ namespace fc5::padglyph
     // Present thread: the icons follow the controllers and the vehicle layout; textures the game let go are released; probe lines.
     void frame(ID3D11DeviceContext* ctx, const FrameIn& in);
 
-    // install_scene_hook: FC_m64.dll's base, for padglyphprobe.
+    // install_scene_hook: FC_m64.dll's base, for padglyphprobe and padonly (padonly on|off, saved, default on: the game's device pick
+    // never chooses the keyboard or mouse while a pad is there, so the prompts and the weapon wheel stay the controller's).
     void set_game_base(uint8_t* base);
 
     bool command(const std::string& cmd, const std::string& arg, std::istream& rest, bool& persist);

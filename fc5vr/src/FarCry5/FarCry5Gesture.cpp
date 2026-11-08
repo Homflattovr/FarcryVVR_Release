@@ -18,6 +18,7 @@
 #include <map>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace fc5::gesture
@@ -195,7 +196,8 @@ namespace
         bool              side_again{ false };   // the sidearm came once and the spot was picked again
         bool              via_y{ false };        // pad Y (the game's last weapon) instead of the wheel
         bool              key{ false };          // shoulderkeys: the slot's keyboard key instead of the wheel
-        uint32_t          from{ 0 }, got{ 0 };
+        bool              by_item{ false };      // gamedrawgrab: the game asked for the slot's known weapon (asked) instead of its key
+        uint32_t          from{ 0 }, got{ 0 }, asked{ 0 };
         clock::time_point t{}, got_t{}, y_until{};
     };
     ShPick                              g_shp;
@@ -203,6 +205,21 @@ namespace
     std::unordered_map<uint32_t, int>   g_sh_weak;        // weapon id -> slot: a pick there gave nothing while it was held (probably its own)
     std::vector<clock::time_point>      g_sh_empty_t;     // per slot: when a pick there gave nothing while another slot's weapon was held
     std::map<int, int>                  g_sh_miss;        // per slot: picks in a row there that gave nothing (2: taken as locked or empty)
+    // slotforget (author 7 Nov 20:36; his 21:28-21:31 log):
+    // a weapon picked up replaces a slot's weapon, but the slot kept the old one (a picked-up weapon reached by pad Y was never learned, and
+    // two weapons could sit at one slot), so the shoulder drew the gone weapon's copy and asked the game for an item it no longer had.
+    // The main weapons held this session: one never held before, not brought by a pick, means the loadout changed (a pickup).
+    std::unordered_set<uint32_t>        g_sh_seen;
+    // slotcarried on|off (saved, default on; author 7 Nov 20:51): the game's inventory is asked whether each slot's remembered weapon is still carried (FarCry5Lua carried_watch). One that is not is
+    // forgotten at once, and the weapon picked up in its place (held for the first time within 10 s of it) takes its slot, so its copy is in the hand at the
+    // next grab. Trusted once the weapon in hand has answered "carried"; the weapon in hand answering "not carried" turns it off for the session.
+    std::atomic<bool>                   g_sh_carry{ true };
+    int                                 g_sh_lost_slot = -1;      // the slot whose weapon the game said is gone
+    uint32_t                            g_sh_lost_sig  = 0;
+    clock::time_point                   g_sh_lost_t{};
+    uint32_t                            g_sh_new_sig = 0;         // a weapon held for the first time, its slot not known yet
+    clock::time_point                   g_sh_new_t{};
+    std::atomic<bool>                   g_sh_carry_seen{ false }, g_sh_carry_bad{ false };   // (carried_trusted, the render thread)
     bool                                g_wheel_by_sh = false;   // the wheel pick under way is the shoulder's (its direction), not the sidearm's (right)
     float                               g_sh_x = 0.0f, g_sh_y = 1.0f;
     std::atomic<uint32_t>               g_sh_target{ 0 };  // the weapon known at the spot being picked (shoulderinstant's guess)
@@ -338,7 +355,7 @@ namespace
     // The neck's pivot from the eyes (head frame: down, back; m): the shoulders hang from it in the body's frame, so turning or
     // tilting the head does not move them (author 24 Oct 13:29). Body frame: x right, y up, +z back at body yaw 0; with the head level and facing the body's heading this is
     // the old point (side / below the eyes / behind the eyes), so gestureshoulder keeps its meaning. side = +1 the right shoulder, -1 the left.
-    constexpr float kNeckDown = 0.10f, kNeckBack = 0.08f;
+    constexpr float kNeckDown = kNeckPivotDown, kNeckBack = kNeckPivotBack;   // FarCry5Gesture.h (armik hangs its shoulders there too)
     glm::vec3 shoulder(const glm::mat4& head, float side)
     {
         const glm::vec3 neck = glm::vec3{ head[3] } + glm::mat3{ head } * glm::vec3{ 0.0f, -kNeckDown, kNeckBack };
@@ -531,6 +548,8 @@ glm::vec3 pouch_pos(const glm::mat4& head, bool mirror, glm::vec3& fwd)
     fwd                  = body * glm::vec3{ 0.0f, 0.0f, -1.0f };
     return glm::vec3{ head[3] } + body * glm::vec3{ m * p[0], -p[1], -p[2] };
 }
+
+float body_yaw() { return g_body_yaw.load(); }
 
 glm::mat4 rest_pose(const glm::mat4& head, bool mirror) { return (side_on() && g_cur_side.load()) ? hip_pose(head, mirror) : sling_pose(head, mirror); }
 
@@ -837,7 +856,7 @@ Output update(const Input& in_game)
         ri.active   = ri.listed && in.allowed && in.weapon && !g_slung.load() && !bow_on;   // (the sling's state of the last poll)
         ri.sig      = in.sig;
         ri.gun_pos  = in.hand[kWeaponHand].pos;
-        ri.gun_rot  = in.weapon_rot;
+        ri.gun_rot  = in.weapon_draw_rot_ok ? in.weapon_draw_rot : in.weapon_rot;   // reloadzonesfollow: the gun as drawn (gunstock calibration, two hands)
         ri.gun_ok   = in.hand[kWeaponHand].tracked && in.weapon_rot_ok;
         ri.hand_pos = in.hand[kOtherHand].pos;
         ri.hand_rot = in.other_rot;
@@ -882,7 +901,10 @@ Output update(const Input& in_game)
     // shoulderkeys (default on; author 30 Oct 12:431" keyboard keybinds short) and second main
     // slot weapon (MP5, or key "2" on keyboard in keybinds)"; the wheel spots gave his pistol and melee weapon): slot N is the game's weapon
     // slot key N, tapped once (scan codes 0x02-0x05 for 1-4). Off: the weapon wheel's spot (shoulderslots).
-    auto press_slot = [&](int i) {
+    // key_only (slotforget): the slot's key even when its weapon's item is known (the game ignored the ask for that item).
+    auto press_slot = [&](int i, bool key_only = false) {
+        g_shp.by_item = false;
+        g_shp.asked   = 0;
         if (g_sh_keys.load()) {
             out.key_scan  = uint16_t(0x02 + std::clamp(i, 0, 3));
             g_shp.key     = true;
@@ -892,8 +914,10 @@ Output update(const Input& in_game)
             uint32_t known = 0;
             for (const auto& [w, s] : g_sh_slot_of) if (s == i) known = w;
             g_sh_target = known;
-            if (const uint64_t item = g_game_draw.load() ? fc5::gameweapon::item(known) : 0; item != 0) {
-                out.key_scan = 0;
+            if (const uint64_t item = g_game_draw.load() && !key_only ? fc5::gameweapon::item(known) : 0; item != 0) {
+                out.key_scan  = 0;
+                g_shp.by_item = true;
+                g_shp.asked   = known;
                 fc5::lua::game_draw(item, false);
                 spdlog::info("[Gesture] shoulderswitch: slot {}: the game asked for weapon {} (item {:x}, gamedrawgrab)", i + 1, known, item);
             }
@@ -930,8 +954,11 @@ Output update(const Input& in_game)
         g_shp.side_again = false;
         // The slot's weapon is the game's last weapon (the one held before this one): pad Y brings it in about 0.5 s, the wheel (held 500 ms
         // to be read) in about 0.9 s (author 11:35).
+        // slotforget: not when gamedrawgrab can ask for that very weapon: pad Y brings whatever the game's last weapon is (his 21:28:50 log:
+        // the AR-C's last weapon was the M133 just picked up, not slot 2's AR-CL, whose copy showed until the M133 came).
         const auto pv = g_sh_slot_of.find(g_held_prev);
-        g_shp.via_y   = g_held_prev != 0 && g_held_cur == in.sig && pv != g_sh_slot_of.end() && pv->second == i;
+        g_shp.via_y   = g_held_prev != 0 && g_held_cur == in.sig && pv != g_sh_slot_of.end() && pv->second == i &&
+                        !(g_game_draw.load() && g_sh_keys.load() && fc5::gameweapon::item(g_held_prev) != 0);
         if (g_shp.via_y) {
             g_shp.idx     = i;
             g_shp.t       = now;
@@ -946,6 +973,76 @@ Output update(const Input& in_game)
                      g_shp.key ? fmt::format("keyboard key {}", i + 1) : fmt::format("the weapon wheel, {:.0f} deg", spots[std::clamp(i, 0, std::max(0, (int)spots.size() - 1))]), in.sig,
                      g_sh_target.load() ? fmt::format("; slot {} gave weapon {} before", i + 1, g_sh_target.load()) : std::string{});
     };
+    // slotcarried: a weapon picked up takes the slot whose weapon just went (the two within 10 s, either first).
+    auto carry_assign = [&]() {
+        if (g_sh_new_sig == 0 || g_sh_lost_slot < 0) return;
+        const float gap = std::chrono::duration<float>(g_sh_new_t > g_sh_lost_t ? g_sh_new_t - g_sh_lost_t : g_sh_lost_t - g_sh_new_t).count();
+        if (gap >= 10.0f) {   // the older of the two is not this one's: kept the newer
+            if (g_sh_new_t > g_sh_lost_t) g_sh_lost_slot = -1;
+            else g_sh_new_sig = 0;
+            return;
+        }
+        if (!g_sh_slot_of.contains(g_sh_new_sig)) {
+            for (auto e = g_sh_slot_of.begin(); e != g_sh_slot_of.end();) e = e->second == g_sh_lost_slot ? g_sh_slot_of.erase(e) : std::next(e);
+            g_sh_slot_of[g_sh_new_sig] = g_sh_lost_slot;
+            g_sh_weak.erase(g_sh_new_sig);
+            spdlog::info("[Gesture] slotcarried: weapon {} (picked up) takes slot {}, whose weapon {} went ({:.1f} s apart)", g_sh_new_sig, g_sh_lost_slot + 1, g_sh_lost_sig, gap);
+        }
+        g_sh_new_sig   = 0;
+        g_sh_lost_slot = -1;
+    };
+    if (g_sh_carry.load() && !g_sh_carry_bad) {
+        uint64_t       items[8]{};
+        uint32_t       sigs[8]{};
+        int            k         = 0;
+        const uint64_t held_item = g_held_cur != 0 && in.sig == g_held_cur ? fc5::gameweapon::item(g_held_cur) : 0;
+        if (held_item != 0) {
+            items[k]  = held_item;
+            sigs[k++] = g_held_cur;
+        }
+        for (const auto& [w, sl] : g_sh_slot_of) {
+            const uint64_t it = fc5::gameweapon::item(w);
+            if (k < 8 && it != 0 && it != held_item) {
+                items[k]  = it;
+                sigs[k++] = w;
+            }
+        }
+        const int k_slots = k;   // the slot weapons end here
+        // weaponcache (FarCry5Holster.cpp): the sling's and the hip's weapons too, kept from the last start (one gone is left out there).
+        for (const uint32_t w : { in.main_sig, in.side_sig }) {
+            const uint64_t it = fc5::gameweapon::item(w);
+            if (k < 8 && it != 0 && std::find(items, items + k, it) == items + k) {
+                items[k]  = it;
+                sigs[k++] = w;
+            }
+        }
+        fc5::lua::carried_watch(items, k);
+        if (held_item != 0 && !g_sh_carry_seen) {
+            const int c = fc5::lua::item_carried(held_item);
+            if (c == 1) {
+                g_sh_carry_seen = true;
+                spdlog::info("[Gesture] slotcarried: the game says the weapon in hand {} (item {:x}) is carried: its answers are used from now", g_held_cur, held_item);
+            } else if (c == 0) {
+                g_sh_carry_bad = true;
+                fc5::lua::carried_watch(nullptr, 0);
+                spdlog::error("[Gesture] slotcarried: the game says the weapon in hand {} (item {:x}) is NOT carried: the call is not what was read; off this session (slotforget's rules instead)",
+                              g_held_cur, held_item);
+            }
+        }
+        if (g_sh_carry_seen && !g_sh_carry_bad) {
+            for (int i = 0; i < k_slots; ++i) {
+                if (sigs[i] == in.sig || fc5::lua::item_carried(items[i]) != 0) continue;
+                const auto e = g_sh_slot_of.find(sigs[i]);
+                if (e == g_sh_slot_of.end()) continue;
+                g_sh_lost_slot = e->second;
+                g_sh_lost_sig  = sigs[i];
+                g_sh_lost_t    = now;
+                spdlog::info("[Gesture] slotcarried: weapon {} (item {:x}) is no longer carried (dropped, or swapped for a weapon picked up): forgotten for slot {}", sigs[i], items[i], e->second + 1);
+                g_sh_slot_of.erase(e);
+                carry_assign();
+            }
+        }
+    }
     // loadslot on|off (saved, default on; author 30 Oct 13:52): his 14:30 log loaded with the bare hands out (4110), so nothing hung on the sling. Once after a load (or a menu of over 5 s), when
     // it has been playable 2.5 s, no switch or sidearm look is under way, and the game holds neither the main weapon nor the sidearm: the
     // left shoulder's slot (his first main weapon) is taken, as its grip would, and hangs on the sling. Given up 30 s after the load.
@@ -1176,7 +1273,16 @@ Output update(const Input& in_game)
             to_wheel(fmt::format("the sidearm {} came (read as the game's last weapon)", in.sig).c_str());
         } else if (landed) {
             if (!in.cur_side && !g_shp.via_y) {
+                // slotforget: one weapon per slot: the one it held before is gone (swapped for a weapon picked up).
+                const int slot = g_shp.idx;
+                for (auto e = g_sh_slot_of.begin(); e != g_sh_slot_of.end();) {
+                    if (e->second == slot && e->first != in.sig) {
+                        spdlog::info("[Gesture] shoulderswitch: slot {} now gives weapon {}: weapon {} forgotten there (slotforget)", slot + 1, in.sig, e->first);
+                        e = g_sh_slot_of.erase(e);
+                    } else ++e;
+                }
                 g_sh_slot_of[in.sig] = g_shp.idx;
+                g_sh_seen.insert(in.sig);
                 g_sh_weak.erase(in.sig);
                 if (g_shp.idx < (int)g_sh_empty_t.size()) g_sh_empty_t[g_shp.idx] = clock::time_point{};
                 g_sh_miss[g_shp.idx] = 0;
@@ -1190,6 +1296,17 @@ Output update(const Input& in_game)
             g_shp.on = false;
         } else if (g_shp.via_y && g_shp.got == 0 && now > g_shp.y_until + std::chrono::milliseconds(900)) {
             to_wheel("pad Y brought nothing in 0.9 s");
+        } else if (!g_shp.via_y && g_shp.by_item && g_shp.got == 0 && now > g_shp.t + std::chrono::milliseconds(500)) {
+            // slotforget: the game ignored the ask for the slot's known weapon (it answers in 0.18-0.21 s in his logs): the player no longer has
+            // it (dropped, or swapped for a weapon picked up). Forgotten, and the slot's own key taken now (the window opens again, its hand empty).
+            const uint32_t gone = g_shp.asked;
+            g_sh_slot_of.erase(gone);
+            g_shp.via_y = false;
+            g_switch_count++;   // shoulderdraw: the switch window again (no copy guessed: the slot's weapon is not known now)
+            g_shp.from  = in.sig;
+            press_slot(g_shp.idx, true);
+            spdlog::info("[Gesture] shoulderswitch: the game ignored the ask for weapon {} in 0.5 s (no longer carried): forgotten for slot {}, its keyboard key now (slotforget)",
+                         gone, g_shp.idx + 1);
         } else if (!g_shp.via_y && g_shp.got == 0 && now > (g_shp.key ? g_shp.t + std::chrono::milliseconds(900) : g_wheel_until + std::chrono::milliseconds(700))) {
             const int i = g_shp.idx;
             if ((int)g_sh_empty_t.size() != n) g_sh_empty_t.assign(n, clock::time_point{});
@@ -1230,6 +1347,29 @@ Output update(const Input& in_game)
         ThrowPhase(g_th_phase.load()) == ThrowPhase::Idle && !g_v2_held.load() && !g_v2_rb.load() && !fc5::gameweapon::bare_hands(g_held_cand)) {
         g_held_prev = g_held_cur;
         g_held_cur  = g_held_cand;
+        // A weapon never held this session and not brought by a shoulder pick (one is learned at its slot as it lands): picked up, or first taken
+        // from the game's own wheel. A pickup replaces some slot's weapon. slotcarried: the slot is the one whose weapon the game says went (now,
+        // or within 10 s); a slot marked empty may have been filled. slotforget, without slotcarried's answers: the mod cannot tell which slot,
+        // so every slot's weapon is forgotten (each learned again from its key, an empty hand until the weapon is out) rather than a wrong copy shown.
+        const bool first = g_sh_seen.insert(g_held_cur).second;
+        if (first && !in.cur_side && g_held_cur != in.side_sig && !g_sh_slot_of.contains(g_held_cur) && !g_shp.on) {
+            for (auto& e : g_sh_empty_t) e = clock::time_point{};
+            g_sh_miss.clear();
+            if (g_sh_carry.load() && g_sh_carry_seen && !g_sh_carry_bad) {
+                g_sh_new_sig = g_held_cur;
+                g_sh_new_t   = now;
+                if (g_sh_lost_slot < 0 || now - g_sh_lost_t > std::chrono::seconds(10))
+                    spdlog::info("[Gesture] slotcarried: weapon {} held for the first time this session: its slot is the one whose weapon goes within 10 s, else learned at its first grab",
+                                 g_held_cur);
+                carry_assign();
+            } else if (!g_sh_slot_of.empty()) {
+                std::string was;
+                for (const auto& [w, sl] : g_sh_slot_of) was += fmt::format("{}slot {} weapon {}", was.empty() ? "" : ", ", sl + 1, w);
+                spdlog::info("[Gesture] shoulderswitch: weapon {} held for the first time this session (picked up?): the slots' weapons forgotten ({}) (slotforget)", g_held_cur, was);
+                g_sh_slot_of.clear();
+                g_sh_weak.clear();
+            }
+        }
     }
     if (g_sw_want.load() >= 0) {
         if (in.sig != 0 && in.sig != g_sw_from && in.sig != g_sw_new) {
@@ -1729,6 +1869,13 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
     if (cmd == "sidearmy") { g_side_y = on; persist = true; return true; }
     if (cmd == "shoulderwheelms") { g_sh_wheel_ms = std::clamp(int(fv), 80, 1500); persist = true; return true; }
     if (cmd == "shoulderpick") { g_sh_test_pick = std::clamp(int(fv), 1, 8); return true; }   // test: slot N picked as its shoulder's grip would
+    if (cmd == "slotcarried") {
+        g_sh_carry = on;
+        persist    = true;
+        if (!on) fc5::lua::carried_watch(nullptr, 0);
+        spdlog::info("[Gesture] slotcarried {}", on ? "on: the game's inventory says which remembered slot weapons are still carried" : "off");
+        return true;
+    }
     if (cmd == "gamedrawgrab") { g_game_draw = on; persist = true; spdlog::info("[Gesture] gamedrawgrab {}", on ? "on" : "off"); return true; }
     if (cmd == "shoulderkeys") { g_sh_keys = on; persist = true; return true; }   // the shoulders press the weapon slot keys 1-4 (off: the weapon wheel)
     if (cmd == "loadslot") { g_ls_on = on; persist = true; return true; }   // after a load with no main weapon out, the left shoulder's slot taken
@@ -1871,6 +2018,8 @@ bool side_on() { init(); return g_state[kSide].on.load() && g_state[kSling].on.l
 bool cur_side() { return g_cur_side.load(); }
 int  switch_want() { return side_on() ? g_sw_want.load() : -1; }
 bool game_draw_grab() { return g_game_draw.load(); }
+bool slot_carried_on() { return g_sh_carry.load(); }
+bool carried_trusted() { return g_sh_carry.load() && g_sh_carry_seen.load() && !g_sh_carry_bad.load(); }
 bool switch_grabbed() { return g_sw_grab.load(); }
 int  side_key() { return g_side_key.load(); }
 bool side_peek_on() { return g_side_peek.load(); }

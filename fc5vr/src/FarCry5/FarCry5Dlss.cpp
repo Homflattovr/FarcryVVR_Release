@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <string_view>
 #include <thread>
 
 namespace fc5::dlss
@@ -1137,6 +1138,132 @@ void main(uint2 tid : SV_DispatchThreadID)
         return fmt::format("OFXR route: {}{}; {}; OFXR's DLSS publications {}{}", ofxr_route_name(fg), g_ofxr_mv.load() == 1 ? " + DLSS motion vectors" : "",
                            g_ofxr_wants.load() ? "takes DLSS data" : "takes no DLSS data (nothing to send)", g_ofxr_published.load(),
                            g_ofxr_d11.load() ? "; DLSS moved to D3D11 for OFXR" : "");
+    }
+    // ofxrmenupause (author 8 Nov 10:34). In menus, the map,
+    // loading screens and flat cinematics the mod sends no projection layer (only the flat screen's quad) and runs no DLSS, so OFXR's
+    // NVIDIA DLSS frame generation keeps making frames from nothing new: the menus blink with black layers (8 Nov 09:37 log: display
+    // period 22.22 ms and xrEndFrame 5-9 ms in every menu; on OFXR optical flow, 7 Nov 21:15, OFXR passed menus through at 11.11 ms).
+    // While the flat screen shows, the mod sets OFXR's own "pause frame generation" signal, the one the tray's Ctrl+Alt+F7 sets (a
+    // named manual-reset event per arm, Local\OFXRBridgePause-<n>, <n> from control_event in the layer's ofxr_bridge.ini), and
+    // resets it when the flat screen ends. A pause the player set by hand is left alone (the mod never resets a signal it did not
+    // set). A marker file in bin (fc5vr_ofxrpause.txt) says the mod holds the signal, so a game run that ended without resetting it
+    // (crash, killed) is undone at the next start instead of leaving OFXR paused.
+    namespace
+    {
+        std::atomic<bool> g_menu_pause{ true };    // ofxrmenupause (saved, default on)
+        HANDLE            g_pause_ev{ nullptr };   // OFXR's pause signal, opened once (EVENT_MODIFY_STATE | SYNCHRONIZE)
+        bool              g_pause_open_tried{ false };
+        bool              g_pause_owned{ false };  // the mod set the signal and has not reset it yet
+        bool              g_flat_prev{ false };
+        bool              g_marker_checked{ false };
+        uint32_t          g_pauses{ 0 };
+        constexpr wchar_t kPauseMarker[] = L"fc5vr_ofxrpause.txt";
+
+        HANDLE ofxr_pause_event()
+        {
+            if (g_pause_ev || g_pause_open_tried) return g_pause_ev;
+            const HMODULE l = ofxr_layer();
+            if (!l) return nullptr;   // OFXR not loaded (yet): try again on the next flat screen
+            g_pause_open_tried = true;
+            wchar_t path[MAX_PATH]{};
+            const DWORD n = GetModuleFileNameW(l, path, MAX_PATH);
+            if (n == 0 || n >= MAX_PATH) {
+                spdlog::warn("[DLSS] ofxrmenupause: OFXR's folder not found: no pause in menus");
+                return nullptr;
+            }
+            std::wstring ini{ path, n };
+            const size_t slash = ini.find_last_of(L"\\/");
+            ini = (slash == std::wstring::npos ? std::wstring{} : ini.substr(0, slash + 1)) + L"ofxr_bridge.ini";
+            wchar_t value[128]{};
+            const DWORD c = GetPrivateProfileStringW(L"ofxr", L"control_event", L"", value, 128, ini.c_str());
+            const std::wstring_view v{ value, c };
+            constexpr std::wstring_view kArm = L"Local\\OFXRBridgeArmStop-";
+            bool digits = c > kArm.size() && v.starts_with(kArm);
+            for (size_t i = kArm.size(); digits && i < v.size(); ++i) digits = v[i] >= L'0' && v[i] <= L'9';
+            if (!digits) {
+                spdlog::warn("[DLSS] ofxrmenupause: no control_event in OFXR's ofxr_bridge.ini (not armed by its tray?): no pause in menus");
+                return nullptr;
+            }
+            const std::wstring name = L"Local\\OFXRBridgePause-" + std::wstring{ v.substr(kArm.size()) };
+            g_pause_ev = OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, name.c_str());
+            if (!g_pause_ev) spdlog::warn("[DLSS] ofxrmenupause: OFXR's pause signal could not be opened (error {}): no pause in menus", GetLastError());
+            else spdlog::info("[DLSS] ofxrmenupause: OFXR's pause signal found (the tray's Ctrl+Alt+F7 one)");
+            return g_pause_ev;
+        }
+        bool pause_set(HANDLE ev) { return WaitForSingleObject(ev, 0) == WAIT_OBJECT_0; }
+        void release_pause(const char* why)
+        {
+            if (!g_pause_owned) return;
+            g_pause_owned = false;
+            if (g_pause_ev) ResetEvent(g_pause_ev);
+            DeleteFileW(kPauseMarker);
+            spdlog::info("[DLSS] ofxrmenupause: OFXR frame generation resumed ({})", why);
+        }
+        // The game closing from a menu (Quit) ends the process with the signal set: reset it on the way out.
+        struct PauseAtExit
+        {
+            ~PauseAtExit()
+            {
+                if (g_pause_owned && g_pause_ev) {
+                    ResetEvent(g_pause_ev);
+                    DeleteFileW(kPauseMarker);
+                }
+            }
+        } g_pause_at_exit;
+    }
+
+    void set_ofxr_menu_pause(bool on)
+    {
+        g_menu_pause = on;
+        if (!on) release_pause("ofxrmenupause off");
+    }
+    bool ofxr_menu_pause() { return g_menu_pause.load(); }
+
+    void ofxr_flat_screen(bool flat)
+    {
+        if (!g_marker_checked && ofxr_layer()) {
+            // A marker left by an earlier run: that run set the signal and never reset it.
+            g_marker_checked = true;
+            if (GetFileAttributesW(kPauseMarker) != INVALID_FILE_ATTRIBUTES) {
+                if (HANDLE ev = ofxr_pause_event(); ev && pause_set(ev)) {
+                    ResetEvent(ev);
+                    spdlog::info("[DLSS] ofxrmenupause: the last game run left OFXR paused: resumed");
+                }
+                DeleteFileW(kPauseMarker);
+            }
+        }
+        if (flat == g_flat_prev) return;   // act on the flat screen's start and end only
+        g_flat_prev = flat;
+        if (!flat) {
+            release_pause("back to 3D");
+            return;
+        }
+        if (!g_menu_pause.load()) return;
+        HANDLE ev = ofxr_pause_event();
+        if (!ev) return;
+        if (pause_set(ev)) {
+            spdlog::info("[DLSS] ofxrmenupause: OFXR already paused by hand: left as it is");
+            return;
+        }
+        if (!SetEvent(ev)) {
+            spdlog::warn("[DLSS] ofxrmenupause: setting OFXR's pause signal failed (error {})", GetLastError());
+            return;
+        }
+        g_pause_owned = true;
+        if (HANDLE f = CreateFileW(kPauseMarker, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr); f != INVALID_HANDLE_VALUE) {
+            const char text[] = "The VR mod set OFXR's pause signal for a menu; the next start resets it if this file is still here.\r\n";
+            DWORD w = 0;
+            WriteFile(f, text, sizeof(text) - 1, &w, nullptr);
+            CloseHandle(f);
+        }
+        if (g_pauses++ < 20 || g_pauses % 50 == 0)
+            spdlog::info("[DLSS] ofxrmenupause: OFXR frame generation paused for the flat screen (route {}; {} so far)", ofxr_route_name(g_ofxr_fg.load()), g_pauses);
+    }
+    std::string ofxr_menu_pause_status()
+    {
+        if (!ofxr_layer()) return "OFXR Bridge is not loaded";
+        if (g_pause_open_tried && !g_pause_ev) return "OFXR's pause signal not found (see the log): no pause in menus";
+        return fmt::format("{}; paused for the flat screen {} times this run", g_pause_owned ? "OFXR paused now (flat screen)" : "OFXR not paused by the mod now", g_pauses);
     }
     void set_ofxr_tags(bool on) { g_ofxr_tags = on; }
     bool ofxr_tags() { return g_ofxr_tags.load(); }

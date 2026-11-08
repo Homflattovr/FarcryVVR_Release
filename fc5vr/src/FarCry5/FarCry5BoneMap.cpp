@@ -491,7 +491,78 @@ void FarCry5Stereo::bonemap_note(ID3D11DeviceContext* ctx, UINT count, UINT star
     }
     if (!have || (skinned && pal.size() < 3072)) return;   // a draw another move set its own constants for (reloadmagmodel, bowarrowmodel, throwable)
 
-    // Its vertices, once (one draw every 5 frames: each is a GPU read).
+    const Scan* sc = static_cast<const Scan*>(bonemap_scan(ctx, count, start, base, skinned, scale));
+
+    int       alts = 0;
+    const int mb   = !skinned ? -2 : sc ? sc->max_bone : -1;
+    const int d    = fc5::bonemap::find(count, mb, how == 2, alts);
+    if (d >= 0) s.named++;
+    else {
+        s.unknown++;
+        if (s.unknown_said.size() < 64 && s.unknown_said.insert(count).second)
+            spdlog::info("[BoneMap] draw {} indices ({}, {}{}) not in the tables: labelled by id", count, how == 2 ? "indirect" : how == 1 ? "hidden" : "drawn",
+                         skinned ? "skinned" : "rigid", sc && skinned ? fmt::format(", palette slots up to {}", sc->max_bone) : std::string{});
+    }
+
+    // Rest space -> game world (b1, the slot's palette matrix), then the weapon pass's placement: game world -> drawn world.
+    const glm::mat3 L   = hm.w_rot * hm.rot;
+    const glm::mat4 w2d = affine(L, hm.w_pos - hm.w_rot * hm.grip - L * hm.cam);
+    const glm::mat4 Om  = from_rows(obj);
+    std::string     dump;
+    const glm::mat4 ci = glm::inverse(affine(m_mo.ctrl_rot_world, m_mo.ctrl_pos_world));
+    auto add = [&](int slot, const glm::vec3& rest_p, const glm::mat4& T, int group) {
+        Pt pt{};
+        pt.p      = point(w2d * T, rest_p);
+        pt.group  = group;
+        pt.hidden = how == 1;
+        pt.count  = count;
+        pt.slot   = slot;
+        pt.draw   = d;
+        pt.name   = d >= 0 ? (slot >= 0 ? fc5::bonemap::slot_name(d, slot) : fc5::bonemap::nbones(d) == 1 ? fc5::bonemap::slot_name(d, 0) : nullptr) : nullptr;
+        if (s.dump_now) {
+            const glm::vec3 c = point(ci, pt.p) * 100.0f;
+            const int       n = sc ? (slot >= 0 ? (sc->n.contains(slot) ? sc->n.at(slot) : 0) : sc->verts) : -1;
+            dump += fmt::format(" {}:{}[{}v]({:.1f},{:.1f},{:.1f})", slot >= 0 ? std::to_string(slot) : std::string{ "r" }, pt.name ? pt.name : "?", n, c.x, c.y, c.z);
+        }
+        if (o.show[std::clamp(group, 1, 5)]) s.cur.push_back(pt);
+    };
+    if (skinned) {
+        const int nb = d >= 0 ? fc5::bonemap::nbones(d) : 0;
+        if (nb > 0) {
+            for (int b = 0; b < nb && b < 256; ++b) {
+                float     j[3]{};
+                glm::vec3 rp{ 0.0f };
+                const bool have_cent = sc && sc->cent.contains(b);
+                if (o.joints && fc5::bonemap::slot_joint(d, b, j)) rp = glm::vec3{ j[0], j[1], j[2] };
+                else if (have_cent) rp = sc->cent.at(b);
+                else continue;
+                add(b, rp, Om * from_rows(pal.data() + size_t(b) * 12), fc5::bonemap::slot_group(d, b));
+            }
+        } else if (sc) {
+            for (const auto& [b, c] : sc->cent)
+                if (b < 256 && sc->n.at(b) >= 3) add(b, c, Om * from_rows(pal.data() + size_t(b) * 12), fc5::bonemap::kOther);
+        }
+    } else {
+        add(-1, sc ? sc->all : glm::vec3{ 0.0f }, Om, d >= 0 && fc5::bonemap::kind(d) == 1 ? fc5::bonemap::kWeapon : fc5::bonemap::kOther);
+    }
+    if (s.dump_now && s.dump_lines < 200) {
+        s.dump_lines++;
+        spdlog::info("[BoneMap] dump: draw {} from {} base {} ({}, {}): {}{}; slots (name [vertices] (right, up, back) cm on the weapon controller):{}", count, start, base,
+                     how == 2 ? "indirect" : how == 1 ? "hidden by the mod" : "drawn", skinned ? "skinned" : "rigid", d >= 0 ? fc5::bonemap::model(d) : "not in the tables",
+                     d >= 0 ? fmt::format(" ({} slots{}{})", fc5::bonemap::nbones(d), alts ? fmt::format(", {} other models share it", alts) : std::string{},
+                                          fc5::bonenames::kDraws[d].count != count ? fmt::format(", its {} indices padded", fc5::bonenames::kDraws[d].count) : std::string{})
+                            : std::string{},
+                     dump.empty() ? " none" : dump);
+    }
+}
+
+// A draw's vertices read once (one draw every 5 frames: each is a GPU read): the palette slots they use and their centres. Shared by
+// bonemap_note and bonemap_identify (armik). Returns the Scan, or nullptr while it is not read (yet, or it failed).
+const void* FarCry5Stereo::bonemap_scan(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, bool skinned, float scale)
+{
+    if (!m_bm) m_bm = new BoneMapState{};
+    auto&     s     = *m_bm;
+    const int frame = m_frame.load();
     ID3D11Buffer* vb = nullptr;
     UINT          stride = 0, voff = 0;
     ctx->IAGetVertexBuffers(0, 1, &vb, &stride, &voff);
@@ -572,69 +643,32 @@ void FarCry5Stereo::bonemap_note(ID3D11DeviceContext* ctx, UINT count, UINT star
     }
     if (vb) vb->Release();
     if (ib) ib->Release();
-    const Scan* sc = si != s.scans.end() ? &si->second : nullptr;
+    return si != s.scans.end() ? &si->second : nullptr;
+}
 
-    int       alts = 0;
-    const int mb   = !skinned ? -2 : sc ? sc->max_bone : -1;
-    const int d    = fc5::bonemap::find(count, mb, how == 2, alts);
-    if (d >= 0) s.named++;
-    else {
-        s.unknown++;
-        if (s.unknown_said.size() < 64 && s.unknown_said.insert(count).second)
-            spdlog::info("[BoneMap] draw {} indices ({}, {}{}) not in the tables: labelled by id", count, how == 2 ? "indirect" : how == 1 ? "hidden" : "drawn",
-                         skinned ? "skinned" : "rigid", sc && skinned ? fmt::format(", palette slots up to {}", sc->max_bone) : std::string{});
+// armik (FarCry5ArmIkDraw.cpp): the kDraws index of the draw now bound (-1 unknown, or two models share its count and its vertices are not read yet).
+int FarCry5Stereo::bonemap_identify(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, bool indirect, int& alts)
+{
+    alts = 0;
+    if (count == 0 || !ctx) return -1;
+    ID3D11Buffer* cb[2]{};
+    ctx->VSGetConstantBuffers(2, 2, cb);   // b2 CSceneGeometry (position scale), b3 the palette
+    bool  skinned = false;
+    float scale   = 0.0f;
+    if (cb[1]) {
+        D3D11_BUFFER_DESC d{};
+        cb[1]->GetDesc(&d);
+        skinned = d.ByteWidth == kPaletteBytes;
     }
-
-    // Rest space -> game world (b1, the slot's palette matrix), then the weapon pass's placement: game world -> drawn world.
-    const glm::mat3 L   = hm.w_rot * hm.rot;
-    const glm::mat4 w2d = affine(L, hm.w_pos - hm.w_rot * hm.grip - L * hm.cam);
-    const glm::mat4 Om  = from_rows(obj);
-    std::string     dump;
-    const glm::mat4 ci = glm::inverse(affine(m_mo.ctrl_rot_world, m_mo.ctrl_pos_world));
-    auto add = [&](int slot, const glm::vec3& rest_p, const glm::mat4& T, int group) {
-        Pt pt{};
-        pt.p      = point(w2d * T, rest_p);
-        pt.group  = group;
-        pt.hidden = how == 1;
-        pt.count  = count;
-        pt.slot   = slot;
-        pt.draw   = d;
-        pt.name   = d >= 0 ? (slot >= 0 ? fc5::bonemap::slot_name(d, slot) : fc5::bonemap::nbones(d) == 1 ? fc5::bonemap::slot_name(d, 0) : nullptr) : nullptr;
-        if (s.dump_now) {
-            const glm::vec3 c = point(ci, pt.p) * 100.0f;
-            const int       n = sc ? (slot >= 0 ? (sc->n.contains(slot) ? sc->n.at(slot) : 0) : sc->verts) : -1;
-            dump += fmt::format(" {}:{}[{}v]({:.1f},{:.1f},{:.1f})", slot >= 0 ? std::to_string(slot) : std::string{ "r" }, pt.name ? pt.name : "?", n, c.x, c.y, c.z);
-        }
-        if (o.show[std::clamp(group, 1, 5)]) s.cur.push_back(pt);
-    };
-    if (skinned) {
-        const int nb = d >= 0 ? fc5::bonemap::nbones(d) : 0;
-        if (nb > 0) {
-            for (int b = 0; b < nb && b < 256; ++b) {
-                float     j[3]{};
-                glm::vec3 rp{ 0.0f };
-                const bool have_cent = sc && sc->cent.contains(b);
-                if (o.joints && fc5::bonemap::slot_joint(d, b, j)) rp = glm::vec3{ j[0], j[1], j[2] };
-                else if (have_cent) rp = sc->cent.at(b);
-                else continue;
-                add(b, rp, Om * from_rows(pal.data() + size_t(b) * 12), fc5::bonemap::slot_group(d, b));
-            }
-        } else if (sc) {
-            for (const auto& [b, c] : sc->cent)
-                if (b < 256 && sc->n.at(b) >= 3) add(b, c, Om * from_rows(pal.data() + size_t(b) * 12), fc5::bonemap::kOther);
-        }
-    } else {
-        add(-1, sc ? sc->all : glm::vec3{ 0.0f }, Om, d >= 0 && fc5::bonemap::kind(d) == 1 ? fc5::bonemap::kWeapon : fc5::bonemap::kOther);
+    {
+        std::lock_guard _{ m_obj_mtx };
+        if (cb[0]) if (auto it = m_obj_consts.find(cb[0]); it != m_obj_consts.end() && it->second.f[5] > 1e-7f && it->second.f[5] < 1e-2f) scale = it->second.f[5];
     }
-    if (s.dump_now && s.dump_lines < 200) {
-        s.dump_lines++;
-        spdlog::info("[BoneMap] dump: draw {} from {} base {} ({}, {}): {}{}; slots (name [vertices] (right, up, back) cm on the weapon controller):{}", count, start, base,
-                     how == 2 ? "indirect" : how == 1 ? "hidden by the mod" : "drawn", skinned ? "skinned" : "rigid", d >= 0 ? fc5::bonemap::model(d) : "not in the tables",
-                     d >= 0 ? fmt::format(" ({} slots{}{})", fc5::bonemap::nbones(d), alts ? fmt::format(", {} other models share it", alts) : std::string{},
-                                          fc5::bonenames::kDraws[d].count != count ? fmt::format(", its {} indices padded", fc5::bonenames::kDraws[d].count) : std::string{})
-                            : std::string{},
-                     dump.empty() ? " none" : dump);
-    }
+    for (auto* b : cb) if (b) b->Release();
+    const Scan* sc = static_cast<const Scan*>(bonemap_scan(ctx, count, start, base, skinned, scale));
+    const int   d  = fc5::bonemap::find(count, !skinned ? -2 : sc ? sc->max_bone : -1, indirect, alts);
+    if (d >= 0 && alts > 0 && skinned && !sc) return -1;   // not told apart yet
+    return d;
 }
 
 // After the overlays: each point of the frame's draws (this frame's, else the last one's) and the game's body as dots and labels.

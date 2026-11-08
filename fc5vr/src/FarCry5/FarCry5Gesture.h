@@ -59,6 +59,8 @@ struct Input
     bool      other_rot_ok{ false };
     glm::mat3 weapon_rot{ 1.0f };      // manualbow (bowarrow): the weapon hand's controller axes (the arrow in the hand points along -z)
     bool      weapon_rot_ok{ false };
+    glm::mat3 weapon_draw_rot{ 1.0f };   // reloadzonesfollow (FarCry5Stereo.h draw_turn): the gun as drawn (tracking space), when turned off the controller
+    bool      weapon_draw_rot_ok{ false };
     bool      reload{ false };         // reloadmanual (FarCry5Reload.cpp): reloadmanual on and the weapon in hand is one of reloadweapons
     bool      b_down{ false };         // reloadmanual: the weapon hand's B (pad Y) now, a pop-up's Esc press excluded
     bool      b_mod{ false };          // reloadmanual: the other hand's grip held raw (left grip + B is the throw)
@@ -216,9 +218,15 @@ glm::mat4 hip_pose(const glm::mat4& head, bool mirror);
 // with the body's heading (fwd: that heading, level), on the other hand's side.
 glm::vec3 pouch_pos(const glm::mat4& head, bool mirror, glm::vec3& fwd);
 glm::mat4 rest_pose(const glm::mat4& head, bool mirror);   // where the game's weapon hangs when not in the hand
+// armik (FarCry5ArmIkDraw.cpp): the body's heading the shoulders, sling and hip turn with (radians about +y, tracking space, 0 = facing -z; it
+// follows the head past a dead zone), and the neck's pivot from the eyes (head frame: down, back; m).
+float     body_yaw();
+inline constexpr float kNeckPivotDown = 0.10f, kNeckPivotBack = 0.08f;
 bool      side_on();          // sidearm and sling both on
 bool      cur_side();         // the game's weapon at the last poll is a sidearm
 bool      game_draw_grab();   // gamedrawgrab: grabs ask the game for the very weapon
+bool      slot_carried_on();  // slotcarried: the shoulder slots' weapons checked against the game's inventory
+bool      carried_trusted();  // slotcarried on and its answers trusted (the weapon in hand answered "carried"): FarCry5Lua item_carried means what it says
 int       switch_want();      // a pending switch: 0 to the main weapon, 1 to the sidearm; -1 none
 bool      switch_grabbed();   // that switch is a sling or hip grab's (the copy in the hand), not the look at the sidearm slot after a load
 void      get_hip_place(float pos[3], float rot[3]);

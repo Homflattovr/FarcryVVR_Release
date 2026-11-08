@@ -4,8 +4,8 @@
 // hidden-area mesh, XR_KHR_visibility_mask) is stamped into the scene depth right after the game clears it, at the near plane of the
 // game's reversed depth (1.0). Every later draw that tests depth fails there, so the G-buffer and the passes that test depth skip
 // those pixels. Mode "restore" puts far depth (0.0, sky) back over the same triangles when the scene depth is first unbound, so the
-// lighting, fog and post passes that read depth see sky there instead of the near plane. Default off; nothing on screen inside the
-// lens should change.
+// lighting, fog and post passes that read depth see sky there instead of the near plane. On by default ("hidmask on" = restore; author
+// 8 Nov), saved; nothing on screen inside the lens should change. A runtime that gives no hidden area: nothing happens.
 
 #include <d3d11.h>
 
@@ -24,6 +24,9 @@ namespace fc5::hidmask
     // was enabled at instance creation.
     void fetch(uint64_t instance, uint64_t session, bool has_ext);
     bool ready();
+    // The runtime reported a changed hidden area: read it again (the old one stays in use until the new one is read).
+    void refetch();
+    bool wants_fetch();   // no mesh yet, or a re-read asked for
 
     // Stamp eye 0/1's hidden area into dsv at depth z (1 = near: nothing drawn later passes the reversed depth test; 0 = far: sky).
     // tangents: the eye image's own field (tan of left, right, up, down angles; left and down negative), as the projection the game

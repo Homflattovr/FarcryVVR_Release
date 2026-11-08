@@ -90,6 +90,14 @@ namespace fc5::padglyph
         std::atomic<uint32_t>   g_probe_val{ 0 }, g_probe_al{ 0 };
         std::atomic<uint64_t>   g_probe_hits{ 0 };
 
+        // padonly: the game's device pick (FC_m64.dll +0x2851c0, every frame) sorts the input devices by their idle time [dev+0E8h] and
+        // the one used last becomes the game's device (its prompts, its weapon wheel). Types 2 and 3 are the keyboard and the mouse, 4
+        // the pad. The hook at +0x2851f2 (just after movss xmm6, [rax+0E8h]) gives the keyboard and the mouse an idle time of 1e9 s, so
+        // the pad wins whenever it is there; with no pad the keyboard still wins (it is still in the list, last).
+        safetyhook::MidHook     g_pad_hook{};
+        std::atomic<bool>       g_pad_on{ true };
+        std::atomic<uint64_t>   g_pad_seen{ 0 }, g_pad_pushed{ 0 };
+
         void build_index()
         {
             if (!g_by_hash.empty()) return;
@@ -297,6 +305,41 @@ namespace fc5::padglyph
             spdlog::info("[PadGlyph] padglyphprobe hook {}", g_probe_hook ? "installed" : "failed");
         }
 
+        void pad_hit(SafetyHookContext& c)
+        {
+            g_pad_seen.fetch_add(1, std::memory_order_relaxed);
+            if (!g_pad_on.load(std::memory_order_relaxed)) return;
+            const uint32_t type = uint32_t(c.rdx);   // mov edx, [rax+8] at +0x2851ce: the device's type
+            if (type != 2 && type != 3) return;
+            c.xmm6.f32[0] = 1.0e9f;
+            g_pad_pushed.fetch_add(1, std::memory_order_relaxed);
+        }
+        bool pad_code_matches(const uint8_t* at)
+        {
+            // movss xmm6, [rax+0E8h]; lea r14, [rbp+48h]; mov [rsp+48h], ecx; mov cl, 1
+            static const uint8_t kAt[18]{ 0xF3, 0x0F, 0x10, 0xB0, 0xE8, 0x00, 0x00, 0x00, 0x4C, 0x8D, 0x75, 0x48, 0x89, 0x4C, 0x24, 0x48, 0xB1, 0x01 };
+            __try { return std::memcmp(at, kAt, 18) == 0; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
+        // Present thread, from frame(): tries once a second for a minute (the code may not be decrypted at the first frames).
+        void pad_install()
+        {
+            static int       tries = 0;
+            static ULONGLONG next  = 0;
+            if (g_pad_hook || tries >= 60 || !g_base) return;
+            const ULONGLONG now = GetTickCount64();
+            if (now < next) return;
+            next = now + 1000;
+            tries++;
+            if (!pad_code_matches(g_base + 0x2851ea)) {
+                if (tries == 60)
+                    spdlog::info("[PadGlyph] padonly: the game's device pick is not at +0x2851ea (other game build?): the game can still switch to the keyboard");
+                return;
+            }
+            g_pad_hook = safetyhook::create_mid(g_base + 0x2851f2, pad_hit);
+            spdlog::info("[PadGlyph] padonly hook {} (now {})", g_pad_hook ? "installed" : "failed",
+                         g_pad_on.load() ? "on: the game stays on the controller" : "off");
+        }
+
         void log_status(const char* why)
         {
             std::lock_guard _{ g_mtx };
@@ -474,6 +517,21 @@ namespace fc5::padglyph
             last = l;
             log_status("layout");
         }
+        pad_install();
+        {
+            static ULONGLONG next_pad = 0;
+            static uint64_t  pad_last = 0;
+            if (g_pad_hook && now >= next_pad) {
+                next_pad = now + 5000;
+                const uint64_t pushed = g_pad_pushed.load();
+                if (pushed != pad_last) {
+                    if (pad_last == 0)
+                        spdlog::info("[PadGlyph] padonly: kept the keyboard and mouse out of the game's device pick ({} of {} device checks so far)",
+                                     pushed, g_pad_seen.load());
+                    pad_last = pushed;
+                }
+            }
+        }
         if (g_probe_on.load()) {
             probe_install();
             if (now >= next_probe) {
@@ -514,6 +572,15 @@ namespace fc5::padglyph
 
     bool command(const std::string& cmd, const std::string& arg, std::istream&, bool& persist)
     {
+        if (cmd == "padonly") {
+            persist = true;
+            const bool v = !(arg == "off" || arg == "0" || arg == "false");
+            g_pad_on = v;
+            spdlog::info("[PadGlyph] padonly {}{}", v ? "on: the game stays on the controller (prompts and weapon wheel), whatever the mod's mouse and keys do"
+                                                       : "off: the game switches to the keyboard when the mod moves the mouse or presses a key",
+                         g_pad_hook ? "" : " (hook not installed yet)");
+            return true;
+        }
         if (cmd.rfind("padglyph", 0) != 0) return false;
         if (cmd == "padglyphs") {
             persist = true;
@@ -548,6 +615,11 @@ namespace fc5::padglyph
 
     void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint)
     {
+        bool po = g_pad_on.load();
+        if (ImGui::Checkbox("Keep the game on the controller##padonly", &po)) cmds += po ? "padonly on\n" : "padonly off\n";
+        hint("On (default): the game never switches to keyboard mode, so its prompts and its weapon wheel stay the controller's even when the "
+             "mod's aiming moves the mouse or it presses a key. Off: the game's own switching. Command padonly on/off.");
+        if (!g_pad_hook) ImGui::TextDisabled("(the game's device pick was not found yet)");
         int m = g_mode.load();
         static const char* kItems[]{ "Auto (from the controllers)", "Meta Touch letters", "Index letters", "Off (the game's icons)" };
         static const char* kCmd[]{ "auto", "touch", "index", "off" };

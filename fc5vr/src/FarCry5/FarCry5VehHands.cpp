@@ -32,18 +32,24 @@
 #include "FarCry5BoneMap.h"
 #include "FarCry5Drive.h"
 #include "FarCry5Record.h"
+#include "FarCry5VehWheelTable.h"
+#include "ModPath.h"
 
 #include <spdlog/spdlog.h>
 
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -51,6 +57,88 @@
 namespace
 {
     using ScanKey = std::tuple<void*, void*, UINT, UINT, INT>;   // index buffer, vertex buffer, count, start, base
+
+    // vehwheels (author 8 Nov 10:35):
+    // each vehicle's learnt wheel (drivehandsmodel) kept by its model, so the drive's ring is on that vehicle's own wheel from the moment
+    // you sit, before any turn. A vehicle is told by its body draw's index count and the driver's seat on it (vehseathold: the camera in
+    // the model's axes; within 8 cm): many bodies share 65535 indices, their seats differ. The wheel is kept in the recentred reference
+    // (game metres: the game camera at the head, the vehicle's front), which comes back the same each time one sits in that seat (the author's
+    // four drives of 8 Nov 11:02-11:27 in the same pickup: centres within 4 cm). Built-in entries (FarCry5VehWheelTable.h, filled from a
+    // simulator pass over every vehicle with tools\wheelglue\gen_vehwheels.py), then bin\fc5vr_vehwheels.txt (learnt in play; one line
+    // per vehicle: wheel count seat.xyz centre.xyz axis.xyz radius votes), which wins over a built-in one for the same vehicle.
+    struct VehWheel
+    {
+        UINT      count{ 0 };
+        glm::vec3 seat{ 0.0f }, c{ 0.0f }, n{ 0.0f, 0.0f, 1.0f };
+        float     r{ 0.0f };
+        int       votes{ 0 };
+        bool      builtin{ false };
+    };
+    std::vector<VehWheel> g_vw;
+    bool                  g_vw_loaded{ false };
+
+    bool vw_sane(const VehWheel& w)
+    {
+        return w.count > 0 && std::isfinite(w.c.x + w.c.y + w.c.z + w.n.x + w.n.y + w.n.z + w.r + w.seat.x + w.seat.y + w.seat.z) && w.r > 0.08f && w.r < 0.4f &&
+               glm::length(w.c) < 1.2f && std::abs(glm::length(w.n) - 1.0f) < 0.05f;
+    }
+    int vw_find(UINT count, const glm::vec3& seat)
+    {
+        int   best = -1;
+        float bd   = 0.08f;
+        for (int i = 0; i < int(g_vw.size()); ++i) {
+            if (g_vw[i].count != count) continue;
+            const float d = glm::length(g_vw[i].seat - seat);
+            if (d < bd || (d == bd && best >= 0 && !g_vw[i].builtin)) bd = d, best = i;
+        }
+        return best;
+    }
+    void vw_load()
+    {
+        if (g_vw_loaded) return;
+        g_vw_loaded = true;
+        for (const auto& e : fc5::vehwheel::kBuiltin) {
+            VehWheel w;
+            w.count   = e.count;
+            w.seat    = { e.seat[0], e.seat[1], e.seat[2] };
+            w.c       = { e.c[0], e.c[1], e.c[2] };
+            w.n       = { e.n[0], e.n[1], e.n[2] };
+            w.r       = e.r;
+            w.votes   = 99;
+            w.builtin = true;
+            if (vw_sane(w)) g_vw.push_back(w);
+        }
+        const size_t  nb = g_vw.size();
+        std::ifstream f{ fc5::mod_file("fc5vr_vehwheels.txt") };
+        std::string   line;
+        int           n = 0;
+        while (std::getline(f, line)) {
+            if (line.rfind("wheel ", 0) != 0) continue;
+            std::istringstream ls{ line.substr(6) };
+            VehWheel           w;
+            if (!(ls >> w.count >> w.seat.x >> w.seat.y >> w.seat.z >> w.c.x >> w.c.y >> w.c.z >> w.n.x >> w.n.y >> w.n.z >> w.r >> w.votes) || !vw_sane(w)) continue;
+            const int i = vw_find(w.count, w.seat);
+            if (i >= 0 && glm::length(g_vw[i].seat - w.seat) < 0.02f) g_vw[i] = w;   // the same vehicle: the learnt one wins
+            else g_vw.push_back(w);
+            ++n;
+        }
+        spdlog::info("[VehHands] vehwheels: {} vehicles' wheels built in, {} read from fc5vr_vehwheels.txt", nb, n);
+    }
+    void vw_save()
+    {
+        std::ofstream f{ fc5::mod_file("fc5vr_vehwheels.txt"), std::ios::trunc };
+        f << "# Far Cry 5 VR: each vehicle's steering wheel, learnt in play (drivehandsmodel; FarCry5VehHands.cpp, vehwheels). One line per vehicle:\n"
+             "# wheel <body index count> <seat x y z (m, the camera in the model's axes)> <centre x y z> <axis x y z> <grip radius> <turns seen>\n"
+             "# (centre, axis, radius: the recentred reference in game metres: x right, y up, z back from the head). Delete a line to learn it again.\n";
+        int n = 0;
+        for (const auto& w : g_vw) {
+            if (w.builtin) continue;
+            f << fmt::format("wheel {} {:.3f} {:.3f} {:.3f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {}\n", w.count, w.seat.x, w.seat.y, w.seat.z, w.c.x, w.c.y, w.c.z, w.n.x,
+                             w.n.y, w.n.z, w.r, w.votes);
+            ++n;
+        }
+        spdlog::info("[VehHands] vehwheels: {} vehicles' wheels saved to fc5vr_vehwheels.txt", n);
+    }
 }
 
 struct FarCry5Stereo::VehHandsState
@@ -84,6 +172,16 @@ struct FarCry5Stereo::VehHandsState
         int         lines{ 0 };                   // log lines this drive (takes, let-gos, state changes)
         std::string state;                        // the last state logged
         bool        far_said{ false };            // the recorded hold left out (its palm too far from the controller), logged
+        // drivehandsmodel: glued to the vehicle's own control. Bars and stick ride a game hand (ref: which side's; k: the hand's pose in that
+        // game hand's frame; g0: that game hand at the start, for the log). Wheel: k is the hand's pose at the glue and th0 the wheel model's
+        // turn then. h_last: the pose last drawn, kept while no game hand is seen.
+        bool        glued{ false };
+        int         ref{ -1 };
+        float       th0{ 0.0f };                  // the wheel model's turn (VehHandsState::theta) at the glue
+        glm::mat4   k{ 1.0f };
+        glm::mat4   g0{ 1.0f };
+        glm::mat4   h_last{ 1.0f };
+        int         glue_log_frame{ -1000 };
     };
     Side        side[2];
     std::set<std::pair<void*, UINT>> live_said;   // drivehandsdirect: the arguments read live and logged this drive (buffer, offset)
@@ -109,6 +207,288 @@ struct FarCry5Stereo::VehHandsState
     int       cand{ -1 }, cand_n{ 0 };          // the kind winning the last checks, how many times in a row
     int       space_lines{ 0 };
     bool      fallback_said{ false };
+
+    // drivehandsmodel (veh_hands_place): the game's own hands this drive, each as a rigid frame (its palm's turn made orthonormal, at the
+    // hand's centre) in the recentred reference (game metres), before the mod moves them; what they say of the vehicle's control.
+    struct GameHand
+    {
+        glm::mat4 x{ 1.0f };
+        int       frame{ -1000 };
+    };
+    static constexpr int kHist = 64;
+    GameHand gh[2];
+    GameHand hist[2][kHist];   // each side's last frames (by frame % kHist)
+    bool fresh(int s, int frame) const { return frame - gh[s].frame <= 1; }
+
+    // The car's wheel, kept in the reference itself (it is fixed in the car, as the eyes are). Round 2 (simulator run of 8 Nov 03:10): the
+    // game's two hands do not both ride its wheel. In a full lock the left hand turned 68 / 93 deg with the wheel model while the right one
+    // stayed where it was (the wheel slides under it), so a hand riding the game's right hand never turned, and a hand riding the left one
+    // swung off the rim (it was 31 cm from it at the take). The wheel is learnt from a game hand's rigid turn of 30-150 deg (8-29 deg turns
+    // gave centres 10-40 cm apart in that run), taken only if it looks like a steering wheel (in front of the eyes, its face to the driver,
+    // 12-32 cm grip radius, no move along the axis), and adopted once a second such turn 10 frames later agrees (6 cm, 12 deg). Its turn
+    // (theta) is then summed frame by frame from the game hand that holds it (on its rim, its palm turning about the axis as far as it goes
+    // round; of the two, the one that has turned the most lately: the other slides or rests), and a held VR hand is turned by it about the
+    // wheel's axis from where it took the rim.
+    struct Wheel
+    {
+        glm::vec3 c{ 0.0f };
+        glm::vec3 n{ 0.0f, 0.0f, 1.0f };   // towards the driver; a positive turn about it is to the left
+        float     r{ 0.0f };               // the game hands' grip radius
+        int       votes{ 0 };
+    };
+    Wheel     wl;                      // adopted at votes >= 2
+    Wheel     wcand;                   // the last candidate (votes 1)
+    int       wcand_frame{ -1000 };
+    float     theta{ 0.0f };           // the wheel model's turn since the drive began (rad)
+    float     dphi[2]{};               // each game hand's turn about the wheel's axis since the last frame, while it turns with the wheel
+    int       dphi_frame[2]{ -1000, -1000 };
+    float     score[2]{};              // how much it has turned with the wheel lately
+    int       holder{ -1 };            // the game hand the wheel's turn was last taken from
+    int       step_frame{ -1000 };
+    int       stick_hand{ -1 };        // the game hand on the stick: the one nearer the drive's stick (helicopters: the left, at the cyclic)
+    int       model_lines{ 0 };
+    int       learn_lines{ 0 };
+    int       turn_log_frame{ -1000 };
+    // vehwheels: this vehicle (its model and seat, from vehseathold), whether its wheel came from the table, and a wheel to save.
+    bool      key_tried{ false };
+    bool      key_ok{ false };
+    UINT      key_count{ 0 };
+    glm::vec3 key_seat{ 0.0f };
+    bool      from_table{ false };
+    bool      dirty{ false };
+    bool wheel_ok() const { return wl.votes >= 2; }
+
+    void reset_model()
+    {
+        for (int s = 0; s < 2; ++s) {
+            gh[s] = GameHand{};
+            for (auto& h : hist[s]) h = GameHand{};
+            dphi_frame[s] = -1000;
+            score[s]      = 0.0f;
+        }
+        wl = wcand  = Wheel{};
+        wcand_frame = step_frame = turn_log_frame = -1000;
+        theta       = 0.0f;
+        stick_hand  = -1;
+        holder      = -1;
+        key_tried = key_ok = from_table = dirty = false;
+        key_count = 0;
+        model_lines = learn_lines = 0;
+    }
+
+    // The vehicle's control from the game's hands, handed to the drive (its recentred reference: game metres / world scale).
+    //  - wheel: only once learnt (above): its centre, axis and the game hands' grip radius; before that the drive keeps its own place (the
+    //    centre between the two hands, used in round 1, put the ring too low and too large: the game's hands are not at 9 and 3 o'clock);
+    //  - bars: the centre between the hands, half width half the line (the jetski's and the tractor's bars: the hands rode them within 1 cm);
+    //  - stick: the game hand nearer the drive's stick (stick_hint), if within 45 cm (in the helicopters the game's right hand is 82 cm under
+    //    the eyes and 63 cm from the drive's stick: not on the cyclic).
+    void send_model(int style, int frame, float ws, const glm::vec3& stick_hint)
+    {
+        fc5::drive::Model m{};
+        m.style             = style;
+        const bool      f[2]{ fresh(0, frame), fresh(1, frame) };
+        const glm::vec3 c[2]{ glm::vec3{ gh[0].x[3] }, glm::vec3{ gh[1].x[3] } };
+        std::string     note;
+        if (style == fc5::drive::kStick) {
+            int   g = -1;
+            float d = 1e9f;
+            for (int s = 0; s < 2; ++s) {
+                if (!f[s]) continue;
+                const float ds = glm::length(c[s] - stick_hint);
+                if (ds < d) d = ds, g = s;
+            }
+            if (g < 0) return;
+            if (d > 0.45f * ws) {
+                if (model_lines < 3) {
+                    model_lines++;
+                    spdlog::info("[VehHands] drivehandsmodel: no game hand on the stick: the nearer ({}) is {:.0f} cm from the drive's stick (right hand ({:+.0f}, {:+.0f}, "
+                                 "{:+.0f}) cm, left ({:+.0f}, {:+.0f}, {:+.0f}) cm from the eyes); the drive's stick stays where it is",
+                                 g == 0 ? "right" : "left", d / ws * 100.0f, c[0].x / ws * 100.0f, c[0].y / ws * 100.0f, c[0].z / ws * 100.0f,
+                                 c[1].x / ws * 100.0f, c[1].y / ws * 100.0f, c[1].z / ws * 100.0f);
+                }
+                stick_hand = -1;
+                return;
+            }
+            stick_hand = g;
+            m.centre   = c[g];
+            note       = fmt::format(" (the game's {} hand, {:.0f} cm from the drive's stick; the other hand {})", g == 0 ? "right" : "left", d / ws * 100.0f,
+                                     f[1 - g] ? fmt::format("{:.0f} cm", glm::length(c[1 - g] - stick_hint) / ws * 100.0f) : std::string{ "not seen" });
+        } else if (style == fc5::drive::kBars) {
+            if (!f[0] || !f[1]) return;
+            m.centre = 0.5f * (c[0] + c[1]);
+            m.radius = 0.5f * glm::length(c[0] - c[1]);
+            if (m.radius < 0.12f * ws || m.radius > 0.6f * ws) return;
+            note = fmt::format(", half width {:.0f} cm", m.radius / ws * 100.0f);
+        } else if (style == fc5::drive::kWheel) {
+            if (!wheel_ok()) return;
+            m.centre      = wl.c;
+            m.n           = wl.n;
+            m.radius      = std::clamp(wl.r, 0.12f * ws, 0.30f * ws);
+            m.axis_learnt = true;
+            note          = fmt::format(", radius {:.0f} cm, learnt from the game hand's turn", m.radius / ws * 100.0f);
+        } else {
+            return;
+        }
+        if (!std::isfinite(m.centre.x + m.centre.y + m.centre.z + m.n.x + m.n.y + m.n.z) || glm::length(m.centre) > 1.5f * ws) return;
+        if (model_lines < 3) {
+            model_lines++;
+            spdlog::info("[VehHands] drivehandsmodel: the vehicle's {} from the game's hands: ({:+.0f}, {:+.0f}, {:+.0f}) cm from the eyes (right, up, back){}",
+                         style == fc5::drive::kWheel ? "wheel" : style == fc5::drive::kBars ? "handlebars" : "stick", m.centre.x / ws * 100.0f,
+                         m.centre.y / ws * 100.0f, m.centre.z / ws * 100.0f, note);
+        }
+        m.centre /= ws;
+        m.radius /= ws;
+        fc5::drive::set_model(m);
+    }
+
+    void offer_wheel(const Wheel& k, int frame, float ws, int s, float phi)
+    {
+        auto agree = [&](const Wheel& a, float dc, float da) {
+            return glm::length(a.c - k.c) < dc * ws && glm::dot(a.n, k.n) > std::cos(glm::radians(da));
+        };
+        if (wheel_ok()) {   // refined by later turns that agree (saved again at 10 and 40 of them)
+            if (agree(wl, 0.08f, 15.0f)) {
+                wl.c = glm::mix(wl.c, k.c, 0.2f);
+                wl.n = glm::normalize(glm::mix(wl.n, k.n, 0.2f));
+                wl.r = glm::mix(wl.r, k.r, 0.2f);
+                wl.votes++;
+                if (wl.votes == 10 || wl.votes == 40) dirty = true;
+                return;
+            }
+            // A wheel from the table that two turns 10 frames apart put elsewhere (the vehicle told wrongly, or the table off): learnt again.
+            if (!from_table) return;
+            if (wcand.votes == 1 && agree(wcand, 0.06f, 12.0f)) {
+                if (frame - wcand_frame < 10) return;
+                const float off = glm::length(wl.c - 0.5f * (wcand.c + k.c)) / ws * 100.0f;
+                wl.c       = 0.5f * (wcand.c + k.c);
+                wl.n       = glm::normalize(wcand.n + k.n);
+                wl.r       = 0.5f * (wcand.r + k.r);
+                wl.votes   = 2;
+                from_table = false;
+                dirty      = true;
+                spdlog::info("[VehHands] drivehandsmodel: the table's wheel for this vehicle was {:.0f} cm off the one the game's {} hand turned: learnt again, centre "
+                             "({:+.0f}, {:+.0f}, {:+.0f}) cm, grip {:.0f} cm", off, s == 0 ? "right" : "left", wl.c.x / ws * 100.0f, wl.c.y / ws * 100.0f,
+                             wl.c.z / ws * 100.0f, wl.r / ws * 100.0f);
+                return;
+            }
+            wcand       = k;
+            wcand.votes = 1;
+            wcand_frame = frame;
+            return;
+        }
+        if (wcand.votes == 1 && agree(wcand, 0.06f, 12.0f)) {
+            if (frame - wcand_frame < 10) return;
+            wl.c     = 0.5f * (wcand.c + k.c);
+            wl.n     = glm::normalize(wcand.n + k.n);
+            wl.r     = 0.5f * (wcand.r + k.r);
+            wl.votes = 2;
+            dirty    = true;
+            if (learn_lines < 6) {
+                learn_lines++;
+                spdlog::info("[VehHands] drivehandsmodel: the wheel learnt from the game's {} hand turning {:.0f} deg (two turns {} frames apart agree): its centre "
+                             "({:+.0f}, {:+.0f}, {:+.0f}) cm from the eyes (right, up, back), the hands grip it {:.0f} cm from the axis, its face tilted {:.0f} deg up",
+                             s == 0 ? "right" : "left", glm::degrees(phi), frame - wcand_frame, wl.c.x / ws * 100.0f, wl.c.y / ws * 100.0f, wl.c.z / ws * 100.0f,
+                             wl.r / ws * 100.0f, glm::degrees(std::asin(std::clamp(wl.n.y, -1.0f, 1.0f))));
+            }
+            return;
+        }
+        wcand       = k;
+        wcand.votes = 1;
+        wcand_frame = frame;
+    }
+
+    void game_hand(int s, const glm::mat4& x, int frame, float ws, int style)
+    {
+        gh[s].x     = x;
+        gh[s].frame = frame;
+        auto& h     = hist[s][frame % kHist];
+        h.x         = x;
+        h.frame     = frame;
+        if (style != fc5::drive::kWheel) return;   // the wheel only (a helicopter's hands learnt "wheels" 76 cm under the eyes in round 1)
+        const glm::mat3 Rn{ x };
+        const glm::vec3 cn{ x[3] };
+        // Learn the wheel from this hand's turn since an older frame (the oldest that turned enough).
+        for (int back = kHist - 4; back >= 6; --back) {
+            const auto& o = hist[s][(frame - back) % kHist];
+            if (o.frame != frame - back) continue;
+            const glm::mat3 Rr = Rn * glm::transpose(glm::mat3{ o.x });
+            glm::quat       q  = glm::quat_cast(Rr);
+            if (q.w < 0.0f) q = -q;
+            const float phi = 2.0f * std::acos(std::clamp(q.w, -1.0f, 1.0f));
+            if (phi < glm::radians(30.0f) || phi > glm::radians(150.0f)) continue;
+            const glm::vec3 a  = glm::normalize(glm::vec3{ q.x, q.y, q.z });
+            const glm::vec3 co{ o.x[3] };
+            const glm::vec3 d  = cn - co;
+            if (std::abs(glm::dot(d, a)) > 0.02f * ws) break;   // not a turn about a fixed axis (the hand moved along it)
+            const glm::vec3 dp = d - a * glm::dot(d, a);
+            const float     dl = glm::length(dp);
+            if (dl < 1e-4f) break;
+            const glm::vec3 w  = glm::normalize(glm::cross(a, dp));
+            const glm::vec3 p  = 0.5f * (cn + co) + w * (0.5f * dl / std::tan(0.5f * phi));
+            const glm::vec3 r  = (cn - p) - a * glm::dot(cn - p, a);
+            const float     rr = glm::length(r);
+            glm::vec3       aa = a;
+            if (glm::dot(aa, -p) < 0.0f) aa = -aa;   // the axis towards the driver (the eyes are the reference's origin)
+            const float pl = glm::length(p);
+            // A steering wheel: 12-32 cm grip radius, 25-85 cm from the eyes and in front of them, its face to the driver (tilted under 60 deg).
+            if (rr < 0.12f * ws || rr > 0.32f * ws || pl < 0.25f * ws || pl > 0.85f * ws || p.z > -0.15f * ws || aa.z < 0.5f) break;
+            offer_wheel(Wheel{ p, aa, rr, 0 }, frame, ws, s, phi);
+            break;
+        }
+        // On the learnt wheel's rim and turning rigidly with it over the last 10 frames (its palm turns about the wheel's axis as far as it
+        // goes round the rim, with little turn about any other axis): its palm's turn about the axis since the last frame counts.
+        if (!wheel_ok()) return;
+        const auto& o1 = hist[s][(frame - 1) % kHist];
+        const auto& ow = hist[s][(frame - 10) % kHist];
+        if (o1.frame != frame - 1 || ow.frame != frame - 10) {
+            score[s] *= 0.9f;
+            return;
+        }
+        auto on_rim = [&](const glm::vec3& p, glm::vec3& rp) {
+            const glm::vec3 rv = p - wl.c;
+            const float     ax = glm::dot(rv, wl.n);
+            rp                 = rv - wl.n * ax;
+            return std::abs(ax) < 0.04f * ws && std::abs(glm::length(rp) - wl.r) < 0.05f * ws;
+        };
+        auto twist = [&](const glm::mat4& A, const glm::mat4& B, float& swing) {
+            glm::quat q = glm::quat_cast(glm::mat3{ A } * glm::transpose(glm::mat3{ B }));
+            if (q.w < 0.0f) q = -q;
+            const float tw  = 2.0f * std::atan2(glm::dot(glm::vec3{ q.x, q.y, q.z }, wl.n), q.w);
+            const float tot = 2.0f * std::acos(std::clamp(q.w, -1.0f, 1.0f));
+            swing           = std::sqrt(std::max(0.0f, tot * tot - tw * tw));
+            return tw;
+        };
+        glm::vec3   rp_now{ 0.0f }, rp_w{ 0.0f };
+        float       sw_w = 0.0f, sw_1 = 0.0f;
+        const float tw_w = twist(x, ow.x, sw_w);
+        const float tw_1 = twist(x, o1.x, sw_1);
+        bool        ok   = on_rim(cn, rp_now) && on_rim(glm::vec3{ ow.x[3] }, rp_w);
+        if (ok) {
+            const float pos_w = std::atan2(glm::dot(wl.n, glm::cross(rp_w, rp_now)), glm::dot(rp_w, rp_now));
+            ok = sw_w < glm::radians(4.0f) + 0.15f * std::abs(tw_w) && std::abs(pos_w - tw_w) < glm::radians(4.0f) + 0.2f * std::abs(tw_w) &&
+                 std::abs(tw_1) < glm::radians(20.0f);
+        }
+        if (ok) {
+            dphi[s]       = tw_1;
+            dphi_frame[s] = frame;
+            score[s]      = 0.97f * score[s] + std::abs(tw_1);
+        } else {
+            score[s] *= 0.9f;
+        }
+    }
+
+    // Once per frame, for the frame just ended: the wheel turned as far as the game hand that holds it (of those turning rigidly with it, the
+    // one that has turned the most lately: the other slides or rests on the rim).
+    void wheel_step(int f)
+    {
+        if (step_frame == f) return;
+        step_frame = f;
+        int g      = -1;
+        for (int s = 0; s < 2; ++s)
+            if (dphi_frame[s] == f && (g < 0 || score[s] > score[g])) g = s;
+        if (g >= 0) theta += dphi[g];
+        holder = g;
+    }
 
     static glm::mat4 space_matrix(int k, const glm::mat4& om_skin, const glm::mat4& om_hair, const glm::vec3& cam, const glm::mat3& game_rot)
     {
@@ -308,8 +688,11 @@ bool FarCry5Stereo::veh_hands_draw(ID3D11DeviceContext* ctx, UINT count, UINT st
         st.cand_n        = 0;
         st.space_lines   = 0;
         st.fallback_said = false;
+        // drivehandsmodel: the game's hands and the wheel found again for each drive.
+        st.reset_model();
         spdlog::info("[VehHands] driving: drivehands {} (the player's body draws below, each once)", mode == 2 ? "all (the whole body as the game draws it)" : "hands");
     }
+    if (st.frame_seen != frame) st.wheel_step(st.frame_seen);   // drivehandsmodel: the wheel's turn in the frame just ended
     st.frame_seen = frame;
     // The palettes' CPU copies (note_object_constants) are needed from here on; the floating hands usually have them on already.
     if (!m_keep_bones.load()) {
@@ -914,6 +1297,50 @@ void FarCry5Stereo::veh_hands_place(ID3D11DeviceContext* ctx, std::vector<float>
     const bool      game_gun = !m_hand_map.empty && frame - m_hand_map.frame <= 1;
     const char*     names[2]{ "right", "left" };
     const char*     ctl = !have_cv ? "control" : cv.style == fc5::drive::kWheel ? "wheel" : cv.style == fc5::drive::kBars ? "handlebars" : "stick";
+    // vehwheels: once this vehicle's seat is known, its wheel from the table (the ring on the vehicle's own wheel before any turn); a wheel
+    // learnt here (or learnt again) saved for it.
+    if (ho.model && have_cv && cv.style == fc5::drive::kWheel) {
+        if (!st.key_tried && m_vsh_valid && m_vsh_count != 0 && m_vsh_learn_frame >= st.drive_frame - 600) {
+            st.key_tried = true;
+            st.key_ok    = true;
+            st.key_count = m_vsh_count;
+            st.key_seat  = m_vsh_seat;
+            vw_load();
+            const int i = vw_find(st.key_count, st.key_seat);
+            if (i >= 0 && !st.wheel_ok()) {
+                const VehWheel& w = g_vw[i];
+                st.wl.c           = w.c;
+                st.wl.n           = w.n;
+                st.wl.r           = w.r;
+                st.wl.votes       = 2;
+                st.from_table     = true;
+                spdlog::info("[VehHands] drivehandsmodel: this vehicle's wheel from {} (model {} indices, the seat at ({:.2f}, {:.2f}, {:.2f}) on it): centre ({:+.0f}, {:+.0f}, "
+                             "{:+.0f}) cm from the eyes, grip {:.0f} cm, face tilted {:.0f} deg up",
+                             w.builtin ? "the built-in table" : "fc5vr_vehwheels.txt (learnt in play)", st.key_count, st.key_seat.x, st.key_seat.y, st.key_seat.z,
+                             w.c.x / ws * 100.0f, w.c.y / ws * 100.0f, w.c.z / ws * 100.0f, w.r / ws * 100.0f, glm::degrees(std::asin(std::clamp(w.n.y, -1.0f, 1.0f))));
+            } else if (i < 0) {
+                spdlog::info("[VehHands] drivehandsmodel: no wheel known yet for this vehicle (model {} indices, the seat at ({:.2f}, {:.2f}, {:.2f}) on it): learnt from its "
+                             "first turn of 30 deg or more, then saved", st.key_count, st.key_seat.x, st.key_seat.y, st.key_seat.z);
+            }
+        }
+        if (st.dirty && st.key_ok && st.wheel_ok()) {
+            st.dirty = false;
+            vw_load();
+            VehWheel w;
+            w.count     = st.key_count;
+            w.seat      = st.key_seat;
+            w.c         = st.wl.c;
+            w.n         = st.wl.n;
+            w.r         = st.wl.r;
+            w.votes     = st.wl.votes;
+            const int i = vw_find(w.count, w.seat);
+            if (vw_sane(w)) {
+                if (i >= 0) g_vw[i] = w;
+                else g_vw.push_back(w);
+                vw_save();
+            }
+        }
+    }
     const glm::mat4 Mx{ glm::vec4{ -1, 0, 0, 0 }, glm::vec4{ 0, 1, 0, 0 }, glm::vec4{ 0, 0, 1, 0 }, glm::vec4{ 0, 0, 0, 1 } };   // x mirrored
     for (int s = 0; s < 2; ++s) {
         if (palm[s] < 0 || size_t(palm[s] + 1) * 12 > pal.size()) continue;
@@ -1005,6 +1432,20 @@ void FarCry5Stereo::veh_hands_place(ID3D11DeviceContext* ctx, std::vector<float>
             X[3] = glm::vec4{ cw, 1.0f };
         }
         sd.lc = glm::inverse(X) * glm::vec4{ cw, 1.0f };
+        // drivehandsmodel: this game hand, where the game animates it on the wheel, bars or stick (before the move), kept as a rigid frame
+        // in the reference (unless it holds the game's own sidearm), and the vehicle's control from both hands handed to the drive.
+        if (ho.model && have_cv && !(s == wside && game_gun)) {
+            const glm::mat3 Rw = glm::mat3{ Gb };
+            const glm::vec3 gx = glm::normalize(Rw[0]);
+            glm::vec3       gy = Rw[1] - glm::dot(Rw[1], gx) * gx;
+            if (glm::length(gy) > 1e-6f && std::isfinite(gx.x + gy.x + cw.x)) {
+                gy = glm::normalize(gy);
+                glm::mat4 G{ glm::mat3{ gx, gy, glm::cross(gx, gy) } };
+                G[3] = glm::vec4{ cw, 1.0f };
+                st.game_hand(s, to_ref(G), frame, ws, cv.style);
+                st.send_model(cv.style, frame, ws, cv_pt(cv.stick_top));
+            }
+        }
         // Its controller (by physical side: the weapon hand's is update_motion's controller, or its own while the weapon hangs elsewhere).
         glm::mat3 CR{ 1.0f };
         glm::vec3 CP{ 0.0f };
@@ -1078,8 +1519,94 @@ void FarCry5Stereo::veh_hands_place(ID3D11DeviceContext* ctx, std::vector<float>
                 M = glm::translate(glm::mat4{ 1.0f }, c) * glm::mat4_cast(glm::angleAxis(cv.angle - sd.a0, axis)) * glm::translate(glm::mat4{ 1.0f }, -c);
             }
             H = M * sd.h0;
+            // drivehandsmodel: the hand goes where the game moves the vehicle's own control under it.
+            //  - wheel: turned about the learnt wheel's axis as far as the game turned its wheel model since the take (theta, from the game hand
+            //    that holds the rim), from where it took the rim; until the wheel is learnt (the first turn of 30 deg or more), with the drive's own;
+            //  - bars: rides the game hand of the same side (or the other while this one holds the game's sidearm);
+            //  - stick: rides the game hand on the stick (stick_hand: the one nearer the drive's stick); none within 45 cm: with the drive's own.
+            // No game hand this frame: where it was.
+            if (ho.model && cv.style == fc5::drive::kWheel) {
+                if (st.wheel_ok()) {
+                    if (!sd.glued) {
+                        sd.glued          = true;
+                        sd.k              = H;   // at the take, sd.h0; once learnt while held, where the drive's wheel had turned it
+                        sd.th0            = st.theta;
+                        sd.glue_log_frame = frame;
+                        if (sd.lines < 40) {
+                            sd.lines++;
+                            const glm::vec3 r  = glm::vec3{ H * sd.lc } - st.wl.c;
+                            const float     h  = glm::dot(r, st.wl.n);
+                            const float     rp = glm::length(r - st.wl.n * h);
+                            spdlog::info("[VehHands] drivehandsmodel: the {} hand turns with the vehicle's own wheel (as far as the game turns it; it took the wheel {:.0f} cm "
+                                         "from its rim)", names[s], std::sqrt((rp - st.wl.r) * (rp - st.wl.r) + h * h) / ws * 100.0f);
+                        }
+                    }
+                    const glm::mat4 R = glm::translate(glm::mat4{ 1.0f }, st.wl.c) * glm::mat4_cast(glm::angleAxis(st.theta - sd.th0, st.wl.n)) *
+                                        glm::translate(glm::mat4{ 1.0f }, -st.wl.c);
+                    H = R * sd.k;
+                    // Every 2 s: the game's turn of its wheel under the hand against the drive's own.
+                    if (frame - sd.glue_log_frame >= 180 && sd.lines < 40) {
+                        sd.glue_log_frame = frame;
+                        sd.lines++;
+                        const glm::vec3 r  = glm::vec3{ H * sd.lc } - st.wl.c;
+                        const float     h  = glm::dot(r, st.wl.n);
+                        const float     rp = glm::length(r - st.wl.n * h);
+                        spdlog::info("[VehHands] drivehandsmodel: the {} hand on the wheel: the game turned it {:+.0f} deg since the take (positive: to the left), the "
+                                     "drive's wheel {:+.0f} deg; the hand {:.0f} cm from the wheel's rim", names[s], glm::degrees(st.theta - sd.th0),
+                                     glm::degrees(cv.angle - sd.a0), std::sqrt((rp - st.wl.r) * (rp - st.wl.r) + h * h) / ws * 100.0f);
+                    }
+                }
+            } else if (ho.model) {
+                int g = -1;
+                if (cv.style == fc5::drive::kStick)
+                    g = st.stick_hand >= 0 && st.fresh(st.stick_hand, frame) ? st.stick_hand : -1;
+                else
+                    g = st.fresh(s, frame) ? s : st.fresh(1 - s, frame) ? 1 - s : -1;
+                if (g >= 0) {
+                    const glm::mat4& Gn = st.gh[g].x;
+                    if (!sd.glued || sd.ref != g) {
+                        const glm::mat4 from = sd.glued ? sd.h_last : sd.h0;
+                        sd.k                 = glm::inverse(Gn) * from;
+                        sd.g0                = Gn;
+                        if (sd.lines < 40) {
+                            sd.lines++;
+                            spdlog::info("[VehHands] drivehandsmodel: the {} hand {} the game's {} hand on the {} ({:.0f} cm from it): it goes where the game moves the "
+                                         "vehicle's own {}", names[s], sd.glued ? "now rides" : "rides", names[g], ctl,
+                                         glm::length(glm::vec3{ from * sd.lc } - glm::vec3{ Gn[3] }) / ws * 100.0f, ctl);
+                        }
+                        sd.glued          = true;
+                        sd.ref            = g;
+                        sd.glue_log_frame = frame;
+                    }
+                    H = Gn * sd.k;
+                    // Every 2 s: how far the game moved its control under the hand, against the drive's own.
+                    if (frame - sd.glue_log_frame >= 180 && sd.lines < 40) {
+                        sd.glue_log_frame = frame;
+                        sd.lines++;
+                        if (cv.style == fc5::drive::kStick) {
+                            const glm::vec3 mv = (glm::vec3{ Gn[3] } - glm::vec3{ sd.g0[3] }) / ws;
+                            spdlog::info("[VehHands] drivehandsmodel: the {} hand on the stick: the game's stick hand moved ({:+.1f}, {:+.1f}, {:+.1f}) cm since the take, the "
+                                         "drive's stick top ({:+.1f}, {:+.1f}, {:+.1f}) cm", names[s], mv.x * 100.0f, mv.y * 100.0f, mv.z * 100.0f,
+                                         (top.x - sd.top0.x) / ws * 100.0f, (top.y - sd.top0.y) / ws * 100.0f, (top.z - sd.top0.z) / ws * 100.0f);
+                        } else {
+                            glm::quat q = glm::quat_cast(glm::mat3{ Gn } * glm::transpose(glm::mat3{ sd.g0 }));
+                            if (q.w < 0.0f) q = -q;
+                            const float phi = 2.0f * std::acos(std::clamp(q.w, -1.0f, 1.0f));
+                            const float sgn = glm::dot(glm::vec3{ q.x, q.y, q.z }, axis) < 0.0f ? -1.0f : 1.0f;
+                            spdlog::info("[VehHands] drivehandsmodel: the {} hand on the {}: the game turned them {:+.0f} deg since the take (positive: to the left), the "
+                                         "drive's {:+.0f} deg", names[s], ctl, glm::degrees(sgn * phi), glm::degrees(cv.angle - sd.a0));
+                        }
+                    }
+                } else if (sd.glued) {
+                    H = sd.h_last;
+                }
+            }
+            if (!ho.model) sd.glued = false;   // switched off while held: taken afresh if switched on again
+            sd.h_last = H;
         } else if (sd.on) {
-            sd.on = false;
+            sd.on     = false;
+            sd.glued  = false;
+            sd.ref    = -1;
             if (sd.lines < 40) {
                 sd.lines++;
                 spdlog::info("[VehHands] drivehandsgrab: the {} hand let go of the {}: back on its controller", names[s], ctl);
@@ -1111,4 +1638,44 @@ void FarCry5Stereo::veh_hands_place(ID3D11DeviceContext* ctx, std::vector<float>
                   fmt::format(": its palm {:.0f} cm from the eyes' base, which is {:.0f} cm from the game camera", glm::length(glm::vec3{ H * sd.lc }) * 100.0f,
                               glm::length(m_mo.draw_shift) * 100.0f));
     }
+}
+
+// drivewheelscan S (test, not saved; FarCry5Drive.h): while it runs, each Vehicle_ draw within 1.5 m of the camera, at most every 0.5 s per
+// index count: its origin and axes in the axes of the vehicle's body (vehicle_probe's model under the seat: x across, y along, z up), its
+// scale, and its skinning palette's size (VS b3, 0: none). A rigid steering wheel shows as a small draw ahead of the seat whose axes turn
+// about one axis with the steering (steerstep); a wheel skinned in the body shows no such draw, only a palette.
+void FarCry5Stereo::veh_wheel_scan(ID3D11DeviceContext* ctx, const float* f, UINT count, const glm::vec3& rel)
+{
+    if (!fc5::drive::wheel_scan_active() || m_frame.load() - m_veh_mesh_frame > 2) return;
+    static std::mutex                                                mtx;
+    static std::map<UINT, std::chrono::steady_clock::time_point> last;
+    const auto                                                       now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard _{ mtx };
+        if (last.size() > 256) last.clear();
+        auto& t = last[count];
+        if (now - t < std::chrono::milliseconds(500)) return;
+        t = now;
+    }
+    const glm::vec3 bx = glm::normalize(m_veh_mesh_x);
+    const glm::vec3 by = glm::normalize(m_veh_mesh_y - glm::dot(m_veh_mesh_y, bx) * bx);
+    const glm::vec3 bz = glm::cross(bx, by);
+    auto            in_body = [&](const glm::vec3& v) { return glm::vec3{ glm::dot(v, bx), glm::dot(v, by), glm::dot(v, bz) }; };
+    const glm::vec3 dx{ f[0], f[4], f[8] }, dz{ f[2], f[6], f[10] };
+    const float     sc = glm::length(dx);
+    if (sc < 1e-6f || glm::length(dz) < 1e-6f) return;
+    const glm::vec3 o  = in_body(glm::vec3{ f[3], f[7], f[11] } - m_veh_mesh_o);
+    const glm::vec3 ax = in_body(dx / sc), az = in_body(glm::normalize(dz));
+    UINT            b3 = 0;
+    ID3D11Buffer*   cb = nullptr;
+    ctx->VSGetConstantBuffers(3, 1, &cb);
+    if (cb) {
+        D3D11_BUFFER_DESC d{};
+        cb->GetDesc(&d);
+        b3 = d.ByteWidth;
+        cb->Release();
+    }
+    spdlog::info("[VehHands] wheelscan: draw {} {:.2f} m from the camera, at ({:+.2f}, {:+.2f}, {:+.2f}) m in the vehicle's axes (across, along, up); its x axis "
+                 "({:+.3f}, {:+.3f}, {:+.3f}), z axis ({:+.3f}, {:+.3f}, {:+.3f}); scale {:.4f}; VS b3 {} B; drive {}", count, glm::length(rel), o.x, o.y, o.z,
+                 ax.x, ax.y, ax.z, az.x, az.y, az.z, sc, b3, fc5::drive::status());
 }

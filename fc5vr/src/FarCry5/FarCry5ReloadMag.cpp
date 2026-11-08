@@ -469,6 +469,8 @@ struct FarCry5Stereo::ReloadMagState
     int                           b2c_hold_n{ 0 };
     std::map<uint32_t, float>     rev_nose;
     uint32_t                      shell_hip_said{ 0 };   // reloadshellhip: logged for this weapon
+    uint32_t                      rigid_body_said{ 0 };  // reloadzonesfollow: a rigid round's draw with no recent main draw, logged for this weapon
+    int                           gl_said{ 0 };          // reloadgrenadeseat (grenade in hand onto the tube): 15 / 10 / 5 cm logged this insert (bits)
     std::map<uint32_t, glm::vec3> rev_seat;   // reloadgrenadeseat: the M79's grenade's move onto its bore (body space; measured once per weapon)
     bool                          rev_dump_init{ false };
     // reloadhandsnap (manualreload41): the free hand's drawn pose, in the gun controller's axes (raw, grippitch undone), eased in and out.
@@ -828,12 +830,26 @@ void FarCry5Stereo::reload_mag_frame(uint32_t sig)
                     }
                     const glm::vec3 ge = ghi - glo;
                     seat = glm::vec3{ 0.5f * (lo.x + hi.x - glo.x - ghi.x), yb - glo.y, 0.5f * (lo.z + hi.z - glo.z - ghi.z) };
-                    ok   = ge.y >= std::max(ge.x, ge.z) && glm::length(seat) < 0.30f;   // a grenade lying along the bore; less than 30 cm to move
+                    // A grenade lying along the bore: longer than it is wide, or (the M79's draw, 4.1 x 3.7 x 4.1 cm: the round's case only; grenade
+                    // launcher pass 8 Nov: "not moved" so far) round across (x and z within 15 %) and at least half as long as wide. Less than 30 cm to move.
+                    const float across = std::max(ge.x, ge.z);
+                    const bool  along  = ge.y >= across || (std::abs(ge.x - ge.z) < 0.15f * across && ge.y >= 0.5f * across);
+                    ok                 = along && glm::length(seat) < 0.30f;
                     spdlog::info("[ReloadMag] weapon {}: reloadgrenadeseat: the bore's centre at the breech ({:.3f} {:.3f}), the breech face at y {:.3f}; the grenade "
                                  "{:.1f} x {:.1f} x {:.1f} cm, its middle ({:.3f} {:.3f}), its base at y {:.3f} (the model's): {} ({:.1f} {:.1f} {:.1f} cm)",
                                  sig, 0.5f * (lo.x + hi.x), 0.5f * (lo.z + hi.z), yb, ge.x * 100.0f, ge.y * 100.0f, ge.z * 100.0f, 0.5f * (glo.x + ghi.x),
                                  0.5f * (glo.z + ghi.z), glo.y, ok ? "moved onto the bore by" : "not moved (not lying along the bore, or too far)",
                                  seat.x * 100.0f, seat.y * 100.0f, seat.z * 100.0f);
+                    // (grenade launcher pass 8 Nov: is the grenade also turned against the tube? Its rest transform against the barrel's: the
+                    // turn between them, and where the grenade part's own axes point in the model's frame; the bore runs along the model's +y.)
+                    const glm::mat3 rb{ pb->second }, rg{ pg->second };
+                    const glm::mat3 rr  = glm::transpose(rb) * rg;
+                    const float     tr  = std::clamp((rr[0][0] + rr[1][1] + rr[2][2] - 1.0f) * 0.5f, -1.0f, 1.0f);
+                    auto            dir = [](const glm::vec3& v) { const glm::vec3 n = glm::length(v) > 1e-6f ? glm::normalize(v) : v; return fmt::format("({:.3f} {:.3f} {:.3f})", n.x, n.y, n.z); };
+                    auto            off = [](const glm::vec3& v) { return glm::length(v) > 1e-6f ? glm::degrees(std::acos(std::clamp(std::abs(glm::normalize(v).y), 0.0f, 1.0f))) : -1.0f; };
+                    spdlog::info("[ReloadMag] weapon {}: reloadgrenadeseat: the grenade part turned {:.1f} deg from the barrel part at rest; its own x {} y {} z {} in the model's "
+                                 "frame (off the bore's +y: x {:.1f}, y {:.1f}, z {:.1f} deg)",
+                                 sig, glm::degrees(std::acos(tr)), dir(rg[0]), dir(rg[1]), dir(rg[2]), off(rg[0]), off(rg[1]), off(rg[2]));
                 }
                 s.rev_seat[sig] = ok ? seat : glm::vec3{ 0.0f };
                 if (ok) pg->second = shift(seat) * pg->second;
@@ -1793,7 +1809,21 @@ bool FarCry5Stereo::reload_mag_draw(ID3D11DeviceContext* ctx, UINT count, UINT s
     // This draw's estimate of the body now (manualreload31): this frame's, or the last one moved as this draw's own object moved since.
     glm::mat4 body_x = s.body;
     bool      body_moved = false;
-    if (!main_draw && s.body_frame != frame)
+    // reloadzonesfollow (author 8 Nov 20:19, the M79; his 21:16:41 screenshot: the grenade above the open
+    // breech, sideways): a rigid round's own draw (the M79's grenade, the RPG-7's and RAT4's rockets) has the round itself as its object, and the
+    // game moves it with its own reload's hand, so following that object (below) put the mod's grenade where the game's animated one was, not on
+    // the gun. Drawn before the gun's main draw (the author's game; the simulator drew it after, so this was never seen there), it takes the last
+    // main draw's body, if that is this frame's or the last one's; else the old way (logged once per weapon).
+    bool rigid_self = false;
+    if (fc5::reload::Revolver rq{}; !main_draw && !skinned && fc5::reload::revolver_parts(sig, rq) && rq.rigid_rounds && count == rq.rounds) {
+        if (s.body_frame == frame || s.body_frame + 1 == frame) rigid_self = true;
+        else if (s.rigid_body_said != sig) {
+            s.rigid_body_said = sig;
+            spdlog::info("[ReloadMag] weapon {}: reloadzonesfollow: the round's draw {} drawn with no main draw this frame or the last (last {} frames ago): it follows its own object",
+                         sig, count, frame - s.body_frame);
+        }
+    }
+    if (!main_draw && s.body_frame != frame && !rigid_self)
         if (const auto lo = s.last_om.find(count); lo != s.last_om.end() && lo->second.second == s.body_frame) {
             body_x     = Om * glm::inverse(lo->second.first) * s.body;
             body_moved = true;
@@ -2518,6 +2548,7 @@ bool FarCry5Stereo::reload_mag_draw(ID3D11DeviceContext* ctx, UINT count, UINT s
                 }
             }
             bool hide_round = false;   // a rigid round's draw holds only it: an empty chamber hides the draw (allreload)
+            if (!v.hand_mag) s.gl_said = 0;   // reloadgrenadeseat: the next grenade in the hand logged again
             for (int c = 0; c < rp.nround; ++c) {
                 const Key k = rkey(c);
                 glm::mat4 T{};
@@ -2527,6 +2558,33 @@ bool FarCry5Stereo::reload_mag_draw(ID3D11DeviceContext* ctx, UINT count, UINT s
                     const glm::mat3 Lr = m_mo.other_rot_world * glm::mat3{ glm::rotate(glm::mat4{ 1.0f }, glm::radians(-m_grip_pitch.load()), glm::vec3{ 1.0f, 0.0f, 0.0f }) };
                     T                  = s.d2w * affine(Lr, m_mo.other_pos_world + Lr * (v.hand_mag_off * ws)) * shift(-nose_c(r, k)) * rc_of(r);
                     s.shown_hand       = true;
+                    // reloadgrenadeseat (grenade launcher pass 8 Nov; author 10:33): the M79's grenade
+                    // was held as it sits in the closed gun, so with the action open (the tube tipped 40 deg down) it lay 40 deg off the tube until it
+                    // went in. Now it turns onto the open tube's axis as its nose nears the seated nose: from 15 cm, fully by 5 cm, about the hand's
+                    // point (the grip kept), its base toward the breech. A break action's rigid round only (the M79s); logged at 15, 10 and 5 cm.
+                    if (rp.brk && rp.rigid_rounds && fc5::reload::grenade_seat()) {
+                        if (glm::mat4 Tp{}; pinned(k, Tp)) {
+                            const glm::vec3 n_h  = point(s.d2w, m_mo.other_pos_world + Lr * (v.hand_mag_off * ws));   // the grenade's nose: the hand's point
+                            const float     nose = s.rev_nose.contains(sig) ? s.rev_nose[sig] : 0.017f;
+                            const glm::vec3 n_p  = point(Tp, s.centre(sig, k) + fwd * nose);                       // its nose seated in the open tube
+                            const float     d    = glm::length(n_h - n_p) / std::max(ws, 1e-3f);
+                            const glm::vec3 ah   = glm::normalize(glm::mat3{ T } * fwd), ap = glm::normalize(glm::mat3{ Tp } * fwd);
+                            const float     raw  = glm::degrees(std::acos(std::clamp(glm::dot(ah, ap), -1.0f, 1.0f)));
+                            const float     w    = std::clamp((0.15f - d) / 0.10f, 0.0f, 1.0f);
+                            if (w > 0.0f && raw > 0.01f) {
+                                const glm::quat q = glm::normalize(glm::quat{ 1.0f + glm::dot(ah, ap), glm::cross(ah, ap) });   // the round's axis onto the tube's
+                                T = shift(n_h) * glm::mat4_cast(glm::normalize(glm::slerp(glm::quat{ 1.0f, 0.0f, 0.0f, 0.0f }, q, w))) * shift(-n_h) * T;
+                            }
+                            const float drawn = glm::degrees(std::acos(std::clamp(glm::dot(glm::normalize(glm::mat3{ T } * fwd), ap), -1.0f, 1.0f)));
+                            constexpr float kAt[3]{ 0.15f, 0.10f, 0.05f };
+                            for (int i = 0; i < 3; ++i)
+                                if (d <= kAt[i] && !(s.gl_said & (1 << i))) {
+                                    s.gl_said |= 1 << i;
+                                    spdlog::info("[ReloadMag] weapon {}: reloadgrenadeseat: the grenade in the hand {:.0f} cm from its seat: {:.1f} deg off the open tube as held, "
+                                                 "drawn {:.1f} deg off", sig, d * 100.0f, raw, drawn);
+                                }
+                        }
+                    }
                 } else if (c == v.target && v.engaged && pinned(k, T)) {
                     // Sliding into its chamber, from behind (the RPG-7's rocket: into the muzzle, from the front).
                     T            = (rp.door ? body_x : body_x * Ro) * shift((rp.muzzle ? fwd : -fwd) * (1.0f - std::clamp(v.insert, -2.0f, 1.0f)) * v.travel) * s.pin_rest.at(k);

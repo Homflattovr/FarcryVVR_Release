@@ -105,6 +105,17 @@ namespace fc5::gameweapon
         return it == g_item.end() ? 0 : it->second;
     }
 
+    void seed(uint32_t sig, uint64_t item)
+    {
+        if (sig == 0 || item == 0) return;
+        std::lock_guard _{ g_mx };
+        uint64_t& kept = g_item[sig];
+        if (kept != 0) return;
+        kept = item;
+        const auto* w = fc5::weapons::find(item);
+        spdlog::info("[Weapon] gameweapon: weapon {} is the game's item {:x} ({}), kept with its copy from an earlier start", sig, item, w ? w->name : "not in the weapon table");
+    }
+
     std::string status()
     {
         std::lock_guard _{ g_mx };

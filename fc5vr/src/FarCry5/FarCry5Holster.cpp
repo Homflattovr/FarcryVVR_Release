@@ -18,7 +18,9 @@
 #include "FarCry5Stereo.h"
 #include "FarCry5Gesture.h"
 #include "FarCry5GameWeapon.h"
+#include "FarCry5Lua.h"
 #include "FarCry5Record.h"
+#include "FarCry5WeaponCache.h"
 #include "ModPath.h"
 
 #include <spdlog/spdlog.h>
@@ -27,13 +29,18 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <istream>
+#include <iterator>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include <glm/gtc/matrix_transform.hpp>
@@ -84,6 +91,7 @@ namespace
         UINT                      mask{ 0xffffffff };
         glm::mat3                 rq{ 1.0f };               // the part's axes in the gun's steadied axes (q')
         glm::vec3                 tq{ 0.0f };               // its origin there
+        uint32_t                  scene_ps{ 0 }, scene_vs{ 0 };   // weaponcache: a copy made from disk, these view slots bound from the game's draws (bits)
 
         void release()
         {
@@ -124,6 +132,427 @@ namespace
     void to_rows(const glm::mat4& m, float* f)
     {
         for (int r = 0; r < 3; ++r) for (int c = 0; c < 4; ++c) f[r * 4 + c] = m[c][r];
+    }
+}
+
+// weaponcache on|off (saved, default on; author 7 Nov 21:10). The game draws only the weapon in its hands, so the sling and the hip could show a weapon only once the mod had
+// recorded it this session: after each start the sidearm slot was looked at (a switch to it and back, the controllers held back meanwhile), and
+// in his 7 Nov 21:16 start three wheel picks gave nothing and the pistol only showed on the hip once he drew it himself, 20 s in.
+// Each recorded copy is now also kept on disk (bin\fc5vr_weaponcopies\<weapon id>.bin): the index range and the vertex range of each draw, its
+// material textures (every mip), constant buffers and states, and its shaders by the CRC32 of their bytecode (the game's own shader objects are
+// found by it; the bytecode is kept as a .cso file once the game makes that shader again, so a later start can make it itself). The scene's own
+// views (render targets and unordered-access resources: shadow maps, light grids) are not kept: a kept copy draws with what the game binds for
+// its own weapon draws with the same pixel shader (else any weapon draw, else the gloves draw). index.txt lists the weapons with the game's item of
+// each, and the last main weapon and sidearm.
+// At the next start the last main weapon and sidearm (and the most recent others, four at most) are made from these files before any is drawn:
+// the game's item comes with each (gamedrawgrab asks the game for it at once), the main weapon is known for the sling and the sidearm for the hip
+// (in the slot modes only a gun the game's data carries on its pistol holster, or one in the saved sidearm list), so there is nothing to look at
+// after a load and the loading popup has nothing to wait for. Neither is shown before slotcarried's inventory call (FarCry5Lua carried_watch_kept)
+// says the player carries it: one the game says is not carried is left out (weapongone; the builder's 7 Nov 23:22 start put a P226 on the sling that
+// the Arcade map's loadout had taken back), and with no answer in 5 s of play both are shown as before. A handgun is never the sling's. The copy recorded this session replaces the kept one at the first hold of that weapon; it is saved
+// again when its textures grew (streamed in since) or its draws changed, at least 20 s into play, one weapon at a time (read back over a few frames).
+namespace
+{
+namespace wc
+{
+    constexpr uint32_t kMagic = 0x43574346u, kVersion = 1;   // 'FCWC'
+    constexpr uint64_t kMaxTex = 96ull << 20, kMaxBuf = 16ull << 20;
+    constexpr int      kStartLoad = 4;   // weapons made at the start: the last main weapon and sidearm, then the most recent
+
+    std::string dir() { return fc5::mod_file("fc5vr_weaponcopies\\"); }
+    std::string file_of(uint32_t sig) { return dir() + fmt::format("{}.bin", sig); }
+    std::string shader_file(bool ps, uint32_t crc) { return dir() + fmt::format("{}_{:08X}.cso", ps ? "ps" : "vs", crc); }
+    bool        exists(const std::string& p) { return GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
+    void        make_dir() { CreateDirectoryA(dir().c_str(), nullptr); }
+    // "#XXXXXXXX ..." (m_vs_info, m_ps_names): the CRC32 of the shader's bytecode.
+    uint32_t crc_of(const std::string& s)
+    {
+        if (s.size() < 9 || s[0] != '#') return 0;
+        uint32_t c = 0;
+        for (int i = 1; i <= 8; ++i) {
+            const char h = s[i];
+            const int  v = h >= '0' && h <= '9' ? h - '0' : h >= 'A' && h <= 'F' ? h - 'A' + 10 : h >= 'a' && h <= 'f' ? h - 'a' + 10 : -1;
+            if (v < 0) return 0;
+            c = (c << 4) | uint32_t(v);
+        }
+        return c;
+    }
+
+    // Bytes per texel, or per 4x4 block (bc); 0: a format not kept.
+    UINT fmt_bytes(DXGI_FORMAT f, bool& bc)
+    {
+        bc = false;
+        switch (f) {
+        case DXGI_FORMAT_BC1_TYPELESS: case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB:
+        case DXGI_FORMAT_BC4_TYPELESS: case DXGI_FORMAT_BC4_UNORM: case DXGI_FORMAT_BC4_SNORM:
+            bc = true;
+            return 8;
+        case DXGI_FORMAT_BC2_TYPELESS: case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB:
+        case DXGI_FORMAT_BC3_TYPELESS: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB:
+        case DXGI_FORMAT_BC5_TYPELESS: case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM:
+        case DXGI_FORMAT_BC6H_TYPELESS: case DXGI_FORMAT_BC6H_UF16: case DXGI_FORMAT_BC6H_SF16:
+        case DXGI_FORMAT_BC7_TYPELESS: case DXGI_FORMAT_BC7_UNORM: case DXGI_FORMAT_BC7_UNORM_SRGB:
+            bc = true;
+            return 16;
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT:
+            return 16;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM: case DXGI_FORMAT_R16G16B16A16_UINT:
+        case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R16G16B16A16_SINT: case DXGI_FORMAT_R32G32_TYPELESS: case DXGI_FORMAT_R32G32_FLOAT:
+        case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R32G32_SINT:
+            return 8;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_UINT: case DXGI_FORMAT_R11G11B10_FLOAT:
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_R8G8B8A8_UINT:
+        case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8X8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        case DXGI_FORMAT_R16G16_TYPELESS: case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16G16_UINT:
+        case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R32_FLOAT:
+        case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT: case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
+            return 4;
+        case DXGI_FORMAT_R8G8_TYPELESS: case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R8G8_SNORM: case DXGI_FORMAT_R8G8_SINT:
+        case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SNORM:
+        case DXGI_FORMAT_R16_SINT:
+            return 2;
+        case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SNORM: case DXGI_FORMAT_R8_SINT:
+        case DXGI_FORMAT_A8_UNORM:
+            return 1;
+        default:
+            return 0;
+        }
+    }
+    // One subresource's tight size: rows of texels, or of 4x4 blocks.
+    void sub_size(const D3D11_TEXTURE2D_DESC& d, UINT mip, UINT& rowbytes, UINT& rows)
+    {
+        bool       bc = false;
+        const UINT b  = fmt_bytes(d.Format, bc);
+        const UINT w = std::max(1u, d.Width >> mip), h = std::max(1u, d.Height >> mip);
+        rowbytes = bc ? std::max(1u, (w + 3) / 4) * b : w * b;
+        rows     = bc ? std::max(1u, (h + 3) / 4) : h;
+    }
+    uint64_t tex_bytes(const D3D11_TEXTURE2D_DESC& d)
+    {
+        uint64_t n = 0;
+        for (UINT m = 0; m < d.MipLevels; ++m) {
+            UINT rb = 0, r = 0;
+            sub_size(d, m, rb, r);
+            n += uint64_t(rb) * r;
+        }
+        return n * d.ArraySize;
+    }
+
+    struct Out
+    {
+        std::vector<uint8_t> b;
+        template <class T> void put(const T& v) { const auto* p = reinterpret_cast<const uint8_t*>(&v); b.insert(b.end(), p, p + sizeof(T)); }
+        void bytes(const void* p, size_t n)
+        {
+            put(uint64_t(n));
+            const auto* q = static_cast<const uint8_t*>(p);
+            b.insert(b.end(), q, q + n);
+        }
+    };
+    struct In
+    {
+        const uint8_t* p{ nullptr };
+        const uint8_t* e{ nullptr };
+        bool           ok{ true };
+        template <class T> void into(T& v)
+        {
+            if (!ok || size_t(e - p) < sizeof(T)) { ok = false; return; }
+            std::memcpy(&v, p, sizeof(T));
+            p += sizeof(T);
+        }
+        template <class T> T get() { T v{}; into(v); return v; }
+        std::pair<const uint8_t*, size_t> bytes()
+        {
+            const uint64_t n = get<uint64_t>();
+            if (!ok || uint64_t(e - p) < n) { ok = false; return { nullptr, 0 }; }
+            const std::pair<const uint8_t*, size_t> r{ p, size_t(n) };
+            p += n;
+            return r;
+        }
+    };
+
+    // A resource of a kept copy: a buffer (the range a draw uses) or a 2D texture (every mip and slice).
+    struct Res
+    {
+        uint8_t              type{ 0 };   // 1 buffer, 2 texture 2D
+        D3D11_BUFFER_DESC    bd{};
+        D3D11_TEXTURE2D_DESC td{};
+        std::vector<UINT>    rowbytes, rows;                       // per subresource (mip + slice * mips)
+        std::vector<std::pair<const uint8_t*, size_t>> at;         // read: each subresource's bytes in the file
+        std::vector<uint8_t> data;                                 // saved: every subresource's bytes, in order
+        ID3D11Resource*      staging{ nullptr };                   // saved: the copy read back
+        ID3D11Resource*      src{ nullptr };                       // saved: the game's resource (one entry for every view of it)
+    };
+    struct View { uint8_t kind{ 0 }; int32_t res{ -1 }; D3D11_SHADER_RESOURCE_VIEW_DESC desc{}; };   // kind 0 none, 1 the scene's (bound at the draw), 2 kept
+    struct Elem { std::string sem; UINT idx{ 0 }, fmt{ 0 }, slot{ 0 }, off{ 0 }, inst{ 0 }; };
+    struct CPart
+    {
+        UINT                     count{ 0 }, start{ 0 }, topo{ 0 }, ib_fmt{ 0 };
+        INT                      base{ 0 };
+        std::vector<Elem>        il;
+        uint32_t                 vs_crc{ 0 }, ps_crc{ 0 };
+        int32_t                  vb[kVb]{ -1, -1, -1, -1 };
+        UINT                     stride[kVb]{};
+        int32_t                  ib{ -1 }, cb2{ -1 }, pal[2]{ -1, -1 };
+        View                     vsrv[kVsSrv]{}, srv[kSrv]{};
+        uint8_t                  smp_has[kSmp]{};
+        D3D11_SAMPLER_DESC       smp[kSmp]{};
+        uint8_t                  pscb_view[kPsCb]{};
+        int32_t                  pscb[kPsCb]{ -1, -1, -1, -1, -1, -1, -1, -1 };
+        float                    obj[32]{};
+        uint8_t                  rs_has{ 0 }, dss_has{ 0 }, bs_has{ 0 };
+        D3D11_RASTERIZER_DESC    rs{};
+        D3D11_DEPTH_STENCIL_DESC dss{};
+        UINT                     ds_ref{ 0 };
+        D3D11_BLEND_DESC         bs{};
+        float                    bf[4]{};
+        UINT                     mask{ 0xffffffffu };
+        float                    rq[9]{}, tq[3]{};
+        // saved: the game's buffers whose ranges are read back (the index range first, then the vertex range it uses)
+        ID3D11Buffer*            ib_src{ nullptr };
+        UINT                     ib_off{ 0 };
+        ID3D11Buffer*            vb_src[kVb]{};
+        UINT                     vb_off[kVb]{};
+    };
+    struct Header
+    {
+        uint32_t sig{ 0 };
+        uint64_t item{ 0 };
+        uint8_t  side{ 0 }, hand_ok{ 0 };
+        float    grip0[3]{}, corr[9]{}, hand[3]{};
+    };
+
+    void put_part(Out& o, const CPart& p)
+    {
+        o.put(p.count); o.put(p.start); o.put(p.base); o.put(p.topo); o.put(p.ib_fmt);
+        o.put(uint32_t(p.il.size()));
+        for (const auto& e : p.il) {
+            o.bytes(e.sem.data(), e.sem.size());
+            o.put(e.idx); o.put(e.fmt); o.put(e.slot); o.put(e.off); o.put(e.inst);
+        }
+        o.put(p.vs_crc); o.put(p.ps_crc);
+        for (int i = 0; i < kVb; ++i) { o.put(p.vb[i]); o.put(p.stride[i]); }
+        o.put(p.ib); o.put(p.cb2); o.put(p.pal[0]); o.put(p.pal[1]);
+        for (const auto& v : p.vsrv) { o.put(v.kind); o.put(v.res); o.put(v.desc); }
+        for (const auto& v : p.srv) { o.put(v.kind); o.put(v.res); o.put(v.desc); }
+        for (int i = 0; i < kSmp; ++i) { o.put(p.smp_has[i]); o.put(p.smp[i]); }
+        for (int i = 0; i < kPsCb; ++i) { o.put(p.pscb_view[i]); o.put(p.pscb[i]); }
+        o.put(p.obj);
+        o.put(p.rs_has); o.put(p.rs); o.put(p.dss_has); o.put(p.dss); o.put(p.ds_ref); o.put(p.bs_has); o.put(p.bs); o.put(p.bf); o.put(p.mask);
+        o.put(p.rq); o.put(p.tq);
+    }
+    bool get_part(In& in, CPart& p)
+    {
+        in.into(p.count); in.into(p.start); in.into(p.base); in.into(p.topo); in.into(p.ib_fmt);
+        const uint32_t n = in.get<uint32_t>();
+        if (!in.ok || n == 0 || n > 32) return false;
+        p.il.resize(n);
+        for (auto& e : p.il) {
+            const auto [q, k] = in.bytes();
+            if (!q || k == 0 || k > 64) return false;
+            e.sem.assign(reinterpret_cast<const char*>(q), k);
+            in.into(e.idx); in.into(e.fmt); in.into(e.slot); in.into(e.off); in.into(e.inst);
+        }
+        in.into(p.vs_crc); in.into(p.ps_crc);
+        for (int i = 0; i < kVb; ++i) { in.into(p.vb[i]); in.into(p.stride[i]); }
+        in.into(p.ib); in.into(p.cb2); in.into(p.pal[0]); in.into(p.pal[1]);
+        for (auto& v : p.vsrv) { in.into(v.kind); in.into(v.res); in.into(v.desc); }
+        for (auto& v : p.srv) { in.into(v.kind); in.into(v.res); in.into(v.desc); }
+        for (int i = 0; i < kSmp; ++i) { in.into(p.smp_has[i]); in.into(p.smp[i]); }
+        for (int i = 0; i < kPsCb; ++i) { in.into(p.pscb_view[i]); in.into(p.pscb[i]); }
+        in.into(p.obj);
+        in.into(p.rs_has); in.into(p.rs); in.into(p.dss_has); in.into(p.dss); in.into(p.ds_ref); in.into(p.bs_has); in.into(p.bs); in.into(p.bf); in.into(p.mask);
+        in.into(p.rq); in.into(p.tq);
+        return in.ok;
+    }
+
+    // A save under way: what is read back, then written on a worker thread.
+    struct Job
+    {
+        Header               h;
+        std::vector<CPart>   parts;
+        std::vector<Res>     res;
+        uint64_t             tex{ 0 };
+        int                  phase{ 1 };   // 1 the index ranges in flight, 2 the vertex ranges and the rest in flight
+        int                  at_frame{ 0 };
+        ID3D11Device*        dev{ nullptr };
+        ID3D11DeviceContext* ctx{ nullptr };
+        void release()
+        {
+            for (auto& r : res) {
+                if (r.staging) r.staging->Release();
+                if (r.src) r.src->Release();
+                r.staging = nullptr;
+                r.src     = nullptr;
+            }
+            for (auto& p : parts) {
+                if (p.ib_src) p.ib_src->Release();
+                p.ib_src = nullptr;
+                for (auto*& b : p.vb_src) { if (b) b->Release(); b = nullptr; }
+            }
+            if (ctx) ctx->Release();
+            if (dev) dev->Release();
+            ctx = nullptr;
+            dev = nullptr;
+        }
+    };
+
+    struct Entry { uint64_t item{ 0 }; int side{ 0 }; long long time{ 0 }; unsigned long long tex{ 0 }; unsigned parts{ 0 }; };
+    // The views the game's own weapon draws bound this frame (per pixel shader of a kept copy, and any), for a kept copy's scene slots.
+    struct Scene
+    {
+        ID3D11ShaderResourceView* ps[kSrv]{};
+        ID3D11ShaderResourceView* vs[kVsSrv]{};
+        int                       frame{ -100000 };
+        void release()
+        {
+            for (auto*& v : ps) { if (v) v->Release(); v = nullptr; }
+            for (auto*& v : vs) { if (v) v->Release(); v = nullptr; }
+        }
+    };
+    struct State
+    {
+        std::atomic<bool>         on{ true };
+        bool                      index_read{ false };
+        std::map<uint32_t, Entry> entries;
+        uint32_t                  start_main{ 0 }, start_side{ 0 };   // the main weapon and sidearm to show at the next start (index.txt)
+        bool                      dirty{ false };
+        clock::time_point         written{};
+        // The start: the files read on a worker thread, made on the render thread.
+        int                       load{ 0 };   // 0 not started, 1 started
+        std::mutex                mx;
+        std::vector<std::pair<uint32_t, std::vector<uint8_t>>> files;   // (mx) read, not made yet
+        clock::time_point         next_try{}, load_t0{};
+        std::map<uint32_t, int>   tries;
+        std::set<uint32_t>        disk;          // weapons drawn from a kept copy (not recorded this session yet)
+        std::set<uint32_t>        unkeepable;    // said once: not kept (and why)
+        uint32_t                  seed_main{ 0 }, seed_side{ 0 };      // the start's main weapon and sidearm, given from the kept copies
+        clock::time_point         seeded_at{};   // the hold time given to them (a real hold this session is later)
+        // weapongone: each one shown once the game's inventory says it is carried. 0 not taken yet, 1 waits for the answer, 2 shown, 3 left out, 4 refused.
+        int                       main_st{ 0 }, side_st{ 0 };
+        float                     main_wait{ 0 }, side_wait{ 0 }, main_zero{ 0 }, side_zero{ 0 };   // s of play waited; s of play answered "not carried"
+        bool                      watching{ false }, trust{ false }, distrust{ false };
+        clock::time_point         ask_last{};
+        // Saving.
+        std::unique_ptr<Job>      job;
+        std::set<uint32_t>        want_save;
+        clock::time_point         play_since{};
+        int                       item_scan{ 0 };
+        std::map<const void*, Scene> scene_ps;
+        Scene                        scene_any;
+        ID3D11Device*                dev{ nullptr };
+    };
+    State g;
+
+    // The shaders a kept copy draws with (any thread: the device's shader creation): (pixel shader, CRC) -> its bytecode is on disk.
+    std::mutex                                g_sh_mx;
+    bool                                      g_sh_read = false;
+    std::map<std::pair<bool, uint32_t>, bool> g_sh;
+    void sh_read_locked()
+    {
+        if (g_sh_read) return;
+        g_sh_read = true;
+        std::ifstream in{ dir() + "index.txt" };
+        std::string   line;
+        while (std::getline(in, line)) {
+            std::istringstream ls{ line };
+            std::string        k, kind, hex;
+            if (!(ls >> k >> kind >> hex) || k != "shader") continue;
+            const bool     ps  = kind == "ps";
+            const uint32_t crc = uint32_t(std::strtoul(hex.c_str(), nullptr, 16));
+            if (crc != 0) g_sh[{ ps, crc }] = exists(shader_file(ps, crc));
+        }
+    }
+
+    void index_read()
+    {
+        if (g.index_read) return;
+        g.index_read = true;
+        std::ifstream in{ dir() + "index.txt" };
+        std::string   line;
+        while (std::getline(in, line)) {
+            std::istringstream ls{ line };
+            std::string        k;
+            if (!(ls >> k)) continue;
+            if (k == "weapon") {
+                uint32_t    sig = 0;
+                std::string item;
+                Entry       e{};
+                if (ls >> sig >> item >> e.side >> e.time >> e.tex >> e.parts && sig != 0) {
+                    e.item         = std::strtoull(item.c_str(), nullptr, 16);
+                    g.entries[sig] = e;
+                }
+            } else if (k == "start") {
+                std::string what;
+                uint32_t    sig = 0;
+                if (ls >> what >> sig) (what == "main" ? g.start_main : g.start_side) = sig;
+            }
+        }
+        for (auto it = g.entries.begin(); it != g.entries.end();) it = exists(file_of(it->first)) ? std::next(it) : g.entries.erase(it);
+    }
+    void index_write()
+    {
+        make_dir();
+        std::string s = "# fc5vr weapon copies (weaponcache, FarCry5Holster.cpp). weapon <id> <game item> <1 a sidearm> <saved, unix time> <texture bytes> <draws>\n";
+        for (const auto& [sig, e] : g.entries) s += fmt::format("weapon {} {:x} {} {} {} {}\n", sig, e.item, e.side, e.time, e.tex, e.parts);
+        if (g.start_main) s += fmt::format("start main {}\n", g.start_main);
+        if (g.start_side) s += fmt::format("start side {}\n", g.start_side);
+        {
+            std::lock_guard _{ g_sh_mx };
+            sh_read_locked();
+            for (const auto& [k, have] : g_sh) s += fmt::format("shader {} {:08X}\n", k.first ? "ps" : "vs", k.second);
+        }
+        const std::string p = dir() + "index.txt", tmp = p + ".tmp";
+        {
+            std::ofstream f{ tmp, std::ios::binary | std::ios::trunc };
+            f << s;
+            if (!f) return;
+        }
+        MoveFileExA(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING);
+    }
+
+    void scene_take(ID3D11DeviceContext* ctx, Scene& s, int frame)
+    {
+        s.release();
+        ctx->PSGetShaderResources(0, kSrv, s.ps);
+        ctx->VSGetShaderResources(0, kVsSrv, s.vs);
+        s.frame = frame;
+    }
+    // The views a part draws with: its own, and in a kept copy's scene slots the game's (its own weapon draw with that pixel shader in the last
+    // 90 frames, else any weapon draw, else cur: what the gloves draw binds now).
+    void views_for(const Part& r, int frame, ID3D11ShaderResourceView* const* cur_ps, ID3D11ShaderResourceView* const* cur_vs, ID3D11ShaderResourceView** ps,
+                   ID3D11ShaderResourceView** vs)
+    {
+        const Scene* sc = nullptr;
+        if (r.scene_ps || r.scene_vs) {
+            if (const auto it = g.scene_ps.find(r.ps); it != g.scene_ps.end() && frame - it->second.frame < 90) sc = &it->second;
+            else if (frame - g.scene_any.frame < 90) sc = &g.scene_any;
+        }
+        for (int j = 0; j < kSrv; ++j) ps[j] = ((r.scene_ps >> j) & 1u) ? (sc ? sc->ps[j] : cur_ps ? cur_ps[j] : nullptr) : r.srv[j];
+        for (int j = 0; j < kVsSrv; ++j) vs[j] = ((r.scene_vs >> j) & 1u) ? (sc ? sc->vs[j] : cur_vs ? cur_vs[j] : nullptr) : r.vs_srv[j];
+    }
+}
+}
+
+namespace fc5::weaponcache
+{
+    bool on() { return wc::g.on.load(); }
+
+    void note_shader(bool ps, uint32_t crc, const void* code, size_t size)
+    {
+        if (!wc::g.on.load() || !code || size == 0 || size > (8u << 20) || crc == 0) return;
+        std::lock_guard _{ wc::g_sh_mx };
+        wc::sh_read_locked();
+        const auto it = wc::g_sh.find({ ps, crc });
+        if (it == wc::g_sh.end() || it->second) return;
+        wc::make_dir();
+        std::ofstream f{ wc::shader_file(ps, crc), std::ios::binary | std::ios::trunc };
+        f.write(static_cast<const char*>(code), std::streamsize(size));
+        it->second = static_cast<bool>(f);
+        if (it->second)
+            spdlog::info("[Holster] weaponcache: the game's {} shader #{:08X} kept on disk ({} bytes): a kept weapon copy can be drawn with it before the game makes it",
+                         ps ? "pixel" : "vertex", crc, size);
     }
 }
 
@@ -391,6 +820,12 @@ void FarCry5Stereo::holster_draw(ID3D11DeviceContext* ctx, UINT count, UINT star
     auto&     t     = *m_hol;
     const int frame = m_frame.load();
     if (!holster_records()) return;
+    if (!wc::g.dev) ctx->GetDevice(&wc::g.dev);   // weaponcache (kept for the session)
+    // weaponcache: the views the game binds for its own weapon draws, for the scene's slots of a copy made from disk.
+    if (!wc::g.disk.empty()) {
+        if (wc::g.scene_any.frame != frame) wc::scene_take(ctx, wc::g.scene_any, frame);
+        if (const auto it = wc::g.scene_ps.find(static_cast<const void*>(m_cur_ps)); it != wc::g.scene_ps.end() && it->second.frame != frame) wc::scene_take(ctx, it->second, frame);
+    }
     const Shape shape{ count, start, base, static_cast<const void*>(m_cur_ps) };
     // The same part drawn twice in a frame (both eyes' passes in one frame, a second pass): one part, recorded once (his 27 Oct save: 5694 and 24417
     // were never recorded, "3 of 2 draws").
@@ -532,7 +967,8 @@ void FarCry5Stereo::holster_frame_end()
     if (!throw_quiet) m_hol_cur_side = holster_is_side(m_weapon_sig.load());
     m_hol_hiding       = weapon_switch_hiding();   // shoulderdraw only (the gesture waits for its new weapon's pose; not our own pending hide)
     m_hol_known        = m_hol->find(m_weapon_sig.load()) != nullptr;   // a weapon recorded (held still) before: the switch lands on it at once
-    m_hol_side_rec     = t.slot_sig.load() != 0 && t.find(t.slot_sig.load()) != nullptr;   // sidearmpeek: nothing to look at
+    m_hol_side_rec     = (t.slot_sig.load() != 0 && t.find(t.slot_sig.load()) != nullptr) ||   // sidearmpeek: nothing to look at
+                     wc::g.side_st == 1;   // (weaponcache: nor while the kept sidearm waits for the inventory's answer, under 5 s of play)
     // A saved sidearm measured since as no handgun (the author's 27 Oct session saved his rifle 57819): forgotten, the slot is looked at again.
     if (const uint32_t ss = t.slot_sig.load(); ss != 0 && (holster_handgun(ss) == 0 || melee_weapon(ss))) {
         t.slot_sig = 0;
@@ -568,6 +1004,7 @@ void FarCry5Stereo::holster_frame_end()
     const bool by_wheel = t.wheel_t != clock::time_point{} && now - t.wheel_t < std::chrono::seconds(3);
     if (m_hol_cur_side.load() && !t.cur_side_was) t.side_by_hip = by_gesture || !by_wheel;
     t.cur_side_was = m_hol_cur_side.load();
+    holster_cache_frame();   // weaponcache: the kept copies read and made, checked, saved
     if (!holster_records()) {
         t.rec_next = false;
         for (auto& p : t.pend) p.release();
@@ -719,6 +1156,8 @@ void FarCry5Stereo::holster_frame_end()
             w->release();
             w->sig   = sig;
             w->parts = std::move(t.pend);
+            wc::g.disk.erase(sig);              // weaponcache: this session's copy from now on
+            if (wc::g.on.load()) wc::g.want_save.insert(sig);   // kept on disk once 20 s into play (if new or better)
             w->grip0 = t.pend_grip0;
             w->corr  = t.pend_corr;
             if (t.pend_hand_ok && glm::length(t.pend_hand) < 0.25f) { w->hand = t.pend_hand; w->hand_ok = true; }   // (a re-record while slung keeps the last one)
@@ -1236,11 +1675,14 @@ void FarCry5Stereo::holster_model_draw(ID3D11DeviceContext* ctx, ID3D11Buffer* c
     call_orig<void>(m_ps_set_hook, 9, ctx, r.ps, static_cast<ID3D11ClassInstance* const*>(nullptr), 0u);
     ID3D11Buffer* v[5]{ vcb0, t.model_obj, r.vs_cb2, r.pal[0] ? t.model_pal : t.model_obj, r.pal[0] ? t.model_pal : vcb4 };
     call_orig<void>(m_vs_cb_hook, 7, ctx, 0u, 5u, static_cast<ID3D11Buffer* const*>(v));
-    ctx->VSSetShaderResources(0, kVsSrv, r.vs_srv);
+    ID3D11ShaderResourceView* pv[kSrv]{};
+    ID3D11ShaderResourceView* vv[kVsSrv]{};
+    wc::views_for(r, m_frame.load(), nullptr, nullptr, pv, vv);   // weaponcache: as the copy's own parts
+    ctx->VSSetShaderResources(0, kVsSrv, vv);
     ID3D11Buffer* p[kPsCb]{};
     for (int j = 0; j < kPsCb; ++j) p[j] = r.ps_cb_view[j] ? vcb0 : r.ps_cb[j];
     ctx->PSSetConstantBuffers(0, kPsCb, p);
-    ctx->PSSetShaderResources(0, kSrv, r.srv);
+    ctx->PSSetShaderResources(0, kSrv, pv);
     call_orig<void>(m_ps_samplers_hook, 10, ctx, 0u, UINT(kSmp), static_cast<ID3D11SamplerState* const*>(r.smp));
     ctx->RSSetState(r.rs);
     ctx->OMSetDepthStencilState(r.dss, r.ds_ref);
@@ -1259,6 +1701,7 @@ void FarCry5Stereo::holster_show(ID3D11DeviceContext* ctx)
 {
     if (!m_hol) m_hol = new HolsterState{};
     auto& t = *m_hol;
+    if (!wc::g.dev) ctx->GetDevice(&wc::g.dev);   // weaponcache: the kept copies are made before any weapon is drawn (the gloves are)
     // shoulderinstant (FarCry5WeaponSwitch.cpp): a shoulder switch's guessed weapon in the hand from the grip, with or without the sidearm.
     const uint32_t sh_sig = weapon_switch_guess();
     const bool     side   = fc5::gesture::side_on();
@@ -1392,11 +1835,14 @@ void FarCry5Stereo::holster_show(ID3D11DeviceContext* ctx)
             // No motion of its own (previous = current transform, a skinned part's previous palette = its palette as recorded).
             ID3D11Buffer* v[5]{ vcb[0], t.pool[k], r.vs_cb2, r.pal[0] ? r.pal[0] : t.pool[k], r.pal[0] ? r.pal[1] : vcb[4] };
             call_orig<void>(m_vs_cb_hook, 7, ctx, 0u, 5u, static_cast<ID3D11Buffer* const*>(v));
-            ctx->VSSetShaderResources(0, kVsSrv, r.vs_srv);
+            ID3D11ShaderResourceView* pv[kSrv]{};
+            ID3D11ShaderResourceView* vv[kVsSrv]{};
+            wc::views_for(r, m_frame.load(), srv, vsrv, pv, vv);   // weaponcache: a copy from disk takes the scene's views from the game's draws
+            ctx->VSSetShaderResources(0, kVsSrv, vv);
             ID3D11Buffer* p[kPsCb]{};
             for (int j = 0; j < kPsCb; ++j) p[j] = r.ps_cb_view[j] ? vcb[0] : r.ps_cb[j];
             ctx->PSSetConstantBuffers(0, kPsCb, p);
-            ctx->PSSetShaderResources(0, kSrv, r.srv);
+            ctx->PSSetShaderResources(0, kSrv, pv);
             call_orig<void>(m_ps_samplers_hook, 10, ctx, 0u, UINT(kSmp), static_cast<ID3D11SamplerState* const*>(r.smp));
             ctx->RSSetState(r.rs);
             ctx->OMSetDepthStencilState(r.dss, r.ds_ref);
@@ -1463,11 +1909,822 @@ bool FarCry5Stereo::holster_vehicle_hand(const void* mesh, UINT count, UINT star
     return true;
 }
 
+// weaponcache: a recorded weapon's copy written to disk. First what each draw keeps (nothing is read back if a part cannot be kept, or if the
+// file on disk is as good: same draws, as many texture bytes), then copies into staging resources read back over the next frames.
+bool FarCry5Stereo::holster_cache_save_begin(uint32_t sig)
+{
+    auto&         t = *m_hol;
+    auto&         g = wc::g;
+    const Weapon* w = t.find(sig);
+    if (!w || !g.dev || g.disk.contains(sig)) return false;
+    auto job          = std::make_unique<wc::Job>();
+    job->h.sig        = sig;
+    job->h.item       = fc5::gameweapon::item(sig);
+    job->h.side       = holster_is_side(sig) ? 1 : 0;
+    job->h.hand_ok    = w->hand_ok ? 1 : 0;
+    for (int i = 0; i < 3; ++i) {
+        job->h.grip0[i] = w->grip0[i];
+        job->h.hand[i]  = w->hand[i];
+        for (int r = 0; r < 3; ++r) job->h.corr[i * 3 + r] = w->corr[i][r];
+    }
+    std::string                    why;
+    std::map<ID3D11Resource*, int> res_of;   // the game's resource (or our recorded copy of a constant buffer) -> its entry
+    auto add_res = [&](ID3D11Resource* r, uint8_t type) -> int32_t {
+        if (const auto it = res_of.find(r); it != res_of.end()) return it->second;
+        wc::Res x{};
+        x.type = type;
+        if (type == 1) static_cast<ID3D11Buffer*>(r)->GetDesc(&x.bd);
+        else static_cast<ID3D11Texture2D*>(r)->GetDesc(&x.td);
+        x.src = r;
+        r->AddRef();
+        const int32_t i = int32_t(job->res.size());
+        res_of[r]       = i;
+        if (type == 2) job->tex += wc::tex_bytes(x.td);
+        job->res.push_back(std::move(x));
+        return i;
+    };
+    // A view: the scene's (render targets, unordered-access and dynamic resources: bound again at each draw) or a resource kept.
+    auto view = [&](ID3D11ShaderResourceView* v, wc::View& out) {
+        if (!v) return;
+        ID3D11Resource* r = nullptr;
+        v->GetResource(&r);
+        if (!r) return;
+        v->GetDesc(&out.desc);
+        D3D11_RESOURCE_DIMENSION dim{};
+        r->GetType(&dim);
+        out.kind = 1;
+        if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+            D3D11_TEXTURE2D_DESC d{};
+            static_cast<ID3D11Texture2D*>(r)->GetDesc(&d);
+            bool       bc   = false;
+            const bool live = (d.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_UNORDERED_ACCESS)) || d.Usage == D3D11_USAGE_DYNAMIC ||
+                              d.Usage == D3D11_USAGE_STAGING || d.SampleDesc.Count > 1;
+            if (!live) {
+                if (wc::fmt_bytes(d.Format, bc) == 0) why = fmt::format("a texture of format {}", int(d.Format));
+                else if (wc::tex_bytes(d) > wc::kMaxTex) why = fmt::format("a texture of {} MB", wc::tex_bytes(d) >> 20);
+                else {
+                    out.kind = 2;
+                    out.res  = add_res(r, 2);
+                }
+            }
+        } else if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+            D3D11_BUFFER_DESC d{};
+            static_cast<ID3D11Buffer*>(r)->GetDesc(&d);
+            const bool live = (d.BindFlags & (D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET | D3D11_BIND_STREAM_OUTPUT)) || d.Usage == D3D11_USAGE_DYNAMIC ||
+                              d.Usage == D3D11_USAGE_STAGING;
+            if (!live) {
+                if (d.ByteWidth > wc::kMaxBuf) why = fmt::format("a buffer view of {} MB", d.ByteWidth >> 20);
+                else {
+                    out.kind = 2;
+                    out.res  = add_res(r, 1);
+                }
+            }
+        }
+        r->Release();
+    };
+    auto cbuf = [&](ID3D11Buffer* b) -> int32_t { return b ? add_res(b, 1) : -1; };
+    for (const Part& p : w->parts) {
+        wc::CPart c{};
+        c.count  = p.count;
+        c.start  = p.start;
+        c.base   = p.base;
+        c.topo   = UINT(p.topo);
+        c.ib_fmt = UINT(p.ib_fmt);
+        {
+            std::lock_guard _{ m_ps_mtx };
+            if (const auto it = m_vs_info.find(p.vs); it != m_vs_info.end()) c.vs_crc = wc::crc_of(it->second);
+            if (const auto it = m_ps_names.find(p.ps); it != m_ps_names.end()) c.ps_crc = wc::crc_of(it->second);
+            if (const auto it = m_layouts.find(p.il); it != m_layouts.end())
+                for (const auto& e : it->second) c.il.push_back(wc::Elem{ e.semantic, e.index, UINT(e.format), e.slot, e.offset, e.inst });
+        }
+        if (!p.vs || !p.ps || c.vs_crc == 0 || c.ps_crc == 0) why = "a shader not known by its bytecode";
+        else if (!p.il || c.il.empty()) why = "its vertex layout not known";
+        else if (std::any_of(c.il.begin(), c.il.end(), [](const wc::Elem& e) { return e.inst != 0 || e.slot >= UINT(kVb); })) why = "a per-instance vertex stream";
+        else if (!p.ib || (p.ib_fmt != DXGI_FORMAT_R16_UINT && p.ib_fmt != DXGI_FORMAT_R32_UINT) || p.count == 0) why = "no 16- or 32-bit index buffer";
+        if (why.empty()) {
+            c.ib_src = addref(p.ib);
+            c.ib_off = p.ib_off;
+            for (const auto& e : c.il) {
+                if (!p.vb[e.slot]) { why = fmt::format("vertex stream {} not bound", e.slot); break; }
+                if (c.vb_src[e.slot]) continue;
+                c.vb_src[e.slot] = addref(p.vb[e.slot]);
+                c.vb_off[e.slot] = p.off[e.slot];
+                c.stride[e.slot] = p.stride[e.slot];
+            }
+        }
+        if (why.empty()) {
+            c.cb2    = cbuf(p.vs_cb2);
+            c.pal[0] = cbuf(p.pal[0]);
+            c.pal[1] = cbuf(p.pal[1]);
+            for (int j = 0; j < kPsCb; ++j) {
+                c.pscb_view[j] = p.ps_cb_view[j] ? 1 : 0;
+                c.pscb[j]      = cbuf(p.ps_cb[j]);
+            }
+            for (int j = 0; j < kVsSrv && why.empty(); ++j) view(p.vs_srv[j], c.vsrv[j]);
+            for (int j = 0; j < kSrv && why.empty(); ++j) view(p.srv[j], c.srv[j]);
+            for (int j = 0; j < kSmp; ++j)
+                if (p.smp[j]) {
+                    c.smp_has[j] = 1;
+                    p.smp[j]->GetDesc(&c.smp[j]);
+                }
+            if (p.rs) { c.rs_has = 1; p.rs->GetDesc(&c.rs); }
+            if (p.dss) { c.dss_has = 1; p.dss->GetDesc(&c.dss); }
+            if (p.bs) { c.bs_has = 1; p.bs->GetDesc(&c.bs); }
+            c.ds_ref = p.ds_ref;
+            std::memcpy(c.bf, p.bf, sizeof(c.bf));
+            c.mask = p.mask;
+            std::memcpy(c.obj, p.obj, sizeof(c.obj));
+            for (int i = 0; i < 3; ++i) {
+                c.tq[i] = p.tq[i];
+                for (int r = 0; r < 3; ++r) c.rq[i * 3 + r] = p.rq[i][r];
+            }
+        }
+        job->parts.push_back(std::move(c));
+        if (!why.empty()) break;
+    }
+    if (!why.empty()) {
+        if (g.unkeepable.insert(sig).second) spdlog::info("[Holster] weaponcache: weapon {} is not kept on disk ({}): it is copied again at each start", sig, why);
+        job->release();
+        return false;
+    }
+    if (const auto e = g.entries.find(sig); e != g.entries.end() && wc::exists(wc::file_of(sig)) && e->second.parts == job->parts.size() && e->second.tex >= job->tex) {
+        job->release();
+        return false;   // the kept one is as good
+    }
+    // Into staging resources: the index ranges now, the vertex ranges they use once read (holster_cache_save_step), every other resource whole.
+    job->dev = g.dev;
+    job->dev->AddRef();
+    job->dev->GetImmediateContext(&job->ctx);
+    if (!job->ctx) { job->release(); return false; }
+    bool ok = true;
+    for (auto& x : job->res) {
+        if (x.type == 1) {
+            D3D11_BUFFER_DESC d{};
+            d.ByteWidth      = x.bd.ByteWidth;
+            d.Usage          = D3D11_USAGE_STAGING;
+            d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            ID3D11Buffer* st = nullptr;
+            ok               = ok && SUCCEEDED(job->dev->CreateBuffer(&d, nullptr, &st)) && st;
+            if (!st) continue;
+            job->ctx->CopyResource(st, x.src);
+            x.staging  = st;
+            x.rowbytes = { x.bd.ByteWidth };
+            x.rows     = { 1u };
+        } else {
+            D3D11_TEXTURE2D_DESC d = x.td;
+            d.Usage                = D3D11_USAGE_STAGING;
+            d.BindFlags            = 0;
+            d.CPUAccessFlags       = D3D11_CPU_ACCESS_READ;
+            d.MiscFlags &= D3D11_RESOURCE_MISC_TEXTURECUBE;
+            ID3D11Texture2D* st = nullptr;
+            ok                  = ok && SUCCEEDED(job->dev->CreateTexture2D(&d, nullptr, &st)) && st;
+            if (!st) continue;
+            job->ctx->CopyResource(st, x.src);
+            x.staging = st;
+            for (UINT a = 0; a < x.td.ArraySize; ++a)
+                for (UINT m = 0; m < x.td.MipLevels; ++m) {
+                    UINT rb = 0, r = 0;
+                    wc::sub_size(x.td, m, rb, r);
+                    x.rowbytes.push_back(rb);
+                    x.rows.push_back(r);
+                }
+        }
+    }
+    for (auto& c : job->parts) {
+        const UINT        isz = c.ib_fmt == DXGI_FORMAT_R32_UINT ? 4u : 2u;
+        D3D11_BUFFER_DESC sd{};
+        c.ib_src->GetDesc(&sd);
+        const uint64_t begin = uint64_t(c.ib_off) + uint64_t(c.start) * isz, bytes = uint64_t(c.count) * isz;
+        if (begin + bytes > sd.ByteWidth) { ok = false; break; }
+        D3D11_BUFFER_DESC d{};
+        d.ByteWidth      = UINT(bytes);
+        d.Usage          = D3D11_USAGE_STAGING;
+        d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ID3D11Buffer* st = nullptr;
+        if (FAILED(job->dev->CreateBuffer(&d, nullptr, &st)) || !st) { ok = false; break; }
+        const D3D11_BOX box{ UINT(begin), 0, 0, UINT(begin + bytes), 1, 1 };
+        job->ctx->CopySubresourceRegion(st, 0, 0, 0, 0, c.ib_src, 0, &box);
+        wc::Res x{};
+        x.type         = 1;
+        x.bd.ByteWidth = UINT(bytes);
+        x.bd.Usage     = D3D11_USAGE_DEFAULT;
+        x.bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+        x.staging      = st;
+        x.rowbytes     = { UINT(bytes) };
+        x.rows         = { 1u };
+        c.ib           = int32_t(job->res.size());
+        job->res.push_back(std::move(x));
+    }
+    if (!ok) {
+        spdlog::info("[Holster] weaponcache: weapon {}: its copy could not be read back (a staging copy failed): not kept this time", sig);
+        job->release();
+        return false;
+    }
+    job->phase    = 1;
+    job->at_frame = m_frame.load();
+    spdlog::info("[Holster] weaponcache: weapon {}: keeping its copy on disk ({} draws, {} resources, {:.1f} MB of textures)", sig, job->parts.size(), job->res.size(),
+                 double(job->tex) / 1048576.0);
+    g.job = std::move(job);
+    return true;
+}
+
+void FarCry5Stereo::holster_cache_save_step()
+{
+    auto& g = wc::g;
+    if (!g.job) return;
+    auto&     j     = *g.job;
+    const int frame = m_frame.load();
+    if (frame - j.at_frame < 3) return;   // the copies are done on the GPU by then (the map does not wait)
+    auto fail = [&](const std::string& why) {
+        spdlog::info("[Holster] weaponcache: weapon {}: not kept this time ({})", j.h.sig, why);
+        j.release();
+        g.job.reset();
+    };
+    auto read_back = [&](wc::Res& x) -> bool {
+        if (!x.staging) return true;
+        size_t total = 0;
+        for (size_t s = 0; s < x.rowbytes.size(); ++s) total += size_t(x.rowbytes[s]) * x.rows[s];
+        x.data.resize(total);
+        size_t at = 0;
+        for (size_t s = 0; s < x.rowbytes.size(); ++s) {
+            D3D11_MAPPED_SUBRESOURCE m{};
+            if (FAILED(j.ctx->Map(x.staging, UINT(s), D3D11_MAP_READ, 0, &m)) || !m.pData) return false;
+            const UINT pitch = x.type == 1 ? x.rowbytes[s] : m.RowPitch;
+            for (UINT r = 0; r < x.rows[s]; ++r) std::memcpy(x.data.data() + at + size_t(r) * x.rowbytes[s], static_cast<const uint8_t*>(m.pData) + size_t(r) * pitch, x.rowbytes[s]);
+            j.ctx->Unmap(x.staging, UINT(s));
+            at += size_t(x.rowbytes[s]) * x.rows[s];
+        }
+        x.staging->Release();
+        x.staging = nullptr;
+        return true;
+    };
+    if (j.phase == 1) {
+        // Each part's vertex range (from its indices), then that range of each of its streams.
+        for (auto& c : j.parts) {
+            auto& ix = j.res[size_t(c.ib)];
+            if (!read_back(ix)) return fail("its indices not read back");
+            const bool i32 = c.ib_fmt == DXGI_FORMAT_R32_UINT;
+            int64_t    lo = INT64_MAX, hi = -1;
+            for (UINT k = 0; k < c.count; ++k) {
+                uint32_t v = 0;
+                if (i32) std::memcpy(&v, ix.data.data() + size_t(k) * 4, 4);
+                else {
+                    uint16_t h = 0;
+                    std::memcpy(&h, ix.data.data() + size_t(k) * 2, 2);
+                    v = h;
+                }
+                const int64_t x = int64_t(c.base) + int64_t(v);
+                lo              = std::min(lo, x);
+                hi              = std::max(hi, x);
+            }
+            if (lo < 0 || hi < lo) return fail("a vertex before its buffer");
+            for (int s = 0; s < kVb; ++s) {
+                if (!c.vb_src[s]) continue;
+                D3D11_BUFFER_DESC sd{};
+                c.vb_src[s]->GetDesc(&sd);
+                const uint64_t st    = c.stride[s];
+                const uint64_t begin = uint64_t(c.vb_off[s]) + (st ? uint64_t(lo) * st : 0);
+                const uint64_t bytes = st ? uint64_t(hi - lo + 1) * st : std::min<uint64_t>(256, sd.ByteWidth > c.vb_off[s] ? sd.ByteWidth - c.vb_off[s] : 0);
+                if (bytes == 0 || bytes > wc::kMaxBuf || begin + bytes > sd.ByteWidth) return fail(fmt::format("vertex stream {} outside its buffer", s));
+                D3D11_BUFFER_DESC d{};
+                d.ByteWidth      = UINT(bytes);
+                d.Usage          = D3D11_USAGE_STAGING;
+                d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                ID3D11Buffer* stg = nullptr;
+                if (FAILED(j.dev->CreateBuffer(&d, nullptr, &stg)) || !stg) return fail("a staging buffer");
+                const D3D11_BOX box{ UINT(begin), 0, 0, UINT(begin + bytes), 1, 1 };
+                j.ctx->CopySubresourceRegion(stg, 0, 0, 0, 0, c.vb_src[s], 0, &box);
+                wc::Res x{};
+                x.type         = 1;
+                x.bd.ByteWidth = UINT(bytes);
+                x.bd.Usage     = D3D11_USAGE_DEFAULT;
+                x.bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+                x.staging      = stg;
+                x.rowbytes     = { UINT(bytes) };
+                x.rows         = { 1u };
+                c.vb[s]        = int32_t(j.res.size());
+                j.res.push_back(std::move(x));
+            }
+            c.base  = INT(int64_t(c.base) - lo);   // the kept streams start at the part's lowest vertex
+            c.start = 0;                            // and its indices at 0
+        }
+        j.phase    = 2;
+        j.at_frame = frame;
+        return;
+    }
+    for (auto& x : j.res)
+        if (!read_back(x)) return fail("a resource not read back");
+    // The file: header, resources, draws.
+    wc::Out o;
+    o.put(wc::kMagic);
+    o.put(wc::kVersion);
+    o.put(j.h.sig); o.put(j.h.item); o.put(j.h.side); o.put(j.h.hand_ok); o.put(j.h.grip0); o.put(j.h.corr); o.put(j.h.hand);
+    o.put(uint32_t(j.res.size()));
+    for (const auto& x : j.res) {
+        o.put(x.type);
+        if (x.type == 1) o.put(x.bd);
+        else o.put(x.td);
+        o.put(uint32_t(x.rowbytes.size()));
+        size_t at = 0;
+        for (size_t s = 0; s < x.rowbytes.size(); ++s) {
+            const size_t n = size_t(x.rowbytes[s]) * x.rows[s];
+            o.put(x.rowbytes[s]);
+            o.put(x.rows[s]);
+            o.bytes(x.data.data() + at, n);
+            at += n;
+        }
+    }
+    o.put(uint32_t(j.parts.size()));
+    for (const auto& c : j.parts) wc::put_part(o, c);
+    const double mb = double(o.b.size()) / 1048576.0;
+    std::thread([sig = j.h.sig, bytes = std::move(o.b)] {
+        wc::make_dir();
+        const std::string p = wc::file_of(sig), tmp = p + ".tmp";
+        {
+            std::ofstream f{ tmp, std::ios::binary | std::ios::trunc };
+            f.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+            if (!f) return;
+        }
+        MoveFileExA(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING);
+    }).detach();
+    wc::Entry e{};
+    e.item  = j.h.item;
+    e.side  = j.h.side;
+    e.time  = (long long)std::time(nullptr);
+    e.tex   = j.tex;
+    e.parts = unsigned(j.parts.size());
+    g.entries[j.h.sig] = e;
+    g.dirty            = true;
+    {
+        std::lock_guard _{ wc::g_sh_mx };
+        wc::sh_read_locked();
+        for (const auto& c : j.parts) {
+            wc::g_sh.try_emplace({ false, c.vs_crc }, wc::exists(wc::shader_file(false, c.vs_crc)));
+            wc::g_sh.try_emplace({ true, c.ps_crc }, wc::exists(wc::shader_file(true, c.ps_crc)));
+        }
+    }
+    spdlog::info("[Holster] weaponcache: weapon {} (item {:x}, {}) kept on disk: {} draws, {:.1f} MB of textures, a {:.1f} MB file", j.h.sig, j.h.item,
+                 j.h.side ? "a sidearm" : "a main weapon", j.parts.size(), double(j.tex) / 1048576.0, mb);
+    j.release();
+    g.job.reset();
+}
+
+// weaponcache: a kept copy made from its file. The game's own shaders are found by their CRC (else made from the bytecode kept); the vertex layout
+// is the game's one with the same elements (else made); everything else is made from the file. 0: a shader not there yet (tried again later).
+int FarCry5Stereo::holster_cache_make(uint32_t sig, const std::vector<uint8_t>& file, std::string& why)
+{
+    auto& t = *m_hol;
+    auto& g = wc::g;
+    if (!g.dev) { why = "no device yet"; return 0; }
+    wc::In in{ file.data(), file.data() + file.size() };
+    if (file.size() < 8 || in.get<uint32_t>() != wc::kMagic || in.get<uint32_t>() != wc::kVersion) { why = "not a copy of this version"; return -1; }
+    wc::Header h{};
+    in.into(h.sig); in.into(h.item); in.into(h.side); in.into(h.hand_ok); in.into(h.grip0); in.into(h.corr); in.into(h.hand);
+    if (!in.ok || h.sig != sig) { why = "another weapon's file"; return -1; }
+    const uint32_t nres = in.get<uint32_t>();
+    if (!in.ok || nres > 4096) { why = "a damaged file"; return -1; }
+    std::vector<wc::Res> res(nres);
+    for (auto& x : res) {
+        in.into(x.type);
+        if (x.type == 1) in.into(x.bd);
+        else if (x.type == 2) in.into(x.td);
+        else { why = "a damaged file"; return -1; }
+        const uint32_t ns = in.get<uint32_t>();
+        if (!in.ok || ns == 0 || ns > 4096 || (x.type == 1 && ns != 1) || (x.type == 2 && ns != x.td.MipLevels * x.td.ArraySize)) { why = "a damaged file"; return -1; }
+        for (uint32_t s = 0; s < ns; ++s) {
+            const UINT rb = in.get<UINT>(), r = in.get<UINT>();
+            const auto at = in.bytes();
+            if (!in.ok || !at.first || at.second != size_t(rb) * r) { why = "a damaged file"; return -1; }
+            x.rowbytes.push_back(rb);
+            x.rows.push_back(r);
+            x.at.push_back(at);
+        }
+        if (x.type == 1 && x.rowbytes[0] != x.bd.ByteWidth) { why = "a damaged file"; return -1; }
+    }
+    const uint32_t np = in.get<uint32_t>();
+    if (!in.ok || np == 0 || np > uint32_t(kMaxParts)) { why = "a damaged file"; return -1; }
+    std::vector<wc::CPart> cp(np);
+    for (auto& c : cp)
+        if (!wc::get_part(in, c)) { why = "a damaged file"; return -1; }
+    auto okr = [&](int32_t i, uint8_t type) { return i == -1 || (i >= 0 && i < int32_t(nres) && res[size_t(i)].type == type); };
+    for (const auto& c : cp) {
+        bool ok = c.ib >= 0 && okr(c.ib, 1) && okr(c.cb2, 1) && okr(c.pal[0], 1) && okr(c.pal[1], 1);
+        for (int s = 0; s < kVb; ++s) ok = ok && okr(c.vb[s], 1);
+        for (int k = 0; k < kPsCb; ++k) ok = ok && okr(c.pscb[k], 1);
+        for (const auto& v : c.vsrv) ok = ok && (v.kind != 2 || (v.res >= 0 && v.res < int32_t(nres)));
+        for (const auto& v : c.srv) ok = ok && (v.kind != 2 || (v.res >= 0 && v.res < int32_t(nres)));
+        for (const auto& e : c.il) ok = ok && e.slot < UINT(kVb) && c.vb[e.slot] >= 0;
+        if (!ok) { why = "a damaged file"; return -1; }
+    }
+    // The shaders and the vertex layouts.
+    std::vector<ID3D11VertexShader*> vs(np, nullptr);
+    std::vector<ID3D11PixelShader*>  ps(np, nullptr);
+    std::vector<ID3D11InputLayout*>  il(np, nullptr);
+    auto release_all = [&] {
+        for (auto* x : vs) if (x) x->Release();
+        for (auto* x : ps) if (x) x->Release();
+        for (auto* x : il) if (x) x->Release();
+    };
+    auto same_layout = [](const std::vector<LayoutElem>& a, const std::vector<wc::Elem>& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i)
+            if (_stricmp(a[i].semantic.c_str(), b[i].sem.c_str()) != 0 || a[i].index != b[i].idx || UINT(a[i].format) != b[i].fmt || a[i].slot != b[i].slot ||
+                a[i].offset != b[i].off || a[i].inst != b[i].inst)
+                return false;
+        return true;
+    };
+    {
+        std::lock_guard _{ m_ps_mtx };
+        for (const auto& [x, info] : m_vs_info) {
+            const uint32_t c = wc::crc_of(info);
+            for (uint32_t i = 0; i < np; ++i)
+                if (!vs[i] && c == cp[i].vs_crc) { vs[i] = x; x->AddRef(); }
+        }
+        for (const auto& [x, names] : m_ps_names) {
+            const uint32_t c = wc::crc_of(names);
+            for (uint32_t i = 0; i < np; ++i)
+                if (!ps[i] && c == cp[i].ps_crc) { ps[i] = x; x->AddRef(); }
+        }
+        for (const auto& [x, elems] : m_layouts)
+            for (uint32_t i = 0; i < np; ++i)
+                if (!il[i] && same_layout(elems, cp[i].il)) { il[i] = x; x->AddRef(); }
+    }
+    auto read_code = [](const std::string& p, std::vector<char>& out) {
+        std::ifstream f{ p, std::ios::binary };
+        if (!f) return false;
+        out.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        return !out.empty();
+    };
+    for (uint32_t i = 0; i < np; ++i) {
+        std::vector<char> code;
+        if (!vs[i] && read_code(wc::shader_file(false, cp[i].vs_crc), code)) g.dev->CreateVertexShader(code.data(), code.size(), nullptr, &vs[i]);
+        if (!ps[i]) {
+            std::vector<char> pc;
+            if (read_code(wc::shader_file(true, cp[i].ps_crc), pc)) g.dev->CreatePixelShader(pc.data(), pc.size(), nullptr, &ps[i]);
+        }
+        if (!il[i] && (code.size() || read_code(wc::shader_file(false, cp[i].vs_crc), code))) {
+            std::vector<D3D11_INPUT_ELEMENT_DESC> el;
+            for (const auto& e : cp[i].il)
+                el.push_back(D3D11_INPUT_ELEMENT_DESC{ e.sem.c_str(), e.idx, DXGI_FORMAT(e.fmt), e.slot, e.off, D3D11_INPUT_PER_VERTEX_DATA, 0 });
+            g.dev->CreateInputLayout(el.data(), UINT(el.size()), code.data(), code.size(), &il[i]);
+        }
+        if (!vs[i] || !ps[i] || !il[i]) {
+            why = !vs[i] ? fmt::format("the game has not made its vertex shader #{:08X} yet (none kept)", cp[i].vs_crc)
+                : !ps[i] ? fmt::format("the game has not made its pixel shader #{:08X} yet (none kept)", cp[i].ps_crc)
+                         : "no vertex layout like its own yet";
+            release_all();
+            return 0;
+        }
+    }
+    // The resources.
+    std::vector<ID3D11Resource*> made(nres, nullptr);
+    auto release_made = [&] { for (auto* x : made) if (x) x->Release(); };
+    for (uint32_t i = 0; i < nres && why.empty(); ++i) {
+        const auto& x = res[i];
+        if (x.type == 1) {
+            D3D11_BUFFER_DESC d = x.bd;
+            d.Usage             = D3D11_USAGE_IMMUTABLE;
+            d.CPUAccessFlags    = 0;
+            d.MiscFlags &= D3D11_RESOURCE_MISC_BUFFER_STRUCTURED | D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+            d.BindFlags &= D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER | D3D11_BIND_CONSTANT_BUFFER | D3D11_BIND_SHADER_RESOURCE;
+            if (d.BindFlags & D3D11_BIND_CONSTANT_BUFFER) d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;   // a constant buffer binds as nothing else
+            D3D11_SUBRESOURCE_DATA s{ x.at[0].first, 0, 0 };
+            ID3D11Buffer*          b = nullptr;
+            if (FAILED(g.dev->CreateBuffer(&d, &s, &b)) || !b) why = fmt::format("a buffer of {} bytes not made", d.ByteWidth);
+            made[i] = b;
+        } else {
+            D3D11_TEXTURE2D_DESC d = x.td;
+            d.Usage                = D3D11_USAGE_IMMUTABLE;
+            d.CPUAccessFlags       = 0;
+            d.BindFlags            = D3D11_BIND_SHADER_RESOURCE;
+            d.MiscFlags &= D3D11_RESOURCE_MISC_TEXTURECUBE;
+            std::vector<D3D11_SUBRESOURCE_DATA> s(x.at.size());
+            for (size_t k = 0; k < x.at.size(); ++k) s[k] = D3D11_SUBRESOURCE_DATA{ x.at[k].first, x.rowbytes[k], UINT(size_t(x.rowbytes[k]) * x.rows[k]) };
+            ID3D11Texture2D* tx = nullptr;
+            if (FAILED(g.dev->CreateTexture2D(&d, s.data(), &tx)) || !tx) why = fmt::format("a {}x{} texture not made", d.Width, d.Height);
+            made[i] = tx;
+        }
+    }
+    if (!why.empty()) {
+        release_made();
+        release_all();
+        return -1;
+    }
+    Weapon w{};
+    w.sig     = sig;
+    w.hand_ok = h.hand_ok != 0;
+    for (int i = 0; i < 3; ++i) {
+        w.grip0[i] = h.grip0[i];
+        w.hand[i]  = h.hand[i];
+        for (int r = 0; r < 3; ++r) w.corr[i][r] = h.corr[i * 3 + r];
+    }
+    w.when    = clock::now() - std::chrono::hours(1);   // the first to go when eight weapons are copied
+    auto buf  = [&](int32_t k) -> ID3D11Buffer* { return k >= 0 ? addref(static_cast<ID3D11Buffer*>(made[size_t(k)])) : nullptr; };
+    for (uint32_t i = 0; i < np && why.empty(); ++i) {
+        const auto& c = cp[i];
+        Part        p{};
+        p.count  = c.count;
+        p.start  = c.start;
+        p.base   = c.base;
+        p.topo   = D3D11_PRIMITIVE_TOPOLOGY(c.topo);
+        p.ib_fmt = DXGI_FORMAT(c.ib_fmt);
+        p.ib_off = 0;
+        p.il     = std::exchange(il[i], nullptr);
+        p.vs     = std::exchange(vs[i], nullptr);
+        p.ps     = std::exchange(ps[i], nullptr);
+        for (int s = 0; s < kVb; ++s) {
+            p.vb[s]     = buf(c.vb[s]);
+            p.stride[s] = c.stride[s];
+            p.off[s]    = 0;
+        }
+        p.ib     = buf(c.ib);
+        p.vs_cb2 = buf(c.cb2);
+        p.pal[0] = buf(c.pal[0]);
+        p.pal[1] = buf(c.pal[1]);
+        for (int k = 0; k < kPsCb; ++k) {
+            p.ps_cb_view[k] = c.pscb_view[k] != 0;
+            p.ps_cb[k]      = buf(c.pscb[k]);
+        }
+        auto mk_view = [&](const wc::View& v, ID3D11ShaderResourceView*& out, uint32_t& mask, int bit) {
+            if (v.kind == 1) mask |= 1u << bit;
+            if (v.kind != 2) return;
+            if (FAILED(g.dev->CreateShaderResourceView(made[size_t(v.res)], &v.desc, &out)) || !out) why = "a texture view not made";
+        };
+        for (int k = 0; k < kVsSrv; ++k) mk_view(c.vsrv[k], p.vs_srv[k], p.scene_vs, k);
+        for (int k = 0; k < kSrv; ++k) mk_view(c.srv[k], p.srv[k], p.scene_ps, k);
+        for (int k = 0; k < kSmp; ++k)
+            if (c.smp_has[k]) g.dev->CreateSamplerState(&c.smp[k], &p.smp[k]);
+        if (c.rs_has) g.dev->CreateRasterizerState(&c.rs, &p.rs);
+        if (c.dss_has) g.dev->CreateDepthStencilState(&c.dss, &p.dss);
+        if (c.bs_has) g.dev->CreateBlendState(&c.bs, &p.bs);
+        p.ds_ref = c.ds_ref;
+        std::memcpy(p.bf, c.bf, sizeof(p.bf));
+        p.mask = c.mask;
+        std::memcpy(p.obj, c.obj, sizeof(p.obj));
+        for (int k = 0; k < 3; ++k) {
+            p.tq[k] = c.tq[k];
+            for (int r = 0; r < 3; ++r) p.rq[k][r] = c.rq[k * 3 + r];
+        }
+        w.parts.push_back(p);
+    }
+    release_made();
+    release_all();
+    if (!why.empty()) {
+        w.release();
+        return -1;
+    }
+    if ((int)t.weapons.size() >= kMaxWeapons) {
+        w.release();
+        why = "eight weapons already copied";
+        return -1;
+    }
+    for (const auto& p : w.parts) g.scene_ps.try_emplace(static_cast<const void*>(p.ps));
+    t.weapons.push_back(std::move(w));
+    g.disk.insert(sig);
+    if (h.item != 0) fc5::gameweapon::seed(sig, h.item);
+    return 1;
+}
+
+// weaponcache, once per frame (holster_frame_end): the kept copies read and made at the start, the start's main weapon and sidearm given and
+// checked against the game's inventory, the weapons to show at the next start, and the saves.
+void FarCry5Stereo::holster_cache_frame()
+{
+    auto&      t   = *m_hol;
+    auto&      g   = wc::g;
+    const auto now = clock::now();
+    if (!g.on.load() || !holster_records() || !t.copies.load()) return;
+    wc::index_read();
+    // The start: the files read on a worker thread (the last main weapon and sidearm first, then the most recent), once the device is known.
+    if (g.load == 0 && g.dev) {
+        g.load       = 1;
+        g.load_t0    = now;
+        g.play_since = now;
+        std::vector<uint32_t> pick;
+        auto add = [&](uint32_t s) {
+            if (s && g.entries.contains(s) && std::find(pick.begin(), pick.end(), s) == pick.end() && (int)pick.size() < wc::kStartLoad) pick.push_back(s);
+        };
+        add(g.start_main);
+        add(g.start_side);
+        std::vector<std::pair<long long, uint32_t>> by_time;
+        for (const auto& [s, e] : g.entries) by_time.emplace_back(e.time, s);
+        std::sort(by_time.rbegin(), by_time.rend());
+        for (const auto& bt : by_time) add(bt.second);
+        if (pick.empty()) {
+            spdlog::info("[Holster] weaponcache: no weapon copy kept yet (bin\\fc5vr_weaponcopies): each weapon is kept once recorded and held 20 s into play");
+        } else {
+            std::string list;
+            for (uint32_t s : pick) list += fmt::format(" {}{}", s, s == g.start_main ? " (main weapon)" : s == g.start_side ? " (sidearm)" : "");
+            spdlog::info("[Holster] weaponcache: reading {} kept weapon copies:{}", pick.size(), list);
+            std::thread([pick] {
+                for (uint32_t s : pick) {
+                    std::ifstream f{ wc::file_of(s), std::ios::binary | std::ios::ate };
+                    std::vector<uint8_t> b;
+                    if (f) {
+                        const auto n = std::streamoff(f.tellg());
+                        if (n > 0 && n < (std::streamoff(1) << 30)) {
+                            b.resize(size_t(n));
+                            f.seekg(0);
+                            f.read(reinterpret_cast<char*>(b.data()), n);
+                            if (!f) b.clear();
+                        }
+                    }
+                    std::lock_guard _{ wc::g.mx };
+                    wc::g.files.emplace_back(s, std::move(b));
+                }
+            }).detach();
+        }
+    }
+    // Made here, one a frame; one whose shaders the game has not made yet is tried again every 0.5 s for 5 min.
+    if (g.load == 1 && now >= g.next_try) {
+        std::pair<uint32_t, std::vector<uint8_t>> f{};
+        bool                                      have = false;
+        {
+            std::lock_guard _{ g.mx };
+            if (!g.files.empty()) {
+                f    = std::move(g.files.front());
+                have = true;
+                g.files.erase(g.files.begin());
+            }
+        }
+        if (have) {
+            const uint32_t s = f.first;
+            std::string    why;
+            const int      r = t.find(s) ? -2 : f.second.empty() ? -1 : holster_cache_make(s, f.second, why);
+            if (f.second.empty()) why = "its file not read";
+            if (r == 1) {
+                const Weapon* w = t.find(s);
+                spdlog::info("[Holster] weaponcache: weapon {} made from its kept copy ({} draws, {:.1f} s after the start of reading){}", s, w ? w->parts.size() : 0,
+                             std::chrono::duration<float>(now - g.load_t0).count(), g.tries[s] ? fmt::format(" after {} tries", g.tries[s]) : std::string{});
+            } else if (r == 0 && ++g.tries[s] < 600) {
+                if (g.tries[s] % 20 == 1) spdlog::info("[Holster] weaponcache: weapon {}'s kept copy waits: {}", s, why);
+                std::lock_guard _{ g.mx };
+                g.files.push_back(std::move(f));
+                g.next_try = now + std::chrono::milliseconds(500);
+            } else if (r != -2) {
+                spdlog::info("[Holster] weaponcache: weapon {}'s kept copy not used: {}", s, why);
+            }
+        }
+    }
+    // The start's main weapon and sidearm, from their kept copies: the sling and the hip show them before either is held this session, once the game's
+    // inventory says the player still carries them (weapongone, builder 7 Nov 23:22: the Arcade map gives back its own loadout at each start, so the P226
+    // swapped in the run before was not carried, yet it hung on the sling; in a campaign a weapon may be sold, dropped, or an older save loaded).
+    auto listed = [&](uint32_t s) {
+        std::lock_guard _{ t.mtx };
+        return t.force_on.contains(s);
+    };
+    if (g.seed_main == 0 && g.start_main && g.disk.contains(g.start_main) && t.find(g.start_main)) {
+        const uint32_t s = g.start_main;
+        g.seed_main      = s;
+        g.main_st        = 1;
+        // A handgun is the hip's, never the sling's (in the slot modes holster_is_side is only the slot's weapon).
+        const char* const no = holster_is_side(s) ? "a sidearm" : holster_handgun(s) == 1 ? "a handgun" : listed(s) ? "in the sidearm list" : fc5::gameweapon::bare_hands(s) ? "the bare hands" : nullptr;
+        if (no) {
+            g.main_st = 4;
+            spdlog::info("[Holster] weaponcache: weapon {} was the main weapon last time but is {}: not on the sling", s, no);
+        }
+    }
+    if (g.seed_side == 0 && g.start_side && g.disk.contains(g.start_side) && t.find(g.start_side)) {
+        const uint32_t s = g.start_side;
+        g.seed_side      = s;
+        g.side_st        = 1;
+        const bool l     = listed(s);
+        // Not a gun the game's data puts elsewhere than its pistol holster unless listed by hand (a wrong sidearm saved on 27 Oct blocked the right one).
+        if (melee_weapon(s) || !(holster_game_side(s) == 1 || l) || holster_handgun(s) == 0) {
+            g.side_st = 4;
+            spdlog::info("[Holster] weaponcache: weapon {} was the sidearm last time but the game's data does not say it is one (holster {}, listed {}): looked at as before", s,
+                         holster_game_side(s), l);
+        }
+    }
+    // The inventory asked (slotcarried's call, every 150 ms on the script thread) about the two waiting, and about the weapon in hand: its "carried"
+    // says the answers can be used, its "not carried" that they cannot (then both are shown as before).
+    const bool  in_play = m_player_views_last_frame != 0 && !m_menu_screen_on;
+    const float dt      = g.ask_last == clock::time_point{} ? 0.0f : std::min(0.25f, std::chrono::duration<float>(now - g.ask_last).count());
+    g.ask_last          = now;
+    const bool ask      = fc5::gesture::slot_carried_on() && !g.distrust;
+    uint64_t   held_it  = 0;
+    if (ask && (g.main_st == 1 || g.side_st == 1)) {
+        uint64_t eq = 0;
+        if (fc5::lua::equipped_item(eq)) held_it = eq;
+        uint64_t items[3]{};
+        int      k = 0;
+        if (held_it) items[k++] = held_it;
+        for (const uint32_t s : { g.main_st == 1 ? g.seed_main : 0u, g.side_st == 1 ? g.seed_side : 0u })
+            if (const uint64_t it = s ? fc5::gameweapon::item(s) : 0; it != 0 && std::find(items, items + k, it) == items + k) items[k++] = it;
+        fc5::lua::carried_watch_kept(items, k);
+        g.watching = true;
+    } else if (g.watching) {
+        fc5::lua::carried_watch_kept(nullptr, 0);
+        g.watching = false;
+    }
+    if (held_it != 0 && !g.trust && !g.distrust) {
+        if (const int c = fc5::lua::item_carried(held_it); c == 1) {
+            g.trust = true;
+            spdlog::info("[Holster] weaponcache: the game says the item in hand {:x} is carried: its answers about the kept weapons are used", held_it);
+        } else if (c == 0) {
+            g.distrust = true;
+            spdlog::error("[Holster] weaponcache: the game says the item in hand {:x} is NOT carried: the inventory's answers not used, the kept weapons shown as before", held_it);
+        }
+    }
+    const bool trusted = (g.trust || fc5::gesture::carried_trusted()) && !g.distrust;
+    auto decide = [&](uint32_t s, int& st, float& wait, float& zero, bool main) {
+        if (st != 1) return;
+        const char* const what = main ? "the main weapon" : "the sidearm";
+        const uint64_t    it   = fc5::gameweapon::item(s);
+        const int         c    = ask && it != 0 ? fc5::lua::item_carried(it) : -1;
+        if (in_play) wait += dt;
+        zero = c == 0 ? zero + (in_play ? dt : 0.0f) : 0.0f;
+        // "Not carried": at once when the answers are trusted, else after 3 s of play of that answer (nothing in hand to check the call with).
+        if (c == 0 && (trusted || zero > 3.0f)) {
+            st = 3;
+            for (auto x = t.weapons.begin(); x != t.weapons.end(); ++x)
+                if (x->sig == s) {
+                    x->release();
+                    t.weapons.erase(x);
+                    break;
+                }
+            g.disk.erase(s);
+            spdlog::info("[Holster] weaponcache: the game says weapon {} ({} last time, item {:x}) is no longer carried: its kept copy left out{}", s, what, it,
+                         main ? "" : ", the sidearm slot looked at as before");
+            return;
+        }
+        const char* const why = !fc5::gesture::slot_carried_on() ? "slotcarried off, not asked"
+                                : g.distrust                     ? "the inventory's answers not used"
+                                : it == 0                        ? "its game item not known, not asked"
+                                : c == 1                         ? "the game says it is carried"
+                                : c < 0 && wait > 5.0f           ? "no answer from the game's inventory in 5 s of play"
+                                                                 : nullptr;
+        if (!why) return;   // waits for the answer (the copy not drawn meanwhile)
+        st = 2;
+        if (!main && fc5::gesture::side_key() != 0 && t.slot_sig.load() == 0) t.slot_sig = s;
+        if (g.seeded_at == clock::time_point{}) g.seeded_at = now - std::chrono::hours(1);
+        if (std::none_of(t.held_at.begin(), t.held_at.end(), [&](const auto& h) { return h.first == s; })) t.held_at.emplace_back(s, g.seeded_at);
+        if (main)
+            spdlog::info("[Holster] weaponcache: weapon {}, the main weapon last time, on the sling from its kept copy (item {:x}; {}, {:.1f} s)", s, it, why, wait);
+        else
+            spdlog::info("[Holster] weaponcache: weapon {}, the sidearm last time, on the hip from its kept copy (item {:x}; {}, {:.1f} s): the sidearm slot is not looked at", s,
+                         it, why, wait);
+    };
+    decide(g.seed_main, g.main_st, g.main_wait, g.main_zero, true);
+    decide(g.seed_side, g.side_st, g.side_wait, g.side_zero, false);
+    // The scene's views kept for the copies made from disk: dropped once none is left.
+    if (g.disk.empty() && !g.scene_ps.empty()) {
+        for (auto& [k, s] : g.scene_ps) s.release();
+        g.scene_ps.clear();
+        g.scene_any.release();
+        g.scene_any.frame = -100000;
+    }
+    // The weapons to show at the next start (once seeded or held: never before the kept ones were given).
+    if (g.load == 1 && now - g.load_t0 > std::chrono::seconds(10)) {
+        const uint32_t ss = t.slot_sig.load() ? t.slot_sig.load() : t.side_sig;
+        // weapongone: never a handgun as the sling's (the P226 spawned in hand on 7 Nov was taken as the main weapon in a slot mode).
+        if (t.main_sig && t.main_sig != g.start_main && holster_handgun(t.main_sig) != 1 && !listed(t.main_sig)) {
+            g.start_main = t.main_sig;
+            g.dirty      = true;
+        }
+        if (ss && ss != g.start_side) { g.start_side = ss; g.dirty = true; }
+    }
+    // A kept weapon's item learned since it was saved.
+    if (++g.item_scan % 120 == 0)
+        for (auto& [s, e] : g.entries)
+            if (e.item == 0)
+                if (const uint64_t it = fc5::gameweapon::item(s); it != 0) { e.item = it; g.dirty = true; }
+    // Saving: a weapon recorded this session, at least 20 s into play (its textures streamed in by then), one at a time.
+    const bool play = m_motion.load() && !flat_screen_on() && !m_cine_on && !in_vehicle();
+    if (!play) g.play_since = now;
+    if (g.job) holster_cache_save_step();
+    else if (!g.want_save.empty() && now - g.play_since > std::chrono::seconds(20)) {
+        const uint32_t s = *g.want_save.begin();
+        g.want_save.erase(g.want_save.begin());
+        if (t.find(s)) holster_cache_save_begin(s);
+    }
+    if (g.dirty && now - g.written > std::chrono::seconds(10)) {
+        g.dirty   = false;
+        g.written = now;
+        wc::index_write();
+    }
+}
+
 bool FarCry5Stereo::holster_command(const std::string& cmd, const std::string& arg, float fv, std::istream& rest, bool& persist)
 {
     if (!m_hol) m_hol = new HolsterState{};
     const bool on = arg == "on" || arg == "1" || arg == "true";
     if (cmd == "weaponcopies") { m_hol->copies = on; persist = true; return true; }
+    if (cmd == "weaponcache") {
+        if (arg == "clear") {   // test: every kept copy deleted (bin\fc5vr_weaponcopies), the weapons copied this session are kept again
+            for (const auto& [s, e] : wc::g.entries) DeleteFileA(wc::file_of(s).c_str());
+            wc::g.entries.clear();
+            wc::g.start_main = wc::g.start_side = 0;
+            wc::g.dirty      = true;
+            for (const auto& w : m_hol->weapons) if (!wc::g.disk.contains(w.sig)) wc::g.want_save.insert(w.sig);
+            spdlog::info("[Holster] weaponcache clear: the kept weapon copies deleted");
+            return true;
+        }
+        wc::g.on = on;
+        persist  = true;
+        spdlog::info("[Holster] weaponcache {}", on ? "on: each weapon copied is kept on disk (bin\\fc5vr_weaponcopies) and shown at once at the next start"
+                                                   : "off: the weapons are copied again at each start (the kept files stay)");
+        return true;
+    }
     if (cmd == "slingthrowhide") {   // on (default) | off, saved: a throwable taken with the weapon carried hides the game's put-away and raise (FarCry5Stereo.h)
         m_sling_throw_hide = on;
         persist            = true;
@@ -1530,7 +2787,13 @@ void FarCry5Stereo::draw_holster_menu(const std::function<void(const char*, std:
     }
     hint("On (default): the mod draws its own copy of your main weapon on the sling while you hold the sidearm, and of the sidearm on the hip "
          "while you hold the main weapon. A weapon is copied once you have held it still in your hand for a second (the first time after each "
-         "start of the game): until then its place stays empty.");
+         "start of the game, unless kept below): until then its place stays empty.");
+    bool kc = wc::g.on.load();
+    if (ImGui::Checkbox("Keep the weapon copies between game starts##weaponcache", &kc)) m_ui_cmds += kc ? "weaponcache on\n" : "weaponcache off\n";
+    hint("On (default; author 7 Nov): each weapon copied is also kept in bin\\fc5vr_weaponcopies (its mesh, textures and material, about 5-40 MB a weapon), "
+         "so at the next start your main weapon is on the sling and your sidearm on the hip at once, the sidearm slot is not looked at after a load and the "
+         "loading popup has nothing to wait for. A weapon the game says you no longer carry is left out. Off: copied again at each start.");
+    ImGui::TextDisabled("Kept on disk: %d weapons; made from disk this session (not held yet): %d", int(wc::g.entries.size()), int(wc::g.disk.size()));
     int key = fc5::gesture::side_key();
     int sel = key < 0 ? 0 : key == 0 ? 1 : key - 0x02 + 2;
     const char* const items[]{ "The weapon wheel's rightmost slot", "The game's last weapon (pad Y)", "Keyboard key 1", "Keyboard key 2", "Keyboard key 3",
@@ -1557,6 +2820,10 @@ void FarCry5Stereo::draw_holster_menu(const std::function<void(const char*, std:
     bool gd = fc5::gesture::game_draw_grab();
     if (ImGui::Checkbox("Grabs ask the game for the very weapon, no wheel or Y (test)##gamedrawgrab", &gd)) m_ui_cmds += gd ? "gamedrawgrab on\n" : "gamedrawgrab off\n";
     hint("Hip, sling and shoulder grabs call the game's own weapon change with the weapon wanted, about 0.2 s in the simulator. It needs the mod to have seen the game hold that weapon once since the game started; until then, as without this.");
+    bool sc = fc5::gesture::slot_carried_on();
+    if (ImGui::Checkbox("Shoulders: ask the game which weapons you still carry##slotcarried", &sc)) m_ui_cmds += sc ? "slotcarried on\n" : "slotcarried off\n";
+    hint("On (default): a shoulder slot forgets a weapon you dropped or swapped at once (the game's inventory says so), and a weapon you pick up takes "
+         "its slot, so the right gun is in your hand at the next grab. Off: after a pickup every slot is learned again from its key.");
     if (ImGui::Checkbox("Hip grab: the game's last weapon when that is the sidearm (faster)##sidearmy", &sy)) m_ui_cmds += sy ? "sidearmy on\n" : "sidearmy off\n";
     hint("On (default; author 28 Oct): when the weapon you held before the one in hand was the sidearm (the usual hip, sling, hip), "
          "the hip switches with pad Y like the sling does, the game's quicker switch, instead of opening the weapon wheel. If Y brings another weapon, the "

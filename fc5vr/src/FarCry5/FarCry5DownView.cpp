@@ -17,6 +17,16 @@
 //    then holds still, so the game camera stays put while the head turns).
 // Log: "[Down] downview: down ...", "... getting up ...", "... up, back to the body view after N s"; the per-second [Cull] line is
 // written every second while active and names downview. Off: as before.
+//  - qtehud on|off (default on, saved; F11 under downview; author 8 Nov 11:29). His 11:09:51 log: knocked down 12.4 s (IsPawnDown, stance 4), the eyes 35 deg off the game camera on average, worst
+//    90, the camera pitched up. With hudmarkers on, the HUD draws before the compass bar are taken for world markers: each is shrunk
+//    to hudmarksize (0.21) about its icon, capped at hudmarkicon / hudmarkmax degrees and shown in the world where the game camera saw
+//    it (FarCry5HudWorld.cpp). A struggle's prompt (a square button icon, 64 or 96 px, with no shape drawn before it) is drawn in that
+//    phase, at the middle of the game camera's view: so it came out about 2 deg wide, 35-90 deg away from where he looked.
+//    While the player is knocked down (IsPawnDown, stance 4, or downview still holding after getting up) or in a QTE (IsInQTE, asked in
+//    the same 150 ms poll), no draw goes to the world markers: the whole HUD stays on the panel, every prompt where the flat game puts
+//    it, straight ahead of the head. World markers come back when it ends. Not in a vehicle (its own rules). Off: as before.
+//    Log: "[HUD] qtehud: ... the whole HUD on the panel" at the start, "... world markers again after N s (M draws kept on the panel)".
+//    downforce on (test) also starts it, so it can be seen standing in the simulator.
 #include "FarCry5Stereo.h"
 #include "FarCry5Lua.h"
 
@@ -38,6 +48,11 @@ bool FarCry5Stereo::downview_command(const std::string& cmd, const std::string& 
         m_down_view = on;
         if (!on && m_dv_active) down_view_release("downview off");
         persist = true;
+        return true;
+    }
+    if (cmd == "qtehud") {   // qtehud on|off (saved)
+        m_qte_hud = on;
+        persist   = true;
         return true;
     }
     if (cmd == "downforce") {   // downforce on|off (test, unsaved)
@@ -143,6 +158,30 @@ void FarCry5Stereo::update_downview()
     }
 }
 
+// qtehud: once per stereo pair, after update_downview (the present thread): whether the HUD's marker phase stays on the panel.
+void FarCry5Stereo::update_qte_hud()
+{
+    const int  gd  = fc5::lua::pawn_down();
+    const int  gst = fc5::lua::pawn_stance();
+    const int  gq  = fc5::lua::pawn_qte();
+    const bool now = m_qte_hud.load() && !m_in_vehicle.load() &&
+                     (m_dv_active || m_down_force.load() == 1 || gd == 1 || gst == 4 || gq == 1);
+    const bool was = m_qte_hud_now.load(std::memory_order_relaxed);
+    if (now == was) return;
+    m_qte_hud_now.store(now, std::memory_order_relaxed);
+    if (now) {
+        m_qte_hud_t0   = std::chrono::steady_clock::now();
+        m_qte_hud_kept = 0;
+        spdlog::info("[HUD] qtehud: {}: the whole HUD on the panel (no world markers), prompts where the flat game puts them",
+                     gq == 1 ? "in a QTE (the game's IsInQTE)" : gd == 1 ? "knocked down (the game's IsPawnDown)" : gst == 4 ? "knocked down (the game's stance 4)"
+                     : m_down_force.load() == 1 ? "downforce" : "downview still holding the view");
+    } else {
+        spdlog::info("[HUD] qtehud: world markers again after {:.1f} s ({} marker-phase draws kept on the panel){}",
+                     std::chrono::duration<float>(std::chrono::steady_clock::now() - m_qte_hud_t0).count(), m_qte_hud_kept,
+                     !m_qte_hud.load() ? " (qtehud off)" : m_in_vehicle.load() ? " (in a vehicle)" : "");
+    }
+}
+
 // The eyes' base (after viewpivot, walkbob and smoothmotion; before gunanchor) while downview is active: eased to the game camera while
 // down and 1.5 s after, then back to the normal base; one offset per pair, the same for the weapon and the world uploads.
 glm::vec3 FarCry5Stereo::down_view_base(int frame, const glm::vec3& cam, const glm::vec3& base_cam)
@@ -198,4 +237,13 @@ void FarCry5Stereo::draw_downview_menu(const std::function<void(const char*, std
     hint("downview. On (default; author 30 Oct): knocked down, the game's camera is "
          "the animation's and the game draws only what it sees. Your view now turns to face where it looks (past 15 deg, eased; at once on a camera cut), the "
          "horizon kept level, and your position follows it smoothly; getting up, it eases back to the normal view without a jump. Off: as before.");
+    bool q = m_qte_hud.load();
+    if (ImGui::Checkbox("Knocked down or in a struggle (QTE): all button prompts on the HUD panel##qtehud", &q)) {
+        m_qte_hud = q;
+        keep("qtehud", q ? "qtehud on" : "qtehud off");
+    }
+    hint("qtehud. On (default; author 8 Nov): while you are knocked down or in a "
+         "struggle (the game's IsPawnDown or IsInQTE), the whole HUD stays on the panel in front of you, so the struggle's button prompts show where the flat "
+         "game puts them. Otherwise they were taken for world markers: made small and put where the game's camera looked, which was the animation's, "
+         "far from where you look. World markers come back when it ends. Off: as before.");
 }

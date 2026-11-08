@@ -561,6 +561,11 @@ VRRuntime::Error OpenXR::consume_events(std::function<void(void*)> callback) {
                 s_fc5_local_space_change_time = (int64_t)ev->changeTime;
                 s_fc5_local_space_changes++;
             }
+        } else if (bh->type == XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR) {
+            // Far Cry 5 hidmask: the hidden area of a view changed (headsets that change it with their FOV or IPD setting).
+            const auto ev = (XrEventDataVisibilityMaskChangedKHR*)&edb;
+            spdlog::info("VR: visibility mask changed (view {})", ev->viewIndex);
+            s_fc5_vismask_changes++;
         }
 
         edb = {XR_TYPE_EVENT_DATA_BUFFER};

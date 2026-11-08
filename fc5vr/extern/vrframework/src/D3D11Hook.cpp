@@ -185,7 +185,13 @@ HRESULT WINAPI D3D11Hook::present(IDXGISwapChain* swap_chain, UINT sync_interval
         return present_fn(swap_chain, sync_interval, flags);
     }*/
 
-    swap_chain->GetDevice(__uuidof(d3d11->m_device), (void**)&d3d11->m_device);
+    // Far Cry 5 (8 Nov 2026, crashes 13:42:24 and 13:53:29 entering the Arcade map): GetDevice writes its out pointer, null when it fails,
+    // and the render thread reads m_device at the same time (fog_late_patch read null). Take it into a local and only store a real device.
+    {
+        ID3D11Device* dev = nullptr;
+        swap_chain->GetDevice(__uuidof(ID3D11Device), (void**)&dev);
+        if (dev != nullptr) d3d11->m_device = dev;
+    }
 
     // Enable multithread protection once the real device is available
     d3d11->ensure_multithread_protection();

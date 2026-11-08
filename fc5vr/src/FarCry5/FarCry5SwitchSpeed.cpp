@@ -24,7 +24,19 @@
 // Write-combined and uncached pages (the graphics driver's CPU-visible GPU memory, video memory itself with Resizable BAR)
 // are never read: a CPU read there is uncached over PCIe and stalls the GPU's own traffic; game data is never there.
 // Writes use WriteProcessMemory on the block's own two floats, only after its whole pattern was read again.
+//
+// reloadfullmag (FarCry5Reload.cpp; author 8 Nov 10:45 for the AR-C's 29 of 30): the same block holds bAutoReload at
+// +0x1ed (the registration: mov edx, 0x1ed before its name at +0x1df06b7, as fDrawTime's 0x1d8 at +0x1df03c0), the game's own reload
+// when the clip runs dry (1 on the AR-C: research 2026-11-02_manualreload.md). Written 0 on the gun in hand's block while the manual
+// reload has it, so a magazine fires every round and the game still starts no reload of its own (reloadkeepone kept one instead).
+// The gun in hand's block: from its weapon object (FarCry5Lua.cpp, inventory vtable +0x308): a copy inside it, or up to three steps of
+// pointers into (or just ahead of) a block the scan holds, with the gun's magazine size (find_block); every pointer is checked with
+// VirtualQuery (committed private read-write, no guard page) and read with ReadProcessMemory, as the scan. Its own value is kept and put back when reloadfullmag or the manual reload
+// goes off, or after the game was seen reloading by itself anyway (autoreload_failed: not used again this session). A weapon put away
+// keeps its 0: an empty gun drawn again must not reload by itself before the block is found again. Blocks are the weapon's data, shared
+// with anyone carrying the same weapon template.
 #include "FarCry5SwitchSpeed.h"
+#include "FarCry5Lua.h"
 
 #include <windows.h>
 
@@ -36,6 +48,8 @@
 #include <istream>
 #include <mutex>
 #include <thread>
+#include <tuple>
+#include <unordered_set>
 #include <vector>
 
 #include <imgui.h>
@@ -141,6 +155,244 @@ namespace
     }
 
     float target(float own, float want) { return (own <= 0.0f || own > want) ? want : own; }
+
+    // reloadfullmag (see the top).
+    constexpr size_t       kAutoReload = 0x1ed;   // bAutoReload
+    std::atomic<bool>      g_ar_on{ false };      // reloadfullmag on and the manual reload on
+    std::atomic<uintptr_t> g_ar_want{ 0 };        // the weapon object to have the game's reload at empty off (0: none in hand)
+    std::atomic<uintptr_t> g_ar_ok{ 0 };          // the weapon object whose block holds 0 (checked by reading back)
+    std::atomic<bool>      g_ar_failed{ false };  // autoreload_failed: put back and not used again this session
+    struct ArBlock
+    {
+        uintptr_t a;
+        uint8_t   own;
+    };
+    std::vector<ArBlock> g_ar_blocks;              // worker thread only: the blocks written, with their own value
+    uintptr_t            g_ar_obj = 0, g_ar_blk = 0;   // worker thread only: the last weapon object and its block
+    int64_t              g_ar_miss_t = 0;          // worker thread only: when the last object's block was not found (tried again after 3 s)
+
+    // A place that may be read: committed private read-write memory with n bytes before its region's end (no guard page touched).
+    bool may_read(uintptr_t a, size_t n)
+    {
+        if (a < 0x10000 || a >= 0x7FFFFFFF0000ull || (a & 7) != 0) return false;
+        MEMORY_BASIC_INFORMATION m{};
+        if (!VirtualQuery(reinterpret_cast<LPCVOID>(a), &m, sizeof(m)) || !readable(m)) return false;
+        return a + n <= reinterpret_cast<uintptr_t>(m.BaseAddress) + m.RegionSize;
+    }
+    bool is_block_at(uintptr_t a) { return may_read(a, kNearFov + 4) && still_matches(a); }
+
+    // reloadfullmag 2 (the builder's run, 8 Nov 12:12: no block within two steps of the weapon object, every gun): the search widened.
+    //  - A copy inside the object: the block's pattern anywhere in its first 0x4000 bytes (the weapon's own copy of its data: then only
+    //    this weapon is changed).
+    //  - Three steps of pointers (0x800 bytes of the object, 0x400 one step down, 0x200 two steps down), each one tested against the blocks
+    //    the scan holds: a pointer into one (b <= p < b + 0x1d60) or up to 0x4000 bytes before one (an object the block is part of).
+    //  - The block of the gun in hand holds its magazine size: iAmmoInClip at +0x328 (the registration: mov edx, 0x328 before its name at
+    //    +0x1df11c4) equal to the game's clip size (weapon vtable +0x48, lua::player_ammo cap). Only such a block is ever written.
+    // Every candidate is logged (8 at most), with the object's vtable and its +0x40 / +0x48 slots as FC_m64.dll offsets, for the next step.
+    // The path found is kept and tried first for the next guns (the same class for every weapon).
+    constexpr size_t kAmmoInClip = 0x328;   // iAmmoInClip
+    constexpr size_t kBlockLen   = kNearFov + 4;
+    struct ArPath
+    {
+        int     n{ -1 };         // pointer steps (0: a copy inside the object; -1: none)
+        int     off[3]{};        // the slot read at each step
+        int64_t delta{ 0 };      // block = the last pointer (or the object) + delta
+    };
+    ArPath g_ar_path;            // worker thread only: the path found
+
+    std::vector<uintptr_t> held_blocks()
+    {
+        std::lock_guard _{ g_mtx };
+        std::vector<uintptr_t> v;
+        v.reserve(g_blocks.size());
+        for (const Block& b : g_blocks) v.push_back(b.a);
+        std::sort(v.begin(), v.end());
+        return v;
+    }
+    // The held block p points into, or up to 0x4000 bytes ahead of; 0 for none.
+    uintptr_t near_block(const std::vector<uintptr_t>& bl, uint64_t p)
+    {
+        auto it = std::upper_bound(bl.begin(), bl.end(), uintptr_t(p));
+        if (it != bl.begin() && p < *(it - 1) + kBlockLen) return *(it - 1);
+        if (it != bl.end() && *it - p <= 0x4000) return *it;
+        return 0;
+    }
+    int block_clip(uintptr_t b)
+    {
+        int v = -1;
+        return read(b + kAmmoInClip, &v, 4) ? v : -1;
+    }
+    uintptr_t resolve(uintptr_t obj, const ArPath& pa)
+    {
+        if (pa.n < 0) return 0;
+        uint64_t p = obj;
+        for (int i = 0; i < pa.n; ++i) {
+            if (!may_read(p + pa.off[i], 8) || !read(p + pa.off[i], &p, 8)) return 0;
+        }
+        return uintptr_t(int64_t(p) + pa.delta);
+    }
+
+    struct ArCand
+    {
+        ArPath    pa;
+        uintptr_t b;
+    };
+    uintptr_t find_block(uintptr_t obj, int cap)
+    {
+        // The path found before.
+        if (const uintptr_t b = resolve(obj, g_ar_path); b != 0 && is_block_at(b) && (cap <= 0 || block_clip(b) == cap)) return b;
+        const auto t0 = clock::now();
+        const std::vector<uintptr_t> bl = held_blocks();
+        std::vector<ArCand> cands;
+        // A copy inside the object.
+        {
+            constexpr size_t kIn = 0x4000;
+            std::vector<uint8_t> buf(kIn + kBlockLen);
+            if (may_read(obj, buf.size()) && read(obj, buf.data(), buf.size()))
+                for (size_t k = 0; k < kIn && cands.size() < 64; k += 8) {
+                    float fov;
+                    std::memcpy(&fov, buf.data() + k + kNearFov, 4);
+                    if (matches(buf.data() + k) && in(fov, 55.0f, 90.0f)) cands.push_back({ { 0, {}, int64_t(k) }, obj + k });
+                }
+        }
+        // Three steps of pointers.
+        if (!bl.empty()) {
+            constexpr size_t kSpanAt[3]{ 0x800, 0x400, 0x200 };
+            struct Node
+            {
+                uint64_t a;
+                int      n;
+                int      off[3];
+            };
+            std::vector<Node> front{ { obj, 0, {} } };
+            std::unordered_set<uint64_t> seen{ obj };
+            std::vector<uint64_t> q;
+            for (int depth = 0; depth < 3 && !front.empty(); ++depth) {
+                std::vector<Node> next;
+                for (const Node& nd : front) {
+                    const size_t span = kSpanAt[depth];
+                    q.assign(span / 8, 0);
+                    if (!may_read(nd.a, span) || !read(nd.a, q.data(), span)) continue;
+                    for (size_t i = 0; i < q.size(); ++i) {
+                        const uint64_t p = q[i];
+                        if (p < 0x10000 || p >= 0x7FFFFFFF0000ull) continue;
+                        Node ch{ p, nd.n + 1, { nd.off[0], nd.off[1], nd.off[2] } };
+                        ch.off[nd.n] = int(i * 8);
+                        if (const uintptr_t b = near_block(bl, p); b != 0 && cands.size() < 64) {
+                            ArPath pa{ ch.n, { ch.off[0], ch.off[1], ch.off[2] }, int64_t(b) - int64_t(p) };
+                            cands.push_back({ pa, b });
+                        }
+                        if (depth < 2 && (p & 7) == 0 && seen.insert(p).second && seen.size() < 40000) next.push_back(ch);
+                    }
+                }
+                front.swap(next);
+            }
+        }
+        // The one with the magazine size, the fewest steps, then pointing at the block itself.
+        auto score = [&](const ArCand& c) {
+            const bool clip_ok = cap > 0 && block_clip(c.b) == cap;
+            return std::tuple{ clip_ok ? 0 : 1, c.pa.n == 0 ? 0 : c.pa.n, c.pa.delta == 0 ? 0 : 1, std::abs(c.pa.delta) };
+        };
+        std::stable_sort(cands.begin(), cands.end(), [&](const ArCand& x, const ArCand& y) { return score(x) < score(y); });
+        const float ms = std::chrono::duration<float, std::milli>(clock::now() - t0).count();
+        // The object's vtable and its clip (+0x40) and clip size (+0x48) slots, as FC_m64.dll offsets (for reading the game's code next).
+        std::string vt = "?";
+        {
+            const uintptr_t mod = reinterpret_cast<uintptr_t>(GetModuleHandleA("FC_m64.dll"));
+            uint64_t v = 0, s40 = 0, s48 = 0;
+            if (read(obj, &v, 8)) {
+                auto rel = [mod](uint64_t x) { return mod && x >= mod && x < mod + 0x10000000 ? fmt::format("FC_m64.dll+{:#x}", x - mod) : fmt::format("{:#x}", x); };
+                vt = rel(v);
+                if (read(v + 0x40, &s40, 8) && read(v + 0x48, &s48, 8)) vt += fmt::format(" (+0x40 {}, +0x48 {})", rel(s40), rel(s48));
+            }
+        }
+        spdlog::info("[FullMag] weapon object {:#x} (vtable {}), clip size {}: {} candidate block(s) in {:.0f} ms ({} blocks held)", obj, vt, cap, cands.size(), ms,
+                     bl.size());
+        for (size_t i = 0; i < cands.size() && i < 8; ++i) {
+            const ArCand& c = cands[i];
+            std::string path = "object";
+            for (int k = 0; k < c.pa.n; ++k) path = fmt::format("[{} + {:#x}]", path, c.pa.off[k]);
+            uint8_t ar  = 0xFF;
+            uint32_t nm = 0;
+            float   dr  = -1.0f;
+            read(c.b + kAutoReload, &ar, 1);
+            read(c.b + 0x1d80, &nm, 4);
+            read(c.b + kDraw, &dr, 4);
+            spdlog::info("[FullMag]   {} {:+#x} = block {:#x}: iAmmoInClip {}, bAutoReload {}, draw {:.3f} s, name id {:#x}", path, c.pa.delta, c.b, block_clip(c.b), int(ar), dr, nm);
+        }
+        if (cands.empty() || !(cap > 0 && block_clip(cands[0].b) == cap)) return 0;   // never a block that is not this gun's size
+        g_ar_path = cands[0].pa;
+        return cands[0].b;
+    }
+    bool write_b(uintptr_t a, uint8_t v)
+    {
+        SIZE_T put = 0;
+        return WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<LPVOID>(a), &v, 1, &put) && put == 1;
+    }
+    void ar_put_back(const char* why)
+    {
+        int n = 0;
+        for (const ArBlock& b : g_ar_blocks) {
+            uint8_t v = 0xFF;
+            if (is_block_at(b.a) && read(b.a + kAutoReload, &v, 1) && v == 0 && b.own != 0 && write_b(b.a + kAutoReload, b.own)) n++;
+        }
+        if (!g_ar_blocks.empty()) spdlog::info("[FullMag] the game's own reload at empty put back on {} of {} weapon blocks ({})", n, g_ar_blocks.size(), why);
+        g_ar_blocks.clear();
+        g_ar_obj = g_ar_blk = 0;
+        g_ar_ok  = 0;
+    }
+    void ar_tick()
+    {
+        if (!g_ar_on.load() || g_ar_failed.load()) {
+            if (!g_ar_blocks.empty() || g_ar_ok.load()) ar_put_back(g_ar_failed.load() ? "the game reloaded by itself anyway: reloadkeepone's kept round from now" : "reloadfullmag or the manual reload off");
+            return;
+        }
+        const uintptr_t obj = g_ar_want.load();
+        if (obj == 0) {   // none in hand, or not a magazine gun: blocks written stay so (see the top)
+            g_ar_ok = 0;
+            return;
+        }
+        const int64_t t = now_ms();
+        if (obj != g_ar_obj) {
+            g_ar_obj    = obj;
+            g_ar_blk    = 0;
+            g_ar_ok     = 0;
+            g_ar_miss_t = 0;
+        }
+        if (g_ar_blk != 0 && !is_block_at(g_ar_blk)) {
+            g_ar_blk = 0;
+            g_ar_ok  = 0;
+        }
+        if (g_ar_blk == 0) {
+            if (g_ar_miss_t != 0 && t - g_ar_miss_t < 10'000) return;   // (a search again after 10 s: a scan may have found more blocks)
+            int clip = -1, reserve = -1, cap = -1;
+            fc5::lua::player_ammo(clip, reserve, &cap);
+            g_ar_blk = find_block(obj, cap);
+            if (g_ar_blk == 0) {
+                if (g_ar_miss_t == 0) spdlog::info("[FullMag] weapon object {:#x}: no block of its magazine size ({}) found from it: the round kept in the clip as before", obj, cap);
+                g_ar_miss_t = t;
+                return;
+            }
+        }
+        uint8_t v = 0xFF;
+        if (!read(g_ar_blk + kAutoReload, &v, 1) || v > 1) {
+            if (g_ar_miss_t == 0) spdlog::info("[FullMag] weapon block {:#x}: bAutoReload reads {}: left alone", g_ar_blk, int(v));
+            g_ar_miss_t = t;
+            g_ar_blk    = 0;
+            return;
+        }
+        if (v == 1) {
+            if (!write_b(g_ar_blk + kAutoReload, 0) || !read(g_ar_blk + kAutoReload, &v, 1) || v != 0) {
+                spdlog::info("[FullMag] weapon block {:#x}: bAutoReload not written: the round kept in the clip", g_ar_blk);
+                g_ar_miss_t = t;
+                g_ar_blk    = 0;
+                return;
+            }
+            if (std::none_of(g_ar_blocks.begin(), g_ar_blocks.end(), [](const ArBlock& b) { return b.a == g_ar_blk; })) g_ar_blocks.push_back({ g_ar_blk, 1 });
+            spdlog::info("[FullMag] weapon block {:#x} (object {:#x}): the game's own reload at empty off: the whole magazine fires ({} block(s) written)", g_ar_blk, obj, g_ar_blocks.size());
+        }
+        g_ar_ok = obj;   // 0 already (written by us, or the weapon's own data)
+    }
 
     // Sets one block to the wanted times (or back to its own with restore); false: the block no longer matches.
     bool apply(Block& b, bool restore)
@@ -311,6 +563,7 @@ namespace
                 last_upkeep = t;
             }
             if (const int n = g_list_req.exchange(0); n > 0) list(n);
+            ar_tick();   // reloadfullmag
         }
     }
 }
@@ -335,6 +588,21 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
     if (cmd == "switchscan") { g_scan_req = true; return true; }                           // test: scan now
     if (cmd == "switchlist") { g_list_req = arg.empty() ? 64 : std::max(1, int(fv)); return true; }   // test: log the blocks held
     return false;
+}
+
+void autoreload_want(bool on, uintptr_t obj)
+{
+    g_ar_on   = on;
+    g_ar_want = on ? obj : 0;
+}
+
+bool autoreload_off(uintptr_t obj) { return obj != 0 && !g_ar_failed.load() && g_ar_ok.load() == obj; }
+
+void autoreload_failed()
+{
+    if (g_ar_failed.exchange(true)) return;
+    g_ar_ok = 0;
+    spdlog::info("[FullMag] the game reloaded by itself with its auto reload written off: put back, the round kept in the clip again for this session");
 }
 
 void frame()

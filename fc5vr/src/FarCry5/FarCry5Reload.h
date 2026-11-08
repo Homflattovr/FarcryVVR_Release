@@ -72,6 +72,8 @@ namespace fc5::reload
     bool hides_game_reload();
     bool game_busy();                   // the game's reload is running now (tapped, or the clip ran dry), not refilled yet
     bool game_pending();
+    bool pump_aim_hold();               // reloadpumpgrip: a pump stroke under way: the gun keeps its two-handed aim on the weapon hand
+    bool pump_grip();                   // reloadpumpgrip on (saved, default on)
     bool pump_held();                   // a pump shotgun's pump held and pulled by the left hand (manualreload31)                // the game's reload tapped and its clip not refilled yet (manualreload28; may outlast game_busy)
     bool mag_in_left_hand();            // a magazine, shell or round from the hip in the left hand (manualreload38: no two-handed hold then)
     bool button_reload();               // reloadbutton (manualreload48): the game's reload from its button, shown, followed now
@@ -387,6 +389,8 @@ namespace fc5::reload
     // reloadwellhere, reloadhandlehere (set from the hands now, saved through reloadgeom), reloadlog on|off, reloadscan S,
     // reloadforce dry|out|full|take|geom (tests: take = a magazine in the left hand, geom = a [Reload] test geometry line),
     // reloadpumpshot on|off (saved, default on: a pump shotgun's pump is worked after each shot).
+    // reloadpumpgrip on|off (saved, default on): the pump taken anywhere along its part's line (or the fore-end held already once the chamber
+    // needs it), its stroke the left hand coming back towards the weapon hand, the two-handed aim kept on the weapon hand during the stroke.
     // reloadweaponsounds on|off (saved, default off): each weapon's own game reload sounds (built in from the arcade map's sound run);
     // reloadsoundpick <id>:<out>,<in>,<back>,<fwd> ... | none (saved; - built in, 0 the mod's own, or a game sound id);
     // reloadsoundtry <id>|mag_out|mag_in|rack_back|rack_fwd (test: play a game sound id, or the weapon in hand's sound for that event).

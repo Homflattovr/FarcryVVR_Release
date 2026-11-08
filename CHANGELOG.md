@@ -1,5 +1,13 @@
 # Changelog
 
+## Beta 0.4.5 (8 November 2026): new home, recoil and two-handed aim
+Full notes: [release/RELEASE_NOTES_beta_0_4_5.md](release/RELEASE_NOTES_beta_0_4_5.md).
+- **New home:** https://github.com/Homflattovr/FarcryVVR_Release.
+- **New:** weapon recoil (off by default), gunstock calibration for long guns, built-in hand poses for every weapon,
+  Arms IK (experimental), full-magazine fire, no black blinking in menus with frame generation.
+- **Also:** weapon slot, sling, pump, MP5 and M79 reload fixes, hands on vehicle wheels, sun shadows at night, the game
+  kept in pad mode, a crash entering the Arcade map fixed.
+
 ## Beta 0.4.3 (7 November 2026): FSR in one click
 Full notes: [release/RELEASE_NOTES_beta_0_4_3.md](release/RELEASE_NOTES_beta_0_4_3.md).
 - **FSR for AMD, Intel and GTX cards:** the launcher's **Add FSR...** installs OptiScaler 0.9.4 from its own download

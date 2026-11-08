@@ -173,6 +173,13 @@ namespace fc5::lua
         std::atomic<bool>     g_down_failed{ false };
         std::atomic<int>      g_down_state{ -1 };
         std::atomic<int64_t>  g_down_t{ 0 };     // the last answer (now_ms)
+        // qtehud: IsInQTE (+0x2FA8E80) for the player in the same poll (its own switch); a fault turns it off for the session.
+        PawnBoolFn            g_qte_fn = nullptr;
+        std::atomic<bool>     g_qte_on{ false };
+        bool                  g_qte_tried = false, g_qte_ok = false;
+        std::atomic<bool>     g_qte_failed{ false };
+        std::atomic<int>      g_qte_state{ -1 };
+        std::atomic<int64_t>  g_qte_t{ 0 };
         // GetPawnStance (+0x2FA2B50) in the same poll while vehscript asks: 0 standing, 1 crouched, 4 downed, 18 seated in a vehicle (09:27 log).
         PawnIntFn             g_stance_fn = nullptr;
         std::atomic<int>      g_stance{ -1 };
@@ -359,6 +366,7 @@ namespace fc5::lua
         // play). What went in leaves the reserve as RemoveItem +0x2FB3740 does it: inventory vtable +0x170 (ammo item, count, 0x12), the ammo the am_read below reads. (GiveAmmoToPlayer with a
         // negative count raised the reserve to its maximum, 67 -> 72 in the 4 Nov campaign run: free ammo.)
         std::atomic<bool> g_fill_req{ false }, g_fill_failed{ false }, g_fill_short{ false };
+        std::atomic<uint64_t> g_am_obj{ 0 };   // reloadfullmag: the weapon object in hand at the latest ammo read (am_tick), 0 with none
         int               g_fill_misses = 0;   // script thread only
         std::atomic<int>  g_take_req{ 0 };
         using FillFn   = void(__fastcall*)(uint64_t* id);
@@ -385,7 +393,8 @@ namespace fc5::lua
 
         // Under SEH (no C++ objects): 1 read, 0 no weapon or inventory (not an error), -1 a fault. cap: the clip's size (the weapon's vtable +0x48: GiveAmmoClipsToPlayer reads it so). take: that many
         // rounds out of the reserve first.
-        int am_read(uint64_t me, int& clip, int& reserve, int* cap = nullptr, int take = 0)
+        // obj: the weapon object in hand (reloadfullmag: FarCry5SwitchSpeed.cpp finds its common properties block from it), 0 with none.
+        int am_read(uint64_t me, int& clip, int& reserve, int* cap = nullptr, int take = 0, uint64_t* obj = nullptr)
         {
             __try {
                 uint8_t* h = nullptr;
@@ -404,6 +413,7 @@ namespace fc5::lua
                     }
                     if (inv) {
                         uint8_t* wpn = (*reinterpret_cast<AmObjFn**>(inv))[0x308 / 8](inv);
+                        if (obj) *obj = reinterpret_cast<uint64_t>(wpn);
                         if (wpn) {
                             uint8_t* item = (*reinterpret_cast<AmObjFn**>(wpn))[0x50 / 8](wpn);
                             if (take > 0 && item) (*reinterpret_cast<AmTakeFn**>(inv))[0x170 / 8](inv, item, take, 0x12);
@@ -476,7 +486,9 @@ namespace fc5::lua
             const uint64_t me  = idp ? *idp : 0;
             if (me == 0 || me == ~0ull) return;
             int       clip = -1, reserve = -1, cap = -1;
-            const int r    = am_read(me, clip, reserve, &cap);
+            uint64_t  obj  = 0;
+            const int r    = am_read(me, clip, reserve, &cap, 0, &obj);
+            g_am_obj       = r == 1 ? obj : 0;   // reloadfullmag
             if (r < 0) {
                 g_am_on     = false;
                 g_am_failed = true;
@@ -550,6 +562,90 @@ namespace fc5::lua
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 return -1;
             }
+        }
+
+        // slotcarried (7 Nov; author 20:51; research\2026-11-07_slotforget):
+        // does the player still carry an item, asked the way CheckPawnWeaponInventoryByDescriptorId's native (+0x2F95B40) asks it: the inventory (the route of
+        // am_read, +0xF48EE0) vtable +0x130 (inventory, item id) gives the item's entry, null when the player does not have it (the native then answers 0; with an
+        // entry, 1 for a weapon and 2 for another item). Read statically from FC_m64.dll (the call at +0x2F95BFE), not run yet. Asked every 150 ms on the script
+        // thread for the items the shoulder slots remember (carried_watch, at most kCarry), and weaponcache's kept sling and hip weapons (carried_watch_kept,
+        // at most kCarryKept, in the slots after them).
+        using CarryFn = uint8_t*(__fastcall*)(uint8_t* inv, uint64_t item);
+        constexpr int         kCarryShoulders = 8, kCarryKept = 4, kCarry = kCarryShoulders + kCarryKept;
+        bool                  g_carry_tried = false, g_carry_ok = false;
+        std::atomic<bool>     g_carry_failed{ false };
+        std::atomic<uint64_t> g_carry_ask[kCarry]{};    // the items watched (0: none)
+        std::atomic<uint64_t> g_carry_item[kCarry]{};   // the item each answer is for
+        std::atomic<int>      g_carry_ans[kCarry]{};    // 0 not carried, 1 carried
+        std::atomic<int64_t>  g_carry_t{ 0 }, g_carry_ask_t{ 0 };
+        uint64_t              g_carry_said_item[kCarry]{};
+        int                   g_carry_said[kCarry]{};
+
+        bool carry_on()
+        {
+            if (!g_carry_ok || g_carry_failed.load()) return false;
+            for (int i = 0; i < kCarry; ++i)
+                if (g_carry_ask[i].load() != 0) return true;
+            return false;
+        }
+
+        int carry_read(uint64_t me, const uint64_t* items, int* out)
+        {
+            __try {
+                uint8_t* h = nullptr;
+                reinterpret_cast<AmLookupFn>(g_base + 0xB27D60)(*reinterpret_cast<void**>(g_base + 0x4FAC1E0), &h, me);
+                if (!h) return 0;
+                int      r   = 0;
+                uint8_t* ent = *reinterpret_cast<uint8_t**>(h + 0x10);
+                if (ent) {
+                    uint8_t* inv  = nullptr;
+                    uint8_t* comp = *reinterpret_cast<uint8_t**>(ent + 0xC8);
+                    if (comp) {
+                        inv = reinterpret_cast<AmInvFn>(g_base + 0xF48EE0)(comp, ent + 0xA8, 0);
+                    } else {
+                        uint32_t key = *reinterpret_cast<uint32_t*>(reinterpret_cast<AmKeyFn>(g_base + 0xF64790)() + 0x18);
+                        inv          = reinterpret_cast<AmFindFn>(g_base + 0xCCD250)(ent, &key);
+                    }
+                    if (inv) {
+                        CarryFn fn = (*reinterpret_cast<CarryFn**>(inv))[0x130 / 8];
+                        for (int i = 0; i < kCarry; ++i) out[i] = items[i] != 0 && items[i] != ~0ull && fn(inv, items[i]) != nullptr ? 1 : 0;
+                        r = 1;
+                    }
+                }
+                if (h != g_base + 0x4CB9E70 && InterlockedDecrement(reinterpret_cast<volatile LONG*>(h + 8)) == 0) reinterpret_cast<AmReleaseFn>(g_base + 0x26E320)(h);
+                return r;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return -1;
+            }
+        }
+
+        void carry_tick()
+        {
+            g_carry_ask_t = now_ms();
+            if (!g_local_id) return;
+            uint64_t       tmp = 0;
+            uint64_t*      idp = g_local_id(&tmp);
+            const uint64_t me  = idp ? *idp : 0;
+            if (me == 0 || me == ~0ull) return;
+            uint64_t items[kCarry]{};
+            int      ans[kCarry]{};
+            for (int i = 0; i < kCarry; ++i) items[i] = g_carry_ask[i].load();
+            const int r = carry_read(me, items, ans);
+            if (r < 0) {
+                g_carry_failed = true;
+                spdlog::error("[GameWeapon] slotcarried: a fault asking the inventory for an item: turned off");
+                return;
+            }
+            if (r == 0) return;
+            for (int i = 0; i < kCarry; ++i) {
+                g_carry_item[i] = items[i];
+                g_carry_ans[i]  = ans[i];
+                if (items[i] != 0 && (items[i] != g_carry_said_item[i] || ans[i] != g_carry_said[i]))
+                    spdlog::info("[GameWeapon] slotcarried: item {:x} {}", items[i], ans[i] ? "carried" : "NOT carried (the inventory has no entry for it)");
+                g_carry_said_item[i] = items[i];
+                g_carry_said[i]      = ans[i];
+            }
+            g_carry_t = now_ms();
         }
 
         // gamedraw <item hex> | gameholster (tests, 3 Nov; research\2026-11-02_throwables.md): the game's own weapon change, with no pad. DrawWeapon's local path (+0x19C7CD0, from the binding's native +0x2F6F8F0),
@@ -1282,6 +1378,17 @@ namespace fc5::lua
             }
         }
 
+        // qtehud: IsInQTE, under SEH: 1 in a QTE, 0 not, -2 a fault.
+        int qte_read(uint64_t me)
+        {
+            __try {
+                uint64_t id = me;
+                return g_qte_fn(&id) ? 1 : 0;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return -2;
+            }
+        }
+
         // On the game's script thread: GetPawnVehicle for the local player; every change logged (downview: IsPawnDown too).
         void veh_tick()
         {
@@ -1301,6 +1408,18 @@ namespace fc5::lua
                 } else {
                     g_down_state = d;
                     g_down_t     = now_ms();
+                }
+            }
+            if (g_qte_on.load()) {
+                const int q = qte_read(me);
+                if (q == -2) {
+                    g_qte_on     = false;
+                    g_qte_failed = true;
+                    g_qte_state  = -1;
+                    spdlog::error("[HUD] qtehud: a fault reading IsInQTE for the player {:x}: QTEs no longer read this session (knocked down still is)", me);
+                } else {
+                    g_qte_state = q;
+                    g_qte_t     = now_ms();
                 }
             }
             if (!g_veh_on.load()) return;
@@ -1484,7 +1603,7 @@ namespace fc5::lua
                 g_after_id  = 0;
                 spdlog::info("[Melee] meleedamage: entity {:x}'s health 30 updates later {:.1f} (before the stim {:.1f})", id, g_health ? g_health(&id) : -1.0f, g_after_h0);
             }
-            const bool veh_due = (g_veh_on.load() || g_down_on.load()) && now_ms() - g_veh_ask_t >= 150;   // vehscript, downview
+            const bool veh_due = (g_veh_on.load() || g_down_on.load() || g_qte_on.load()) && now_ms() - g_veh_ask_t >= 150;   // vehscript, downview, qtehud
             const bool gs_due  = g_gs_on.load() && now_ms() - g_gs_ask_t >= 100;     // gamestate
             const bool snd_due = fc5::gamesound::due();                              // gamesound
             const bool thr_due = g_thr_on.load() && now_ms() - g_thr_ask_t.load() >= 200;   // throwlibrary
@@ -1495,8 +1614,9 @@ namespace fc5::lua
             const bool eq_due  = g_eq_on.load() && now_ms() - g_eq_ask_t >= 150;     // gameweapon
             const bool am_due  = g_am_on.load() && (g_am_fast.load() || now_ms() - g_am_ask_t >= 100);     // reloadmanual (every update while the clip is low)
             const bool bm_due  = g_bmb_on.load() && now_ms() - g_bmb_t >= 100;      // bonemapbody
+            const bool carry_due = carry_on() && now_ms() - g_carry_ask_t.load() >= 150;   // slotcarried
             if (!g_in_play.load() || (!g_fov_pending.load() && !g_dmg_pending.load() && !g_probe_pending.load() && !g_self_pending.load() && !veh_due && !gs_due && !snd_due && !thr_due && !drw_due && !ray_due && !eq_due && !am_due &&
-                                      !bm_due && !sp_due && !fill_due)) return;
+                                      !bm_due && !sp_due && !fill_due && !carry_due)) return;
             const unsigned long script_tid = g_game_tid.load();
             if (script_tid == 0 || script_tid != GetCurrentThreadId()) {
                 static int told = 0;
@@ -1524,6 +1644,7 @@ namespace fc5::lua
             if (eq_due) eq_tick();                     // gameweapon
             if (am_due) am_tick();                     // reloadmanual
             if (bm_due) bmb_tick();                    // bonemapbody
+            if (carry_due) carry_tick();               // slotcarried
             if (g_dmg_pending.load()) damage_tick();   // meleedamage
             if (g_probe_pending.load()) probe_tick();
             if (g_self_pending.exchange(false) && g_stim && g_local_id) {
@@ -1733,7 +1854,43 @@ namespace fc5::lua
         if (item) g_draw_item = item;
     }
 
+    static bool carry_usable()
+    {
+        if (!g_ready || g_carry_failed.load()) return false;
+        if (!g_carry_tried) {
+            g_carry_tried = true;
+            // CheckPawnWeaponInventoryByDescriptorId's native at its inventory call: mov rax,[rax]; mov rdx,rsi; call [rax+130h]. And the helpers of am_read.
+            static const uint8_t kCall[]{ 0x48, 0x8B, 0x00, 0x48, 0x8B, 0xD6, 0xFF, 0x90, 0x30, 0x01, 0x00, 0x00 };
+            g_carry_ok = std::memcmp(g_base + 0x2F95BF8, kCall, sizeof(kCall)) == 0 && g_base[0xB27D60] == 0xE9 && g_base[0xF48EE0] == 0xE9 && g_base[0xF64790] == 0xE9 &&
+                         g_base[0xCCD250] == 0xE9;
+            if (g_carry_ok) spdlog::info("[GameWeapon] slotcarried: the inventory asked whether the shoulder slots' weapons are still carried, every 150 ms on the script thread (vtable +0x130)");
+            else spdlog::error("[GameWeapon] slotcarried: unexpected code at CheckPawnWeaponInventoryByDescriptorId's inventory call or its helpers: not used");
+        }
+        return g_carry_ok;
+    }
+
+    void carried_watch(const uint64_t* items, int n)
+    {
+        if (!carry_usable()) return;
+        for (int i = 0; i < kCarryShoulders; ++i) g_carry_ask[i] = i < n ? items[i] : 0;
+    }
+
+    void carried_watch_kept(const uint64_t* items, int n)
+    {
+        if (!carry_usable()) return;
+        for (int i = 0; i < kCarryKept; ++i) g_carry_ask[kCarryShoulders + i] = i < n ? items[i] : 0;
+    }
+
+    int item_carried(uint64_t item)
+    {
+        if (item == 0 || !g_carry_ok || g_carry_failed.load() || now_ms() - g_carry_t.load() > 1000) return -1;
+        for (int i = 0; i < kCarry; ++i)
+            if (g_carry_item[i].load() == item) return g_carry_ans[i].load();
+        return -1;
+    }
+
     void clip_fill_request() { g_fill_short = false; g_fill_req = true; }
+    uint64_t weapon_object() { return (g_am_on.load() && now_ms() - g_am_t.load() < 1000) ? g_am_obj.load() : 0; }
     void reserve_take_request(int n) { g_take_req += n; }
     bool clip_fill_failed() { return g_fill_failed.load(); }
     bool clip_fill_short() { return g_fill_short.exchange(false); }
@@ -1939,6 +2096,33 @@ namespace fc5::lua
             }
         }
         g_down_on = g_down_ok;
+    }
+
+    void qte_query(bool on)
+    {
+        if (!on || !g_ready || g_qte_failed.load()) {
+            g_qte_on    = false;
+            g_qte_state = -1;
+            return;
+        }
+        if (!g_qte_tried) {
+            g_qte_tried = true;
+            static const uint8_t kQteSig[]{ 0x48, 0x89, 0x5C, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x09, 0xE8 };   // IsInQTE's native (30 Oct)
+            g_qte_ok = std::memcmp(g_base + 0x2FA8E80, kQteSig, sizeof(kQteSig)) == 0;
+            if (g_qte_ok) {
+                g_qte_fn = reinterpret_cast<PawnBoolFn>(g_base + 0x2FA8E80);
+                spdlog::info("[HUD] qtehud: IsInQTE (FC_m64.dll+0x2fa8e80) asked every 150 ms on the game's script thread");
+            } else {
+                spdlog::error("[HUD] qtehud: unexpected code at IsInQTE (FC_m64.dll+0x2fa8e80): not used (knocked down still is)");
+            }
+        }
+        g_qte_on = g_qte_ok;
+    }
+
+    int pawn_qte()
+    {
+        if (!g_qte_on.load() || now_ms() - g_qte_t.load() > 1000) return -1;
+        return g_qte_state.load();
     }
 
     int pawn_down()

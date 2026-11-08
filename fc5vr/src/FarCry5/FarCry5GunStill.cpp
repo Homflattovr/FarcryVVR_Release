@@ -25,6 +25,7 @@
 #include "FarCry5Gesture.h"
 #include "FarCry5Reload.h"
 #include "FarCry5Dlss.h"
+#include "FarCry5GunPoseTable.h"
 #include "ModPath.h"
 
 #include <algorithm>
@@ -108,6 +109,30 @@ namespace
         const float off = axes_off_deg(r, roll);
         return off > 20.0f || std::abs(roll) > 30.0f;
     }
+    // twohandlevel: a long gun by the game's data (rifle, SMG, shotgun, marksman rifle, LMG; not one-handed): not a handgun, a machine
+    // pistol, a bow, a launcher, the flamethrower or a melee weapon.
+    bool data_long_gun(uint32_t sig)
+    {
+        const auto* w = fc5::gameweapon::info(sig);
+        return w && w->cls >= 2 && w->cls <= 6 && !w->one_handed;
+    }
+    // A direction in a gun's axes (x right, y along the barrel, z up) from its angles right of and up from the barrel (deg), and back.
+    glm::vec3 line_of(float right_deg, float up_deg)
+    {
+        const float r = glm::radians(right_deg), u = glm::radians(up_deg);
+        return glm::vec3{ std::cos(u) * std::sin(r), std::cos(u) * std::cos(r), std::sin(u) };
+    }
+    void line_angles(const glm::vec3& l, float& right_deg, float& up_deg)
+    {
+        right_deg = glm::degrees(std::atan2(l.x, l.y));
+        up_deg    = glm::degrees(std::atan2(l.z, std::sqrt(l.x * l.x + l.y * l.y)));
+    }
+    // weaponaudit: a direction's yaw (right +) and pitch (up +) against -Z, deg (the game camera's or a controller's axes).
+    void dir_angles(const glm::vec3& d, float& yaw_deg, float& pitch_deg)
+    {
+        yaw_deg   = glm::degrees(std::atan2(d.x, -d.z));
+        pitch_deg = glm::degrees(std::asin(std::clamp(d.y / std::max(1e-6f, glm::length(d)), -1.0f, 1.0f)));
+    }
 }
 
 struct FarCry5Stereo::GunStillState
@@ -128,6 +153,7 @@ struct FarCry5Stereo::GunStillState
         bool      line_ok{ false };
         bool      temp{ false };   // shoulderdraw: a pose taken for one switch only (a weapon held out of the learning's reach), dropped after it
         int       ahead{ 0 }, beside{ 0 };    // sidearm: measures with the left hand ahead of the weapon hand along the barrel / not
+        bool      builtin{ false };          // gunposebuiltin: the pose came from FarCry5GunPoseTable.h (not saved while so)
     };
     // A dropped pose: back to the weapon's first learned one if it has one, else learned again.
     static void drop(Ref& r)
@@ -143,6 +169,7 @@ struct FarCry5Stereo::GunStillState
     }
     std::unordered_map<uint32_t, Ref> refs{};   // by weapon signature (m_weapon_sig)
     std::set<uint32_t>                unlearned_said{};   // weapons logged as out 5 s and not learned
+    clock::time_point                 unlearned_t{};      // gunstillwhy: the last "still not learned" line
     bool                              loaded{ false };   // fc5vr_gunposes.txt read
 
     // The player's horizontal speed from the game camera.
@@ -307,11 +334,282 @@ int FarCry5Stereo::gun_still_handgun(uint32_t sig) const
 bool FarCry5Stereo::gun_still_hand_line(glm::vec3& g)
 {
     if (!m_gst || !m_two_hand_line.load()) return false;
-    const auto it = m_gst->refs.find(m_weapon_sig.load());
-    if (it == m_gst->refs.end() || !it->second.ok || !it->second.line_ok) return false;
-    const bool      made = m_gst->held_axes && m_gst->held_sig == m_weapon_sig.load();   // gunaxes: the gun drawn at the made pose
+    const uint32_t sig  = m_weapon_sig.load();
+    const auto     it   = m_gst->refs.find(sig);
+    const bool     have = it != m_gst->refs.end() && it->second.ok;
+    const bool     made = m_gst->held_axes && m_gst->held_sig == sig;   // gunaxes: the gun drawn at the made pose
+    // twohandlevel (Stereo.h): a long gun lines up the common hand line, at once (no need to have stood still with it first).
+    if (m_two_hand_level.load() && (made || have) && data_long_gun(sig)) {
+        g = glm::normalize(glm::mat3_cast(made ? m_gst->held.r : it->second.pose.r) * line_of(m_two_hand_level_ref[0].load(), m_two_hand_level_ref[1].load()));
+        return g.z < -0.5f;
+    }
+    if (!have || !it->second.line_ok) return false;
     g = glm::normalize(glm::mat3_cast(made ? m_gst->held.r : it->second.pose.r) * it->second.line);
     return g.z < -0.5f;   // forward-ish only (a bad measure is ignored)
+}
+
+// onehandmatch (Stereo.h): called from update_motion right after the two-handed hold has set k (the weapon's frame: weapon controller with
+// grip pitch, world scale in the position). k_ctrl: the weapon controller's own frame. can: a weapon in hand on its controller (not slung,
+// bow, mounted, vehicle). two: the two-handed hold is on. Nothing is learnt: the one-hand line is the fixed onehandmatch P Y.
+void FarCry5Stereo::one_hand_match(glm::mat4& k, const glm::mat4& k_ctrl, bool can, bool two)
+{
+    using clock    = std::chrono::steady_clock;
+    const auto now = clock::now();
+    float      dt  = m_ohm_t == clock::time_point{} ? 0.0f : std::chrono::duration<float>(now - m_ohm_t).count();
+    m_ohm_t        = now;
+    dt             = std::clamp(dt, 0.0f, 0.1f);
+    if (m_gsl_on.load() && std::chrono::duration<float>(now - m_gsl_t0).count() >= 8.0f) gunstock_learn_finish();
+    const uint32_t sig = m_weapon_sig.load();
+    // The gun's own barrel in the weapon controller's axes as its one-hand hold draws it (gun_still's pose this frame, axes or pose).
+    glm::vec3 b{ 0.0f };
+    if (m_gst && sig != 0 && m_gst->held_sig == sig) b = glm::mat3_cast(m_gst->held.r) * glm::vec3{ 0.0f, 1.0f, 0.0f };
+    const bool b_ok = glm::length(b) > 0.5f;
+    // gunstocklearn: from 1.5 s into the window, the drawn barrel of a long gun in two hands (weapon controller's axes; k is the hold's here),
+    // not while firing or reloading. Sampled with the switch off too.
+    if (m_gsl_on.load() && two && can && b_ok && data_long_gun(sig) && !fc5::gesture::kept() && std::chrono::duration<float>(now - m_gsl_t0).count() > 1.5f &&
+        !m_trigger.load() && !fc5::reload::hides_game_reload() && !(m_gst && m_gst->reload)) {
+        std::lock_guard _{ m_gsl_mtx };
+        m_gsl_samples.push_back(glm::normalize(glm::transpose(glm::mat3{ k_ctrl }) * glm::mat3{ k } * glm::normalize(b)));
+        m_gsl_good_s += dt;
+    }
+    if (!m_ohm_on.load() || !can || !b_ok || !data_long_gun(sig) || fc5::gesture::kept()) {
+        m_ohm_cur_ok = m_ohm_was_two = false;
+        m_ohm_sig                    = sig;
+        m_ohm_last_turn              = 0.0f;
+        return;
+    }
+    b = glm::normalize(b);
+    if (sig != m_ohm_sig) { m_ohm_cur_ok = false; m_ohm_sig = sig; }   // another gun: no easing from the last one's turn
+    const glm::mat3 Kc{ k_ctrl };
+    auto            put = [&](const glm::quat& q) {
+        const glm::mat3 K = Kc * glm::mat3_cast(q);   // turned about the controller's point: the grip point, where the weapon hand is
+        k[0]              = glm::vec4{ K[0], 0.0f };
+        k[1]              = glm::vec4{ K[1], 0.0f };
+        k[2]              = glm::vec4{ K[2], 0.0f };
+    };
+    const float ease = 1.0f - std::exp(-dt / 0.05f);   // ~95 % in 0.15 s
+    if (two) {
+        // The grab: eased from the one-hand turn into the two-handed hold's (the hold itself is not changed).
+        if (!m_ohm_was_two) m_ohm_two_t0 = now;
+        const float     age = std::chrono::duration<float>(now - m_ohm_two_t0).count();
+        const glm::quat qn  = glm::normalize(glm::quat_cast(glm::transpose(Kc) * glm::mat3{ k }));
+        if (m_ohm_cur_ok && age < 0.15f) {
+            m_ohm_cur = glm::normalize(glm::slerp(m_ohm_cur, qn, ease));
+            put(m_ohm_cur);
+        } else {
+            m_ohm_cur = qn;
+        }
+        m_ohm_cur_ok    = true;
+        m_ohm_was_two   = true;
+        m_ohm_last_turn = 0.0f;
+        return;
+    }
+    const bool let_go = m_ohm_was_two;
+    m_ohm_was_two     = false;
+    const float     pt = glm::radians(std::clamp(m_ohm_p.load(), -80.0f, 80.0f)), yt = glm::radians(std::clamp(m_ohm_y.load(), -80.0f, 80.0f));
+    const glm::vec3 d{ std::sin(yt) * std::cos(pt), std::sin(pt), -std::cos(yt) * std::cos(pt) };
+    glm::quat       r   = glm::normalize(glm::quat{ 1.0f + glm::dot(b, d), glm::cross(b, d) });   // shortest turn: the barrel onto the line (the roll kept)
+    const float     ang = glm::degrees(2.0f * std::acos(std::clamp(std::abs(r.w), 0.0f, 1.0f)));
+    if (ang > 45.0f) r = glm::normalize(glm::slerp(glm::quat{ 1.0f, 0.0f, 0.0f, 0.0f }, r, 45.0f / ang));
+    m_ohm_cur       = m_ohm_cur_ok ? glm::normalize(glm::slerp(m_ohm_cur, r, ease)) : r;   // the let-go eased from the hold; a new draw at once
+    m_ohm_cur_ok    = true;
+    m_ohm_last_turn = std::min(ang, 45.0f);
+    put(m_ohm_cur);
+    if (let_go) {   // information only: nothing is learnt from the hold
+        float by = 0.0f, bp = 0.0f, dy = 0.0f, dp = 0.0f;
+        dir_angles(b, by, bp);
+        dir_angles(d, dy, dp);
+        m_ohm_last_x = bp - dp;
+        spdlog::info("[Motion] Angle correction for two handed weapons (gunstock calibration): weapon {} let go, 1H barrel turned {:.1f} {:.1f} deg onto the two-handed line (raw 1H would be {:.1f} deg above){}", sig, dp - bp,
+                     dy - by, bp - dp, ang > 45.0f ? fmt::format("; the turn {:.0f} deg held to 45", ang) : std::string{});
+    }
+}
+
+// reloadzonesfollow (Stereo.h): the drawn gun's turn against the weapon controller's raw axes (set in update_motion), false when none.
+bool FarCry5Stereo::draw_turn(glm::mat3& E)
+{
+    std::lock_guard _{ m_draw_turn_mtx };
+    E = m_draw_turn;
+    return m_draw_turn_on;
+}
+
+// reloadzonesfollow: k with the one-hand turn last applied (onehandmatch), for the press tests made before one_hand_match runs this frame.
+// k itself when none is applied (onehandmatch off, two hands, not a long gun): bit for bit as before.
+glm::mat4 FarCry5Stereo::one_hand_drawn(const glm::mat4& k) const
+{
+    if (!m_ohm_on.load() || !m_ohm_cur_ok || m_ohm_was_two || m_ohm_last_turn.load() <= 0.0f) return k;
+    glm::mat4       r = k;
+    const glm::mat3 K = glm::mat3{ k } * glm::mat3_cast(m_ohm_cur);
+    r[0]              = glm::vec4{ K[0], 0.0f };
+    r[1]              = glm::vec4{ K[1], 0.0f };
+    r[2]              = glm::vec4{ K[2], 0.0f };
+    return r;
+}
+
+void FarCry5Stereo::gunstock_learn_start()
+{
+    {
+        std::lock_guard _{ m_gsl_mtx };
+        m_gsl_samples.clear();
+        m_gsl_good_s = 0.0f;
+        m_gsl_msg    = "learning...";
+    }
+    m_gsl_t0 = std::chrono::steady_clock::now();
+    m_gsl_on = true;
+    gunstock_tick();
+    spdlog::info("[Motion] gunstock calibration: learning for 8 s: hold a two-handed weapon and aim with it");
+}
+
+void FarCry5Stereo::gunstock_learn_finish()
+{
+    m_gsl_on = false;
+    std::vector<glm::vec3> s;
+    float                  good = 0.0f;
+    {
+        std::lock_guard _{ m_gsl_mtx };
+        s    = std::move(m_gsl_samples);
+        good = m_gsl_good_s;
+        m_gsl_samples.clear();
+    }
+    gunstock_tick();
+    if (good < 2.0f || s.empty()) {
+        std::lock_guard _{ m_gsl_mtx };
+        m_gsl_msg = fmt::format("not learnt: hold a two-handed weapon and aim with it ({:.1f} s of two-handed aim, 2 s needed); the angle kept", good);
+        spdlog::info("[Motion] gunstock calibration not learnt: hold a two-handed weapon and aim with it ({:.1f} s of samples, 2 s needed); kept {:.1f} up {:.1f} right", good,
+                     m_ohm_p.load(), m_ohm_y.load());
+        return;
+    }
+    glm::vec3 m{ 0.0f };
+    for (const auto& v : s) m += v;
+    m = glm::normalize(m);
+    float sq = 0.0f;
+    for (const auto& v : s) {
+        const float a = glm::degrees(std::acos(std::clamp(glm::dot(v, m), -1.0f, 1.0f)));
+        sq += a * a;
+    }
+    const float spread = std::sqrt(sq / float(s.size()));
+    float       y = 0.0f, p = 0.0f;
+    dir_angles(m, y, p);
+    m_ohm_p                   = std::clamp(p, -45.0f, 30.0f);
+    m_ohm_y                   = std::clamp(y, -20.0f, 20.0f);
+    m_ohm_cur_ok              = false;
+    m_persist["onehandmatch"] = fmt::format("onehandmatch {} {:.1f} {:.1f}", m_ohm_on.load() ? "on" : "off", m_ohm_p.load(), m_ohm_y.load());
+    save_settings();
+    {
+        std::lock_guard _{ m_gsl_mtx };
+        m_gsl_msg = fmt::format("learnt: {:.1f} deg up, {:.1f} right (from {} samples, spread {:.1f} deg)", m_ohm_p.load(), m_ohm_y.load(), s.size(), spread);
+    }
+    spdlog::info("[Motion] gunstock calibration learnt: {:.1f} up {:.1f} right from {} samples (spread {:.1f} deg){}", m_ohm_p.load(), m_ohm_y.load(), s.size(), spread,
+                 (p != m_ohm_p.load() || y != m_ohm_y.load()) ? fmt::format(" (measured {:.1f} {:.1f}, held to the sliders' range)", p, y) : std::string{});
+}
+
+std::string FarCry5Stereo::gunstock_learn_text()
+{
+    if (m_gsl_on.load()) {
+        const float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - m_gsl_t0).count();
+        float       good;
+        {
+            std::lock_guard _{ m_gsl_mtx };
+            good = m_gsl_good_s;
+        }
+        return fmt::format("Learning: hold a two-handed weapon and aim with it: {:.0f} s left ({:.1f} s of two-handed aim so far)", std::max(0.0f, std::ceil(8.0f - t)), good);
+    }
+    std::lock_guard _{ m_gsl_mtx };
+    return m_gsl_msg;
+}
+
+std::string FarCry5Stereo::one_hand_match_text()
+{
+    return fmt::format("every rifle, SMG, shotgun and machine gun held {:.1f} deg up, {:.1f} right of your weapon hand's controller (default {:.0f} {:.0f}); turn now {:.1f} deg{}",
+                       m_ohm_p.load(), m_ohm_y.load(), kOhmDefaultP, kOhmDefaultY, m_ohm_last_turn.load(),
+                       m_ohm_last_x.load() != 0.0f ? fmt::format("; at the last let-go the raw one-hand hold was {:.1f} deg above", m_ohm_last_x.load()) : std::string{});
+}
+std::string FarCry5Stereo::gun_still_hand_line_text()
+{
+    if (!m_gst) return "its own hand line";
+    const uint32_t sig = m_weapon_sig.load();
+    const auto     it  = m_gst->refs.find(sig);
+    std::string    own = "its own line not measured yet";
+    if (it != m_gst->refs.end() && it->second.line_ok) {
+        float r = 0.0f, u = 0.0f;
+        line_angles(it->second.line, r, u);
+        own = fmt::format("its own {:.1f} right, {:.1f} up", r, u);
+    }
+    if (m_two_hand_level.load() && data_long_gun(sig))
+        return fmt::format("the common hand line (twohandlevel: {:.1f} deg right, {:.1f} up of the barrel; {})", m_two_hand_level_ref[0].load(), m_two_hand_level_ref[1].load(), own);
+    return fmt::format("its own hand line ({})", own);
+}
+
+// weaponaudit (test; all-weapons pass 7 Nov): one [Audit] line for the gun in hand, from gun_still's frame (s.held just set). Points in the
+// weapon controller's axes (grip pitch in: the axes the gun is placed in, game metres), then in the raw controller's axes and tracking metres
+// (as the test commands ctrl / lctrl take them: "track"). With two hands: the turn the hold gave the weapon's frame against the one-hand
+// frame, and the barrel it leaves.
+void FarCry5Stereo::gun_still_audit(uint32_t sig, bool axes_hold, bool melee_hold)
+{
+    if (!m_gst) return;
+    auto&       s    = *m_gst;
+    const auto* w    = fc5::gameweapon::info(sig);
+    const Pose& H    = s.held;
+    const auto  it   = s.refs.find(sig);
+    const bool  have = it != s.refs.end() && it->second.ok;
+    const auto  ait  = s.axes.find(sig);
+    const bool  rh_ok = ait != s.axes.end() && ait->second.n >= 3;
+    const float gp   = m_grip_pitch.load();
+    const float ws   = std::max(1e-3f, m_world_scale.load());
+    const glm::mat3 Rg = glm::mat3_cast(glm::angleAxis(glm::radians(gp), glm::vec3{ 1.0f, 0.0f, 0.0f }));   // k axes -> the raw controller's
+    auto cam = [&](const glm::vec3& p) { return glm::mat3_cast(H.r) * p + H.t; };   // gun axes -> the weapon controller's axes
+    auto v3  = [](const glm::vec3& v) { return fmt::format("{:.3f} {:.3f} {:.3f}", v.x, v.y, v.z); };
+    const glm::vec3 b = glm::mat3_cast(H.r) * glm::vec3{ 0.0f, 1.0f, 0.0f }, u = glm::mat3_cast(H.r) * glm::vec3{ 0.0f, 0.0f, 1.0f };
+    float by = 0.0f, bp = 0.0f;
+    dir_angles(b, by, bp);
+    const float roll = glm::degrees(std::atan2(u.x, u.y));
+    std::string sight = "none";
+    if (glm::vec3 sd{ 0.0f }, su{ 0.0f }; sight_axes(sig, sd, su) && glm::length(sd) > 0.5f) {
+        float r = 0.0f, uu = 0.0f;
+        line_angles(glm::normalize(sd), r, uu);
+        sight = fmt::format("{:.2f} {:.2f}", r, uu);
+    }
+    glm::vec3 c{ m_grip_hand_ref[0].load(), m_grip_hand_ref[1].load(), m_grip_hand_ref[2].load() };
+    bool      grip_ok = false;
+    {
+        std::lock_guard _{ m_weapon_cal_mtx };
+        if (auto g = m_grip_hand.find(sig); g != m_grip_hand.end() && g->second.ok) { c = g->second.c; grip_ok = true; }
+    }
+    const char* hold = melee_hold ? "melee" : axes_hold ? "axes" : (s.alpha > 0.5f ? "pose" : "game");
+    std::string rh = "rhand none", lh = "lhand none", line = "line none";
+    if (rh_ok) rh = fmt::format("rhand {} n {} rhctrl {}", v3(ait->second.h), ait->second.n, v3(cam(ait->second.h)));
+    if (have && it->second.hand_ok) {
+        const glm::vec3 lc = cam(it->second.hand);
+        // The game's camera-space points are put on the controller about the grip point O (Stereo.cpp's weapon placement: world' = W_pos +
+        // W_rot (q - O), O = gripoff + this gun's grip - the reference grip): the left hand as drawn, against the weapon controller, is lc - O.
+        const glm::vec3 O = glm::vec3{ m_grip_off[0].load(), m_grip_off[1].load(), m_grip_off[2].load() } +
+                            (m_grip_by_hand.load() ? c - glm::vec3{ m_grip_hand_ref[0].load(), m_grip_hand_ref[1].load(), m_grip_hand_ref[2].load() } : glm::vec3{ 0.0f });
+        const glm::vec3 ld = lc - O;
+        lh = fmt::format("lhand {} lhctrl {} lhtrack {} lhdrawn {} lhdtrack {} fore {:.2f}", v3(it->second.hand), v3(lc), v3(Rg * lc / ws), v3(ld), v3(Rg * ld / ws),
+                         glm::length(ld - glm::vec3{ 0.0f, 0.0f, -m_fore_grip.load() }));
+    }
+    if (have && it->second.line_ok) {
+        float r = 0.0f, uu = 0.0f;
+        line_angles(it->second.line, r, uu);
+        line = fmt::format("line {:.2f} {:.2f} ahead {} beside {}", r, uu, it->second.ahead, it->second.beside);
+    } else if (have) line = fmt::format("line none ahead {} beside {}", it->second.ahead, it->second.beside);
+    const bool  level = m_two_hand_level.load() && data_long_gun(sig);
+    std::string two   = "two off";
+    if (m_frame.load() - m_aud_frame <= 10) {
+        const glm::mat3 kc{ m_aud_kc }, k{ m_aud_k };
+        const glm::mat3 rel = glm::transpose(kc) * k;   // the weapon's frame in the one-hand frame's axes
+        float ty = 0.0f, tp = 0.0f, b2y = 0.0f, b2p = 0.0f;
+        dir_angles(rel * glm::vec3{ 0.0f, 0.0f, -1.0f }, ty, tp);
+        dir_angles(rel * b, b2y, b2p);
+        const glm::vec3 up2 = rel * glm::vec3{ 0.0f, 1.0f, 0.0f };
+        const glm::vec3 o   = m_aud_other_ok ? glm::transpose(kc) * (m_aud_other - glm::vec3{ m_aud_kc[3] }) : glm::vec3{ 0.0f };
+        two = fmt::format("two {} turn {:.2f} {:.2f} {:.2f} barrel2 {:.2f} {:.2f} other {} othertrack {}", m_aud_two ? "on" : "off", ty, tp, glm::degrees(std::atan2(up2.x, up2.y)), b2y, b2p,
+                          m_aud_other_ok ? v3(o) : std::string{ "- - -" }, m_aud_other_ok ? v3(Rg * o / ws) : std::string{ "- - -" });
+    }
+    spdlog::info("[Audit] weapon {} item {} cls {} oneh {} | hold {} sight {} | barrel {:.2f} {:.2f} roll {:.2f} grippitch {:.1f} ws {:.3f} | grip {} {} gripraw {} | {} | {} | {} level {} ref {:.2f} {:.2f} | {} | handgun {} pose {} builtin {}",
+                 sig, w ? w->name : "-", w ? int(w->cls) : -1, w ? int(w->one_handed) : -1, hold, sight, by, bp, roll, gp, ws, grip_ok ? "measured" : "ref", v3(c), v3(Rg * c / ws), rh, lh, line,
+                 level ? "on" : "off", m_two_hand_level_ref[0].load(), m_two_hand_level_ref[1].load(), two, gun_still_handgun(sig), have ? v3(it->second.pose.t) : std::string{ "none" },
+                 have && it->second.builtin ? "yes" : "no");
 }
 
 void FarCry5Stereo::note_pad_buttons(uint16_t buttons)
@@ -701,6 +999,31 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
             spdlog::info("[Motion] gunstill: weapon {} not learned after 5 s: gun at ({:.2f}, {:.2f}, {:.2f}) in the camera's axes (in the hands needs z < -0.10, y > -0.45), "
                          "game's left hand {}, quiet {}, steady {}, sling {}, speed {:.1f} m/s", sig, qp.t.x, qp.t.y, qp.t.z, hand_fresh ? "drawn" : "not drawn", quiet_now, steady,
                          m_mo.slung, s.speed);
+        // gunstillwhy (author 7 Nov 20:49: the M133 29259; in his log it was the one gun of
+        // the session with no learned pose, out about 1.5 min and logged once only, during its shell loading): every 10 s while the weapon in
+        // hand is still not learned, what stopped the learning on this update.
+        if (!ref.ok && out_s > 5.0f && now - s.unlearned_t > std::chrono::seconds(10)) {
+            s.unlearned_t = now;
+            std::string why;
+            auto add = [&why](bool bad, const std::string& t) { if (bad) why += (why.empty() ? "" : ", ") + t; };
+            add(vehicle, "in a vehicle");
+            add(s.speed >= 0.4f, fmt::format("moving {:.1f} m/s (needs under 0.4)", s.speed));
+            add(now - s.last_moving <= std::chrono::milliseconds(1500), "moved or sprinted in the last 1.5 s");
+            add(s.reload, "the game's reload shown");
+            add(manual_reload, "a manual reload step under way");
+            add(throwing || now - s.last_throw <= std::chrono::milliseconds(1500), "throwing (or in the last 1.5 s)");
+            add(now - s.last_fire <= std::chrono::milliseconds(800), "fired in the last 0.8 s");
+            add(now - s.last_ads <= std::chrono::milliseconds(800), "aiming down sights (LT) in the last 0.8 s");
+            add(now - clock::time_point{ clock::duration{ m_pad_x_press.load() } } <= std::chrono::milliseconds(2500), "pad X in the last 2.5 s");
+            add(!steady, "the game's gun moving");
+            add(!hand_fresh, "the game's left hand not drawn");
+            add(!(qp.t.z < -0.10f), fmt::format("the gun {:.0f} cm ahead of the camera (needs over 10)", -qp.t.z * 100.0f));
+            add(!(qp.t.y > -0.45f), fmt::format("the gun {:.0f} cm below the camera (needs under 45)", -qp.t.y * 100.0f));
+            add(hand_off, fmt::format("the game's left hand {:.0f} cm off its place", s.hand_off_cm));
+            add(m_mo.slung, "on the sling");
+            spdlog::info("[Motion] gunstillwhy: weapon {} still not learned after {:.0f} s ({}held by its axes): {}", sig, out_s, s.axes[sig].n >= 3 ? "" : "not ",
+                         why.empty() ? "nothing stopped it on this update (it learns once that lasts)" : why);
+        }
         if (!(calm && away)) s.away_on = false;
         else if (!s.away_on) {
             s.away_on   = true;
@@ -960,6 +1283,7 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
     s.held      = hpose;
     s.held_sig  = sig;
     s.held_axes = axes_hold;
+    if (m_weapon_audit.exchange(false)) gun_still_audit(sig, axes_hold, melee_hold);
     const bool known = ref.ok || axes_hold;
     // Held unless a reload or a throw is under way, the pose is unknown, or the gun is far from it (another mesh).
     // shoulderdraw (FarCry5WeaponSwitch.cpp): a weapon just taken by a switch gesture is held at once and fully, wherever the game's
@@ -1572,6 +1896,46 @@ bool FarCry5Stereo::gun_still_command(const std::string& cmd, const std::string&
     }
     if (cmd == "weaponidsplit") { m_weapon_id_split = on; persist = true; return true; }   // a gun split in 65535-index pieces told apart by its next largest piece
     if (cmd == "twohandline") { m_two_hand_line = on; persist = true; return true; }   // the two-handed hold lines the gun's hand line up with your hands
+    if (cmd == "twohandlevel") {   // on (default) | off, saved: every long gun lines up one common hand line in two hands (Stereo.h)
+        m_two_hand_level = on;
+        persist          = true;
+        spdlog::info("[Motion] twohandlevel {}", on ? fmt::format("on: every long gun in two hands lines up the common hand line, {:.1f} deg right, {:.1f} up of its barrel",
+                                                                  m_two_hand_level_ref[0].load(), m_two_hand_level_ref[1].load())
+                                                     : std::string{ "off: each gun lines up its own hand line (as before 7 Nov)" });
+        return true;
+    }
+    if (cmd == "twohandlevelref") {   // twohandlevelref right up (deg off the barrel; saved): the common hand line of twohandlevel
+        float up = m_two_hand_level_ref[1].load();
+        rest >> up;
+        if (!arg.empty()) {
+            m_two_hand_level_ref[0] = std::clamp(fv, -20.0f, 20.0f);
+            m_two_hand_level_ref[1] = std::clamp(up, -20.0f, 25.0f);
+        }
+        persist = true;
+        spdlog::info("[Motion] twohandlevelref {:.2f} {:.2f}: the common hand line {:.2f} deg right, {:.2f} up of the barrel", m_two_hand_level_ref[0].load(),
+                     m_two_hand_level_ref[1].load(), m_two_hand_level_ref[0].load(), m_two_hand_level_ref[1].load());
+        return true;
+    }
+    if (cmd == "gunstocklearn") { gunstock_learn_start(); return true; }   // test / F11 button, not saved: the 8 s gunstock calibration window (Stereo.h)
+    if (cmd == "onehandmatch") {   // on (default) | off [P Y], saved: every long gun in one hand along one fixed line, P up and Y right (deg) of the weapon controller
+        m_ohm_on = on;
+        if (!on) m_ohm_cur_ok = false;
+        float p = 0.0f, y = 0.0f;
+        if (rest >> p >> y; std::isfinite(p) && std::isfinite(y) && !rest.fail()) {
+            m_ohm_p = std::clamp(p, -45.0f, 30.0f);
+            m_ohm_y = std::clamp(y, -20.0f, 20.0f);
+        }
+        persist = true;
+        spdlog::info("[Motion] Angle correction for two handed weapons (gunstock calibration), onehandmatch {}", on ? one_hand_match_text() : std::string{ "off: the one-hand hold as before 8 Nov" });
+        return true;
+    }
+    if (cmd == "weaponaudit") { m_weapon_audit = true; return true; }   // test: one [Audit] line for the gun in hand (gun_still_audit)
+    if (cmd == "gunposebuiltin") {   // on (default) | off, saved, read at start: guns not in fc5vr_gunposes.txt use the built-in poses (FarCry5GunPoseTable.h)
+        m_gun_builtin = on;
+        persist       = true;
+        spdlog::info("[Motion] gunposebuiltin {} (from the next launch)", on ? "on: a gun not learnt yet starts from its built-in pose, grip point and right hand" : "off: each gun learnt in play only");
+        return true;
+    }
     if (cmd == "gripnearweapon") {   // on (default) | off: a press of the left grip near the weapon in hand is the weapon's, never the D-pad modifier
         m_grip_near_weapon = on;
         if (!on) m_other_near = false;
@@ -1759,6 +2123,41 @@ void FarCry5Stereo::gun_still_load()
         ++n;
     }
     if (n || grips) spdlog::info("[Motion] gunstill: {} weapons' poses and {} grip points read from fc5vr_gunposes.txt", n, grips);
+    // gunposebuiltin (Stereo.h): what the file does not have, from the built-in table (measured for every weapon in the simulator).
+    if (m_gun_builtin.load()) {
+        int bp = 0, bg = 0, bh = 0;
+        for (const auto& e : fc5::gunposes::kTable) {
+            if (e.has_pose && !m_gst->refs.contains(e.sig)) {
+                auto& r         = m_gst->refs[e.sig];
+                r.pose          = Pose{ glm::normalize(glm::quat{ e.q[3], e.q[0], e.q[1], e.q[2] }), glm::vec3{ e.t[0], e.t[1], e.t[2] } };
+                r.hand          = glm::vec3{ e.lh[0], e.lh[1], e.lh[2] };
+                r.hand_ok       = e.lh_ok;
+                r.first         = r.pose;
+                r.first_hand    = r.hand;
+                r.first_hand_ok = r.hand_ok;
+                r.ok = r.settled = r.first_ok = true;
+                r.builtin       = true;
+                ++bp;
+            }
+            if (e.has_grip) {
+                std::lock_guard _{ m_weapon_cal_mtx };
+                if (auto& gh = m_grip_hand[e.sig]; !gh.ok) {
+                    gh.c  = glm::vec3{ e.grip[0], e.grip[1], e.grip[2] };
+                    gh.n  = 90;
+                    gh.ok = true;
+                    ++bg;
+                }
+            }
+            if (e.has_rhand) {
+                if (auto& ax = m_gst->axes[e.sig]; ax.n < 90) {
+                    ax.h = glm::vec3{ e.rh[0], e.rh[1], e.rh[2] };
+                    ax.n = 90;
+                    ++bh;
+                }
+            }
+        }
+        if (bp || bg || bh) spdlog::info("[Motion] gunposebuiltin: {} poses, {} grip points and {} right hands from the built-in table (guns not in fc5vr_gunposes.txt)", bp, bg, bh);
+    }
 }
 
 void FarCry5Stereo::gun_still_save()
@@ -1767,7 +2166,7 @@ void FarCry5Stereo::gun_still_save()
     std::ofstream f{ fc5::mod_file("fc5vr_gunposes.txt"), std::ios::trunc };
     int           n = 0;
     for (const auto& [sig, r] : m_gst->refs) {
-        if (!r.first_ok) continue;
+        if (!r.first_ok || r.builtin) continue;   // gunposebuiltin: a built-in pose stays the table's (a later build's table reaches it)
         f << sig << ' ' << r.first.t.x << ' ' << r.first.t.y << ' ' << r.first.t.z << ' ' << r.first.r.x << ' ' << r.first.r.y << ' ' << r.first.r.z << ' ' << r.first.r.w << ' '
           << r.first_hand.x << ' ' << r.first_hand.y << ' ' << r.first_hand.z << ' ' << (r.first_hand_ok ? 1 : 0) << '\n';
         ++n;

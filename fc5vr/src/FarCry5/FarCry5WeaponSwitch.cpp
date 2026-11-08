@@ -140,9 +140,11 @@ void FarCry5Stereo::weapon_switch_frame(uint32_t frame_sig)
             // shoulderwheel: the weapon the wheel spot being picked gave before, when known; never the latest held otherwise (it may be the
             // sidearm, which the shoulder never brings).
             w.guess = fc5::gesture::shoulder_pick_target();
-            if (w.guess == 0) {
+            // slotforget (author 7 Nov 20:36, wrong models on shoulder switches): with shoulderwheel the slot's own weapon or nothing; what a
+            // switch from this weapon brought last time may be another shoulder's slot, or a weapon swapped for one picked up since.
+            if (w.guess == 0 && (side || !fc5::gesture::shoulder_wheel_on())) {
                 if (auto it = w.next.find(w.old_sig); it != w.next.end()) w.guess = it->second;
-                else if (side || !fc5::gesture::shoulder_wheel_on())
+                else
                     for (uint32_t r : w.recent)
                         if (r != w.old_sig) { w.guess = r; break; }
             }

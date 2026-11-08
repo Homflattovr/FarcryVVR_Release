@@ -382,7 +382,7 @@ private:
     std::unordered_map<ID3D11Resource*, ObjConsts>   m_obj_consts;
     std::unordered_map<ID3D11Resource*, std::vector<float>> m_bone_data;   // whole skinning palettes (m_keep_bones)
     std::atomic<bool>  m_keep_bones{ false };
-    struct LayoutElem { std::string semantic; UINT index{ 0 }; DXGI_FORMAT format{}; UINT slot{ 0 }; UINT offset{ 0 }; };
+    struct LayoutElem { std::string semantic; UINT index{ 0 }; DXGI_FORMAT format{}; UINT slot{ 0 }; UINT offset{ 0 }; UINT inst{ 0 }; };   // inst: D3D11_INPUT_PER_INSTANCE_DATA (weaponcache)
     std::unordered_map<ID3D11InputLayout*, std::vector<LayoutElem>> m_layouts{};
     safetyhook::InlineHook m_create_il_hook{};
     safetyhook::InlineHook m_create_tex2d_hook{};   // padglyphs (FarCry5PadGlyph.cpp)
@@ -1268,6 +1268,10 @@ private:
     void               popup_watch(int dx);
     int                m_no_player_frames{ 0 };
     int                m_player_frames{ 0 };   // consecutive frames with a player camera
+    // menufastback (author 8 Nov 10:34):
+    // back to 3D once the player camera and the first-person pass have been there together for 10 frames.
+    std::atomic<bool>  m_menu_fast_back{ true };
+    int                m_menu_fp_frames{ 0 };  // consecutive frames with a player camera and the first-person (weapon) pass
 
 public:
     bool virtual_pad_active() const { return m_use_vigem.load() && m_pad != nullptr && !m_pad_failed; }
@@ -1519,6 +1523,12 @@ public:
     bool                 throwable_idle_part(UINT count, UINT start, INT base) const;   // FarCry5Throwable.cpp: a draw of the last frame before the throw (the gun)
     bool                 holster_has_copy(uint32_t sig);              // that weapon recorded (shoulderinstant can draw it)
     bool                 holster_records() const;                     // weapons are recorded (the sidearm, or shoulderinstant)
+    // weaponcache (FarCry5Holster.cpp): each weapon's copy kept on disk (bin\fc5vr_weaponcopies), read at the next start so the sling and the hip
+    // show it at once; the last main weapon and sidearm known from the start, checked against the game's inventory.
+    void                 holster_cache_frame();                       // once per frame at holster_frame_end: read, make, check, save
+    int                  holster_cache_make(uint32_t sig, const std::vector<uint8_t>& file, std::string& why);   // 1 made, 0 not yet (retry), -1 never
+    bool                 holster_cache_save_begin(uint32_t sig);      // a save of that recorded weapon started (false: nothing to save, or not keepable)
+    void                 holster_cache_save_step();                   // the save under way, one step per frame
     void                 draw_holster_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint);
     int                  gun_still_handgun(uint32_t sig) const;       // FarCry5GunStill.cpp: 1 handgun, 0 not, -1 not measured
     struct ThrowableState;
@@ -1579,13 +1589,22 @@ public:
     BoneMapState*        m_bm{ nullptr };
     void                 bonemap_note(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, int how);   // a weapon-pass draw (how: 0 drawn, 1 hidden arms, 2 indirect)
     void                 bonemap_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* eye);                        // after the overlays
+    const void*          bonemap_scan(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, bool skinned, float scale);    // a draw's vertices read once (FarCry5BoneMap.cpp)
+    int                  bonemap_identify(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, bool indirect, int& alts);  // the bound draw's kDraws index (armik)
+    // armik, armcensus (FarCry5ArmIkDraw.cpp; research\2026-11-08_fullbody_ik.md): the arms drawn from the shoulder to the hand the mod places.
+    struct ArmIkState;
+    ArmIkState*          m_ak{ nullptr };
+    // how: 0 a hand draw that goes ahead (gloves, bare hands), 1 an arm or sleeve draw the mod hides, 2 clothing glovemesh hides.
+    // true: its palette was moved (1, 2: draw it instead of hiding it).
+    bool                 armik_draw(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, int how);
+    bool                 hands_cb_update(ID3D11DeviceContext* ctx, const std::vector<float>& bones);   // the stand-in palette rewritten, or swapped in
     // wristammo (FarCry5WristAmmo.cpp; author 5 Nov): the rounds in the gun / what it holds / what is left, under the weapon hand's wrist.
     struct WristAmmoState;
     WristAmmoState*      m_wa{ nullptr };
     void                 wrist_ammo_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* eye);                     // after the overlays
     bool                 wrist_ammo_smooth(ID3D11DeviceContext* ctx, ID3D11Texture2D* eye, float cx, float cy, float pu, const std::string& a,
                                            const std::string& b, const std::string& t, int first, bool none_left);   // wristammostyle smooth
-    std::vector<float>   m_bm_pal;              // the palette hands_cb_swap put in m_hand_standin (bonemap on)
+    std::vector<float>   m_bm_pal;              // the palette hands_cb_swap put in m_hand_standin (bonemap or armik on)
     int                  m_bm_pal_frame{ -1 };
     void                 reload_mag_frame(uint32_t sig);
     void                 reload_hand_snap(glm::mat3& rot, glm::vec3& pos);   // reloadhandsnap: the free controller's pose for drawing its hand (drawn world)
@@ -1725,6 +1744,8 @@ public:
     std::string          game_seat_text() const;   // vehdrivegun: the game's seat, driver's seat and vehicle entity (log only)
     VehSeatRec         m_vsh_rec[4]{};          // by frame: the camera in the axes of the Vehicle_ draw nearest the seat (or the largest)
     glm::vec3          m_vsh_seat{ 0.0f };      // the learnt seat (the camera in the model's axes)
+    UINT               m_vsh_count{ 0 };        // vehwheels (FarCry5VehHands.cpp): the learnt seat's vehicle model (its body draw's index count; 0 none)
+    int                m_vsh_learn_frame{ -1000 };   // and the frame it was learnt
     bool               m_vsh_valid{ false }, m_vsh_driving{ false }, m_vsh_near{ false }, m_vsh_kept_said{ false };
     std::atomic<float> m_vsh_side{ 99.0f };     // drivequadseat (FarCry5Drive.cpp): the learnt seat's sideways place (m_vsh_seat.x; 99 not learnt), for the pad thread
     float              m_vsh_off_max{ 0.0f };   // the camera's largest distance from the seat while held (log)
@@ -1991,6 +2012,9 @@ private:
         glm::vec3 draw_shift{ 0.0f };         // gunanchor: added to the drawn gun and hands (eyes' base minus game camera)
         glm::vec3 muzzle_drawn{ 0.0f };       // the drawn muzzle (barrel_origin + draw_shift): scope lens test, tracers
         float     sight_dist{ 0.0f };         // sightdepth: the eased distance the red dot, its ring and the scope picture are put at (0 = off: each its own raw hit)
+        bool      arm_body_valid{ false };    // armik (FarCry5ArmIkDraw.cpp): the body under the head, world: the point between the shoulders and
+        glm::vec3 arm_mid_world{ 0.0f };      // the body's axes (right, up, back; level, the gestures' body heading)
+        glm::vec3 arm_right_world{ 1.0f, 0.0f, 0.0f }, arm_up_world{ 0.0f, 0.0f, 1.0f }, arm_back_world{ 0.0f, -1.0f, 0.0f };
     };
     glm::mat4          m_hand_ref{ 1.0f };    // sling: the weapon controller itself, reference space
     bool               m_slung_was{ false };  // sling: last frame's state (the weapon smoothing restarts at a change)
@@ -2042,6 +2066,25 @@ private:
     // looking down, and for a second the eyes were 55 deg below the camera the game culls with, every frame past its view): settlepitch's
     // Extended View pitch during the exit animation too, so the culled camera looks up / down with the head while getting out.
     std::atomic<bool>  m_exit_pitch{ true };
+    // exityaw on|off (default on since author 7 Nov 19:59Z, saved; F11 Comfort > Cinematics and vehicles, next to exitpitch; author 7 Nov 14:11, research\2026-11-07_camera_culling_transitions.md T2 / F2): during the exit animation the
+    // head's yaw too goes to the game through Extended View (up to splitevmax handed), so the camera the game culls with stays on the head
+    // while the animation swings it (up to 261 deg in the author's logs). The exit's follow snaps and its end read the animation's camera less
+    // that offset (veh_anim_cam_yaw); once the animation is over firesplit carries on from the offset while the aim comes back (as wheellook).
+    // One "[Vehicle] exityaw" line at each exit's start and end. Off: as before 7 Nov (pitch only, exitpitch).
+    std::atomic<bool>  m_exit_yaw_ev{ true };
+    std::atomic<bool>  m_exy_active{ false };      // exityaw: handing the yaw now
+    std::atomic<float> m_exy_oy{ 0.0f };           // exityaw: the yaw offset the current camera carries (radians)
+    int                m_exy_n{ 0 }, m_exy_clamped{ 0 };
+    float              m_exy_max{ 0.0f };
+    float              veh_anim_cam_yaw() const;   // the game camera's yaw less exityaw's offset (the exit animation's own camera)
+    // cullpitch N (degrees 0-10, default 0 = off, saved; F11 Comfort > Cinematics and vehicles; research\2026-11-07_camera_culling_transitions.md F1):
+    // wherever the mod points the game's culled camera through Extended View (firesplit, wheellook, the head look in vehicles, settlepitch,
+    // exitpitch / exityaw), it aims N deg below the head. The game's view reaches 58 deg down and 64.3 up from its centre, Quest 3 eyes 55 down
+    // and 44 up: only 3 deg spare at the bottom (362 of 598 headset culling episodes short there), 20 at the top; 4.5 deg evens them (7.5 / 15.8).
+    // The game's aim is read as the camera less the offset, so shots do not move. Not on foot with empty hands (the mouse aims there, no offset).
+    std::atomic<float> m_cull_pitch_deg{ 0.0f };
+    float              cull_bias() const;                              // cullpitch in radians
+    glm::vec3          cull_target(const glm::vec3& head_world) const; // the head's direction tilted cullpitch down (normalised)
     // chutelevel on|off (default on, saved; F11 Comfort > Cinematics and vehicles; author 29 Oct 10:15 playtest: bailing out of the plane,
     //). A fall held as a vehicle (chutelook) put the view on the fall's attitude: the game's
     // camera less the head look, which in a free fall points at the ground (his log: 47-53 deg down, vehpitchguard 451 times), so the
@@ -2077,6 +2120,16 @@ private:
     void               down_view_release(const char* why);
     bool               downview_command(const std::string& cmd, const std::string& arg, bool& persist);
     void               draw_downview_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint);
+    // qtehud (default on, saved; F11 Comfort > Cinematics and vehicles, under downview; author 8 Nov 11:29): with hudmarkers on, every HUD draw before the compass bar is taken for a world marker, shrunk to
+    // hudmarksize and shown where the game camera saw it. A struggle's prompts (the bear's) are drawn there too, while the game camera is
+    // the animation's (his 11:09:51 log: eyes 35 deg off it on average, worst 90, the camera pitched up), so they were tiny and out of
+    // view. While the player is knocked down (IsPawnDown, stance 4, downview's hold) or in a QTE (IsInQTE), no draw goes to the world
+    // markers: the whole HUD stays on the panel, prompts where the flat game shows them. Off: as before.
+    std::atomic<bool>  m_qte_hud{ true };
+    std::atomic<bool>  m_qte_hud_now{ false };   // set once a pair by update_qte_hud, read by hud_begin
+    uint64_t           m_qte_hud_kept{ 0 };      // marker-phase draws kept on the panel while it holds
+    std::chrono::steady_clock::time_point m_qte_hud_t0{};
+    void               update_qte_hud();          // after update_downview
     bool               m_veh_proof_mesh{ false };   // a vehicle model under the camera, or within 4 m of it, since the weapon view went
     // vehnear (author 29 Oct 15:01, headset; log 15:56:42): the truck's model origin sat 2.1 m from the seated camera, never under it, so the truck counted only once it
     // drove over 3 m/s, 4 s late, and the entry animation turned the game camera 42-84 deg away from a view kept on foot. Any vehicle
@@ -2528,6 +2581,25 @@ private:
     // red pair shown ~20 deg up and right of the enemies). Taken into the HUD, they get a copy of the game's own upload of that
     // buffer (this call's first world camera upload, before the mod's rewrite), as the flat game draws them.
     std::atomic<bool>        m_hud_prim_cam{ true };
+    // hudprimworld (default on, saved; author 8 Nov 08:55): the game's GPS route on the road is drawn with the same textured primitive shader as the
+    // detection chevrons (#4BA2D4B5 with the world vertex shader #7CFFEC1A: its first draw of 7 Nov came at 21:17:38, 7 s after he
+    // closed the map with a waypoint set), so hudprim took the route off the eye picture into the marker image, where it was shrunk
+    // to hudmarksize about its box and cut to hudmarkmax degrees: gone from the road. A chevron is one textured quad per draw (2-3
+    // draws a call on 30 Oct); the route is a strip of many points (the game's "fGPSStepLength", "Width of the GPS path"). A hudprim
+    // draw of more than this many vertices (count x instances) stays in the eye picture with the eye's own camera, like the world,
+    // and in the scope picture too. 0 = off (every hudprim draw is HUD, as before). "hudprimworld on" = 12.
+    std::atomic<int>         m_hud_prim_world_min{ 12 };
+    uint64_t                 m_hud_prim_world_n[2]{};            // hudprim draws left in the eye picture as world geometry, per eye, last second
+    bool hud_prim_is_world(UINT count, UINT instances) const
+    {
+        const int m = m_hud_prim_world_min.load();
+        return m > 0 && count != 0 && (uint64_t)count * (uint64_t)(instances ? instances : 1u) > (uint64_t)m;
+    }
+    // hudprimkind (log only, always on, at most 40 lines a session): each new kind of hudprim draw (shader, vertex count bucket,
+    // instances, topology, target format and size, depth test) once, with where it went, so a run with a waypoint set and an animal
+    // noticing the player shows what tells the route from the chevrons.
+    void hud_prim_kind_log(ID3D11DeviceContext* ctx, UINT count, UINT instances, bool world);
+    std::unordered_set<uint64_t> m_hud_prim_kinds_seen{};
     std::vector<float>       m_hud_game_cb{};                    // the game's own world camera upload of this call
     int                      m_hud_game_cb_frame{ -1 };
     ID3D11Buffer*            m_hud_prim_standin{ nullptr };
@@ -2886,6 +2958,8 @@ public:
     // shotbuzz (author 24 Oct 21:25): each of the player's shots gives the
     // hands that hold the gun one fixed pulse of their own (game thread, from the shot code; fc5::bullet).
     void shot_buzz();
+    // recoil (FarCry5Recoil.cpp): this game update's kick for the gun in hand (the weapon pass and recoilaim's shots alike).
+    bool recoil_kick_now(int frame, glm::mat3& R, glm::vec3& T);
 private:
     std::atomic<bool>    m_shot_buzz{ true };           // cmd shotbuzz on|off (saved): the fixed pulse on every shot (off: only the game's rumble)
     std::atomic<float>   m_shot_buzz_amp{ 1.0f };       // cmd shotbuzzamp A (saved, 0.1-1): its strength (1 = the controller's strongest)
@@ -3008,25 +3082,66 @@ private:
     std::unordered_map<ID3D11ComputeShader*, UINT> m_ssr_vig_cs;   // reflection passes with an edge fade -> CSSLRContextProvider slot (m_ps_mtx)
     SsrSymSaved        ssr_edge_bind(ID3D11DeviceContext* ctx);
     void               ssr_sym_restore(ID3D11DeviceContext* ctx, SsrSymSaved& s);
-    // asmlit / ssrrough (F6 shadow bugs, 7 Nov, research\2026-11-07_f6_shadow_bugs.md): for one dispatch, the pass reads a copy of
-    // its constant buffer with one or two floats changed (and, asmlit, LESS_EQUAL copies of its LESS comparison samplers).
+    // ssrrough (F6 shadow bugs, 7 Nov, research\2026-11-07_f6_shadow_bugs.md): for one dispatch, the pass reads a copy of its
+    // constant buffer with one float changed (asmlit, which also used this, was removed on 7 Nov).
     struct CbPatchCs { UINT slot{ 255 }, size{ 0 }, off[2]{ 0xFFFFFFFFu, 0xFFFFFFFFu }; };
     struct CbPatchSaved { ID3D11Buffer* cb{ nullptr }; UINT first{ 0 }, num{ 0 }, slot{ 0 }; bool on{ false }, ps{ false };
                           ID3D11SamplerState* smp[16]{}; ID3D11SamplerState* le[16]{}; UINT smp_mask{ 0 }; };
-    std::unordered_map<ID3D11ComputeShader*, CbPatchCs> m_asm_def_cs;   // resolves that read ASMLongRangeDefaultShadowFactor (m_ps_mtx)
     std::unordered_map<ID3D11ComputeShader*, CbPatchCs> m_ssr_cut_cs;   // reflection passes that read SpecularFactorCutoffThreshold (m_ps_mtx)
-    std::atomic<bool>  m_asm_lit{ false };        // asmlit: far-shadow areas with no tile drawn yet read as lit; far-edge depth ties lit
     std::atomic<float> m_ssr_rough{ 0.0f };       // ssrrough x: the reflections' SpecularFactorCutoffThreshold (0 = the game's)
-    int                m_cbp_logged[3]{};         // the game's buffer dumped once per kind (asmlit compute 0, ssrrough 1, asmlit pixel 2)
+    int                m_cbp_logged[3]{};         // the game's buffer dumped once per kind (only kind 1, ssrrough, is used)
     uint64_t           m_cbp_runs[3]{};
     float              m_cbp_val_last[3]{ -1.0f, -1.0f, -1.0f };
     ID3D11Buffer*      m_cbp_standin[3]{};        // 4096 B copies of the pass's buffer
     ID3D11Buffer*      m_cbp_val[3]{};            // 16 B: the changed value, copied into the stand-in
-    // asmlit, pixel stage (water 7 Nov): the forward shaders that sample the far-shadow atlas themselves (water, glass, particles).
-    std::unordered_map<ID3D11PixelShader*, CbPatchCs> m_asm_def_ps;   // (m_ps_mtx)
-    CbPatchSaved       m_alit_ps{};               // the draw's changed binding, restored after the draw (render thread)
     CbPatchSaved       cb_patch_bind(ID3D11DeviceContext* ctx, int kind);
     void               cb_patch_restore(ID3D11DeviceContext* ctx, CbPatchSaved& s);
+public:   // the shadow lab's copy hooks (free functions) reach it
+    // Lights and shadows lab (7 Nov, author 16:56): F11 Debug > "Lights and shadows lab (tests)", code in FarCry5ShadowLab.cpp. Every tool is off by default,
+    // not saved, and reachable by command: shadowcap, shadowcapall, passorder, shadowvals, shadowsplit 0|1|2, pairdiff <cb name> [N].
+    struct LabSaved { ID3D11Buffer* cb[2]{}; UINT first[2]{}, num[2]{}, slot[2]{ 255, 255 }; int n{ 0 }; };
+    std::atomic<bool>  m_lab_any{ false };          // any lab tool running: the one check in the hooks
+    std::atomic<bool>  m_lab_own{ false };          // the lab's own copies (not logged by passorder)
+    std::atomic<bool>  m_lab_cap_armed{ false };    // shadowcap: the next F6 / snappair also dumps the sun shadow maps
+    std::atomic<bool>  m_lab_cap_always{ false };   // shadowcapall: every F6 / snappair dumps them (about 130 MB each; stops below 25 GB free)
+    uint64_t           m_lab_cap_shot{ 0 };         // the present number of the F6 that started the dump (its probes\snapshot_<n>.bmp)
+    std::atomic<int>   m_lab_cap_state{ 0 };        // 1 waiting for a left call's first resolve, 2 waiting for the right call's
+    int                m_lab_cap_frame{ -1 };
+    std::string        m_lab_cap_last{};             // the last dump folder (menu)
+    std::atomic<int>   m_lab_order_state{ 0 };      // passorder: 1 waiting for a left call, 2 logging the pair
+    int                m_lab_order_frame{ -1 };
+    int                m_lab_order_n{ 0 };
+    void*              m_lab_order_file{ nullptr }; // FILE*
+    std::string        m_lab_order_last{};
+    std::atomic<int64_t> m_lab_vals_until{ 0 };     // shadowvals: steady-clock ms until which the values are logged
+    int                m_lab_vals_frame{ -1 }, m_lab_vals_ssr_frame{ -1 }, m_lab_vals_lines{ 0 };
+    std::atomic<int>   m_lab_split{ 0 };            // shadowsplit: 0 the game's, 1 near cascades only, 2 far shadows only
+    ID3D11Buffer*      m_lab_standin[2]{};          // 4096 B stand-ins: [0] the Viewport buffer (cb0), [1] CTileLightingBlended (cb2)
+    ID3D11Buffer*      m_lab_v3{ nullptr };          // 16 B of 3.0 (ShadowCSMLastSliceIndex)
+    ID3D11Buffer*      m_lab_v0{ nullptr };          // 16 B of 0 (a CSMSlice z row)
+    ID3D11Buffer*      m_lab_staging{ nullptr };     // 4096 B readback
+    uint64_t           m_lab_split_runs{ 0 };
+    std::string        m_lab_pd_name{};              // pairdiff: the constant buffer's name
+    std::atomic<int>   m_lab_pd_left{ 0 };          // pairs still to compare
+    int                m_lab_pd_frame[2]{ -1, -1 };
+    std::string        m_lab_pd_where[2]{};
+    std::vector<float> m_lab_pd_vals[2]{};
+    std::unordered_map<ID3D11ComputeShader*, int> m_lab_resolve{};   // 1 a sun shadow resolve (reads the far-shadow atlas, writes HalfScreenEffectsBuffer), 0 not
+    void               lab_update_any();
+    LabSaved           lab_dispatch(ID3D11DeviceContext* ctx, UINT x, UINT y, UINT z, bool indirect);
+    void               lab_restore(ID3D11DeviceContext* ctx, LabSaved& s);
+    void               lab_draw(ID3D11DeviceContext* ctx, const char* kind, UINT a, UINT b);
+    void               lab_note(ID3D11DeviceContext* ctx, const char* kind, ID3D11View* view, ID3D11Resource* dst, ID3D11Resource* src);
+    void               lab_snapshot();
+    bool               lab_command(const std::string& cmd, const std::string& arg, const std::string& line);
+    void               lab_menu(void (*hint)(const char*), void (*section)(const char*));
+    bool               lab_read_cb(ID3D11DeviceContext* ctx, int stage, UINT slot, std::vector<float>& out, UINT max_bytes = 4096);
+    void               lab_cap_resolve(ID3D11DeviceContext* ctx, ID3D11ComputeShader* cs, int eye);
+    void               lab_vals_resolve(ID3D11DeviceContext* ctx, ID3D11ComputeShader* cs, int eye);
+    void               lab_pairdiff(ID3D11DeviceContext* ctx, int stage, UINT slot, const std::string& where);
+    bool               lab_order_frame();
+    bool               lab_is_resolve(ID3D11ComputeShader* cs);
+private:
     uint64_t           m_smv_ssr_runs{ 0 };
     std::atomic<int>   m_ssr_ptr_log{ 0 };
     std::atomic<int>   m_smv_trace{ 0 };   // smvtrace N (research): the sun-shadow resolve's history and outputs, per dispatch
@@ -3321,6 +3436,80 @@ private:
     bool               gun_still_hand_line(glm::vec3& g);   // twohandline: the game's weapon hand -> left hand direction for the held gun, game-camera axes
     std::atomic<bool>  m_two_hand_line{ true };   // cmd twohandline: the two-handed hold lines the gun's own hand line up with your hands (off: its barrel)
     bool               m_two_hand_line_said = false;   // logged once per two-handed hold
+    glm::mat3          m_pump_rel{ 1.0f };             // reloadpumpgrip: the two-handed gun's turn in the weapon hand's controller axes, before a pump stroke
+    bool               m_pump_rel_ok = false;
+    int                m_pump_aim_frames = 0;          // reloadpumpgrip: frames of this stroke with the aim kept (logged at its end)
+    float              m_pump_aim_max = 0.0f;          // ... and how far the hands' line went from it (deg)
+    // twohandlevel (author 7 Nov 20:46, all-weapons pass; saved, default on; F11 Controls under twohandline): one hand holds every gun with its sight line (or barrel) along the
+    // controller, but two hands lined up each gun's own hand line (the game's right hand -> left hand), which sits 0-19 deg off the barrel
+    // depending on the gun, so each gun tilted by its own amount when the left hand took it. On: every long gun (rifles, SMGs, shotguns,
+    // marksman rifles, LMGs by the game's data, two-handed) lines up one common hand line instead, twohandlevelref right up (deg off the
+    // barrel; default the AR-C 57819's own, so the AR-C does not change): each gun sits at the same angle in two hands against one hand.
+    // Handguns, machine pistols, bows, launchers, melee weapons keep their own line. Off: each gun's own line (as before 7 Nov).
+    std::atomic<bool>  m_two_hand_level{ true };
+    std::atomic<float> m_two_hand_level_ref[2]{ 0.6f, 16.2f };   // the AR-C's line from the author's fc5vr_gunposes.txt (MP40 0.1 up, .308 2.3, M60 3.3, M133 6.5, M249 9.8, AK 12.3, MP5 18.9)
+    std::string        gun_still_hand_line_text();   // for the twohandline log line: which line the hold used
+    // onehandmatch, "Angle correction for two handed weapons (gunstock calibration)" in F11 (author 8 Nov 09:37) (author 8 Nov 09:13; saved, default on; F11 Controls under
+    // twohandlevel). In two hands a long gun follows the line between the controllers; in one hand it followed the weapon controller's -Z (grip
+    // pitch in), and a rifle's two-handed wrist points that controller well above the barrel, so at the let-go the gun swung up 25-40 deg.
+    // On: in one hand every long gun is turned about the grip point so its own barrel (its one-hand hold, axes or pose) lies on ONE fixed
+    // direction, P deg up and Y deg right of the weapon controller's -Z (saved as onehandmatch on P Y; set only in F11, never learnt in play:
+    // Author 09:30 the one-hand angle to change after a two-handed hold), pitch and yaw only, at most 45 deg; every long gun so
+    // sits at the same one-handed angle. The switch between the two-handed hold and one hand is eased over about 0.15 s (the let-go and the grab).
+    // Default -25 0: the two-handed barrel against the weapon hand is not in the author's logs; his let-go swing was 25-40 deg (video, 8 Nov 09:13)
+    // and the simulator's two-handed hold with the left hand on the drawn fore-end put the barrel 20-24 deg under the controller (AR-C -20.4,
+    // M133 -23.9, M249 -24.1; all-weapons pass). Handguns, machine pistols, bows, launchers, melee weapons: unchanged. The gun's pose, grip and
+    // right-hand learning read the game's own camera-space pose and are not affected. Off: the one-hand hold as before 8 Nov.
+    static constexpr float kOhmDefaultP = -25.0f, kOhmDefaultY = 0.0f;
+    std::atomic<bool>  m_ohm_on{ true };
+    std::atomic<float> m_ohm_p{ kOhmDefaultP }, m_ohm_y{ kOhmDefaultY };   // pitch (up +) and yaw (right +) against the weapon controller's -Z, deg
+    std::atomic<float> m_ohm_last_x{ 0.0f };               // readout: at the last let-go, the raw one-hand barrel's pitch above the line
+    std::atomic<float> m_ohm_last_turn{ 0.0f };            // readout: the turn applied in one hand now, deg
+    glm::quat          m_ohm_cur{ 1.0f, 0.0f, 0.0f, 0.0f };   // the turn applied (one hand) or the hold's (two hands), weapon controller's axes
+    bool               m_ohm_cur_ok = false, m_ohm_was_two = false;
+    uint32_t           m_ohm_sig    = 0;
+    std::chrono::steady_clock::time_point m_ohm_t{}, m_ohm_two_t0{};
+    void               one_hand_match(glm::mat4& k, const glm::mat4& k_ctrl, bool can, bool two);
+    // reloadzonesfollow (author 8 Nov 20:18: the gunstock calibration): the manual reload measures its
+    // gun-attached points (well, seat, handle, bolt, slide, pump, breech) in the gun's frame as DRAWN (m_mo.ctrl_rot_world, from the final k:
+    // after the two-handed hold, onehandmatch, twohandkeep), but its pad poll placed them with the raw weapon controller. draw_turn: the drawn
+    // gun's turn against the weapon controller's own axes (grip pitch undone, so the measured and saved geometry keep their meaning), set at
+    // the end of update_motion's weapon frame; false when there is none (one hand, onehandmatch off: the poll's frame is bit for bit the raw
+    // controller's, as before) or the weapon is slung, kept or a bow (their own paths). one_hand_drawn: k with the last applied one-hand turn,
+    // for the press tests made before one_hand_match runs (the fore-end grab point, gripnearweapon).
+    std::mutex         m_draw_turn_mtx;
+    glm::mat3          m_draw_turn{ 1.0f };
+    bool               m_draw_turn_on = false;
+    bool               draw_turn(glm::mat3& E);
+    glm::mat4          one_hand_drawn(const glm::mat4& k) const;
+    // gunstocklearn (author 8 Nov 10:33: click, hold a two-handed weapon and aim with it, after 8 s the
+    // angle correction is saved): an 8 s window; from 1.5 s on, each frame a long gun is held in two hands (not firing, not reloading) gives a
+    // sample of its drawn barrel in the weapon controller's axes; at 8 s, with 2 s of samples or more, onehandmatch P Y become their mean (saved).
+    // The only way the value is learnt (nothing in play). Position: the two-handed hold turns the gun about the weapon controller's point, as
+    // the one-hand hold does, so the gun's place is the same in both by construction: only the angle is learnt.
+    std::atomic<bool>  m_gsl_on{ false };
+    std::chrono::steady_clock::time_point m_gsl_t0{};
+    std::vector<glm::vec3> m_gsl_samples;
+    float              m_gsl_good_s = 0.0f;
+    std::mutex         m_gsl_mtx;
+    std::string        m_gsl_msg;   // the last result, for F11
+    void               gunstock_learn_start();
+    void               gunstock_learn_finish();
+    std::string        gunstock_learn_text();
+    void               gunstock_tick();   // a light buzz on the weapon hand's controller (Stereo.cpp)
+    std::string        one_hand_match_text();
+    // weaponaudit (test, not saved; all-weapons pass 7 Nov): one [Audit] line for the gun in hand: how it is held (axes, sight line, grip
+    // point, the game's right and left hands on it, its hand line), and with two hands how far the hold turned it from the one-hand pose.
+    std::atomic<bool>  m_weapon_audit{ false };
+    glm::mat4          m_aud_kc{ 1.0f }, m_aud_k{ 1.0f };   // this frame's weapon controller (grip pitch in) and the weapon's frame after the two-handed hold
+    glm::vec3          m_aud_other{ 0.0f };                 // the other controller, same space
+    int                m_aud_frame{ -1 };
+    bool               m_aud_two{ false }, m_aud_other_ok{ false };
+    void               gun_still_audit(uint32_t sig, bool axes_hold, bool melee_hold);
+    // gunposebuiltin (saved, default on; all-weapons pass 7 Nov, author 20:46): each gun's standing pose, grip point and the game's right hand on it, measured for every weapon in the simulator
+    // (FarCry5GunPoseTable.h), used for a gun bin\fc5vr_gunposes.txt does not have yet: the first draw of each gun sits in the hand at once
+    // instead of 19-25 cm off it for 1-2 s until measured. Read at start (a change applies from the next launch).
+    std::atomic<bool>  m_gun_builtin{ true };
     void               gun_still_first_draw();                    // probe: the first weapon-pass draw of a frame
     void               gun_still_forget();                        // gunstillreset, F11 Comfort button
     void               gun_still_load();                          // fc5vr_gunposes.txt: each weapon's first learned pose, across sessions
@@ -3637,6 +3826,9 @@ private:
     // gm: path B's arm mesh (its slots' rest-pose centres; nullptr for path A, which takes path B's move of that side this frame).
     void               veh_hands_place(ID3D11DeviceContext* ctx, std::vector<float>& pal, int nslots, const int8_t* slot_side, const int palm[2], const glm::vec3 pivot[2],
                                        const glm::vec3* fore, UINT count, UINT start, INT base, const GloveMesh* gm = nullptr, float scale = 0.0f);
+    // drivewheelscan (test; FarCry5VehHands.cpp): from vehicle_probe, each Vehicle_ draw within 1.5 m of the camera while the scan runs,
+    // logged with its place and turn in the vehicle's axes, to find the steering wheel's own draw (or its bone).
+    void               veh_wheel_scan(ID3D11DeviceContext* ctx, const float* f, UINT count, const glm::vec3& rel);
     std::atomic<bool>  m_dh_grip[2]{};          // drive_poll: the raw grips by physical side (0 right, 1 left)
     std::atomic<bool>  m_dh_held[2]{};          // drive_poll: the gesture drive (drive on) holds its control with that hand
     // drivehandsdirect: the bare arm's indirect draw (veh_hands_draw, path B) drawn instead as a direct draw of one instance with the counts

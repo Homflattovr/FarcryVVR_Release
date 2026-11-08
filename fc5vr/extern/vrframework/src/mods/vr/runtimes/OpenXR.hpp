@@ -39,6 +39,7 @@ struct OpenXR final : public VRRuntime {
     // headsetrecenter (FC5): the runtime's own recenter (Meta button held, Virtual Desktop's recenter) moves its LOCAL space;
     // how many such changes were announced and the time the last one takes effect, for the mod's recentre to follow it.
     inline static std::atomic<uint32_t> s_fc5_local_space_changes{0};
+    inline static std::atomic<uint32_t> s_fc5_vismask_changes{0};   // hidmask: XrEventDataVisibilityMaskChangedKHR seen (Far Cry 5 re-reads the hidden area)
     inline static std::atomic<int64_t>  s_fc5_local_space_change_time{0};
     inline static std::chrono::steady_clock::time_point s_fc5_last_wait_return{};
 

@@ -31,6 +31,8 @@ float4 main(float2 p : POSITION) : SV_Position { return float4(p, DEPTH_Z, 1.0);
         std::mutex             g_mtx;   // the triangles (fetch on any thread, stamp on the render thread)
         std::vector<XrVector2f> g_tri[2];   // per eye: the hidden triangles' corners, three per triangle, in tangent units (z = -1 plane)
         bool                   g_have = false;
+        bool                   g_refetch = false;            // a changed hidden area to read again
+        std::atomic<uint32_t>  g_gen{ 1 };                   // mesh generation: the eye buffers are rebuilt when it moves
         int                    g_tries = 0;
         bool                   g_no_ext_logged = false;
         std::chrono::steady_clock::time_point g_next_try{};
@@ -46,6 +48,7 @@ float4 main(float2 p : POSITION) : SV_Position { return float4(p, DEPTH_Z, 1.0);
         {
             ID3D11Buffer* vb = nullptr;
             UINT          count = 0;
+            uint32_t      gen = 0;
             float         tan[4]{};
             float         hidden = 0.0f;   // share of the eye image (0-1)
         };
@@ -114,10 +117,11 @@ float4 main(float2 p : POSITION) : SV_Position { return float4(p, DEPTH_Z, 1.0);
         bool build(ID3D11Device* dev, int eye, const float tan[4])
         {
             EyeVb& e = g_eye[eye];
-            bool same = e.vb != nullptr;
+            bool same = e.vb != nullptr && e.gen == g_gen.load();
             for (int k = 0; k < 4 && same; ++k) same = std::abs(e.tan[k] - tan[k]) < 1e-6f;
             if (same) return true;
             if (e.vb) { e.vb->Release(); e.vb = nullptr; e.count = 0; }
+            e.gen = g_gen.load();
             std::vector<float> v;
             {
                 std::lock_guard _{ g_mtx };
@@ -173,7 +177,7 @@ float4 main(float2 p : POSITION) : SV_Position { return float4(p, DEPTH_Z, 1.0);
     {
         {
             std::lock_guard _{ g_mtx };
-            if (g_have) return;
+            if (g_have && !g_refetch) return;
         }
         if (!has_ext) {
             if (!g_no_ext_logged) {
@@ -225,6 +229,8 @@ float4 main(float2 p : POSITION) : SV_Position { return float4(p, DEPTH_Z, 1.0);
         g_tri[0] = std::move(tri[0]);
         g_tri[1] = std::move(tri[1]);
         g_have   = !g_tri[0].empty() && !g_tri[1].empty();
+        g_refetch = false;
+        g_gen++;
         spdlog::info("[HidMask] hidden-area mesh from the runtime: left {} triangles, right {} triangles", g_tri[0].size() / 3, g_tri[1].size() / 3);
     }
 
@@ -232,6 +238,21 @@ float4 main(float2 p : POSITION) : SV_Position { return float4(p, DEPTH_Z, 1.0);
     {
         std::lock_guard _{ g_mtx };
         return g_have;
+    }
+
+    void refetch()
+    {
+        std::lock_guard _{ g_mtx };
+        g_refetch    = true;
+        g_tries      = 0;
+        g_next_try   = {};
+        spdlog::info("[HidMask] the runtime reports a changed hidden area: reading it again");
+    }
+
+    bool wants_fetch()
+    {
+        std::lock_guard _{ g_mtx };
+        return !g_have || g_refetch;
     }
 
     bool stamp(ID3D11DeviceContext* ctx, ID3D11DepthStencilView* dsv, int eye, const float tangents[4], float z)
