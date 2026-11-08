@@ -162,8 +162,8 @@ each step plays the game's own reload sound, and the ammo count shows under your
 - **Windows 10 or 11**, 64-bit.
 - **An NVIDIA RTX graphics card** (the mod uses DLSS). Other cards can try FSR instead: see *Optional: FSR instead of DLSS* below.
 - **A PC VR headset with an OpenXR runtime set as the system default.** Tested: Meta Quest 3 with Virtual Desktop and
-  VDXR (Virtual Desktop Streamer > OpenXR Runtime: VDXR). Quest Link / Air Link, SteamVR, Pimax Play and others
-  should work but are untested. The launcher has presets for Quest 2, 3, 3S and Pro, Valve Index, Vive Pro 2,
+  VDXR (Virtual Desktop Streamer > OpenXR Runtime: VDXR). Quest Link / Air Link, Pimax Play and other OpenXR
+  runtimes should work but are untested; avoid SteamVR. The launcher has presets for Quest 2, 3, 3S and Pro, Valve Index, Vive Pro 2,
   Reverb G2, Bigscreen Beyond and Pimax Crystal.
 - **The ViGEmBus driver** (the controllers reach the game as a virtual Xbox pad):
   [ViGEmBus 1.22.0](https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe)
@@ -207,6 +207,12 @@ motion vectors do not work: use OFXR without them, or pick DLSS.
 ---
 
 ## Install
+
+> **Before you start**
+> - **Play with the basic (default) outfit** until the mod works, and only then switch to another one. Other outfits
+>   can leave the hands missing or wrong.
+> - **Avoid SteamVR.** Use your headset's own OpenXR runtime instead (VDXR for Virtual Desktop, Meta Quest Link, or
+>   Pimax Play).
 
 1. **Install the requirements above** (ViGEmBus, your OpenXR runtime as the default). We strongly recommend
    [OFXR Bridge](https://github.com/tig3rmast3r/OFXR-Bridge/releases) and a high-bitrate codec (H.264+ at 300-400 Mbps

@@ -4,11 +4,17 @@ This is an early alpha: expect rough edges (see KNOWN_ISSUES.txt).
 It works with the Steam copy and the Ubisoft Connect copy of Far Cry 5. A copy bought on the Epic Games Store
 runs through Ubisoft Connect too: follow the Ubisoft Connect steps for it.
 
+BEFORE YOU START
+- Play with the basic (default) outfit until the mod works, and only then switch to another one. Other outfits
+  can leave the hands missing or wrong.
+- Avoid SteamVR. Use your headset's own OpenXR runtime instead (VDXR for Virtual Desktop, Meta Quest Link, or
+  Pimax Play).
+
 1. INSTALL BEFORE
 - ViGEmBus driver (the controllers reach the game as a virtual Xbox pad):
   https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe
 - An OpenXR runtime set as the system default. Tested: Quest 3 with Virtual Desktop and VDXR
-  (Virtual Desktop Streamer > OpenXR Runtime: VDXR). Quest Link, SteamVR and the others should work but are untested.
+  (Virtual Desktop Streamer > OpenXR Runtime: VDXR). Quest Link and other OpenXR runtimes should work but are untested; avoid SteamVR.
 - An NVIDIA RTX graphics card (the mod uses DLSS). Other cards can try FSR instead: see "Upscaler" in 4.
 
 STRONGLY RECOMMENDED (foliage: trees and grass judder at a low frame rate and smear in a compressed stream)
