@@ -17,6 +17,9 @@ namespace fc5::steertune
     void note_poll(float lx);
     // steerstep, steerfind, steersweep: the stick X and RT to hand the game now (both pad paths); false when none runs.
     bool step_value(float& x, int& rt);
+    // driveautoturn (author 9 Nov 11:09): the left stick full left for ms, full right for ms, centred; no throttle. FarCry5VehHands.cpp calls it once a
+    // drive when the car's wheel is not known yet, so the game's hands turn it and drivehandsmodel learns it at once.
+    void auto_turn(int ms);
     // F11 Experimental > Steering lab (test).
     void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint);
 }

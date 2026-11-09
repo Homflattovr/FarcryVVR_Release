@@ -41,7 +41,7 @@ namespace
     using clock = std::chrono::steady_clock;
     int64_t now_ns() { return clock::now().time_since_epoch().count(); }
 
-    std::atomic<bool>  g_on{ false };      // recoil (saved; off until the author has judged it in the headset)
+    std::atomic<bool>  g_on{ true };       // recoil (saved; default on for Beta 0.4.6, author 9 Nov 11:34)
     std::atomic<bool>  g_buzz{ true };     // recoilbuzz (saved)
     std::atomic<bool>  g_aim{ true };      // recoilaim (saved): the shots follow the kicked gun
     std::atomic<bool>  g_log{ false };     // recoillog (not saved)

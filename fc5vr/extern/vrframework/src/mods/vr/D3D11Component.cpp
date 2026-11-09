@@ -1,6 +1,9 @@
 #include <d3dcompiler.h>
 #include <d3d11_1.h>
+#include <cstring>
 #include <unordered_map>
+#include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <ModSettings.h>
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -23,6 +26,11 @@ void tag_xr_image(int eye, ID3D11Texture2D* image);
 #endif
 
 namespace vrmod {
+namespace {
+bool fc5_menu_panel(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* src, const float (&consts)[2][20], ID3D11Texture2D** out0, ID3D11Texture2D** out1);
+ComPtr<ID3D11Texture2D> g_fc5_menu_src{};   // menuproj: the last image sent to the left eye, held (the flat screen's picture while flat)
+}
+
 class DX11StateBackup {
 public:
     DX11StateBackup(ID3D11DeviceContext* context) {
@@ -237,6 +245,9 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
     auto runtime = vr->get_runtime();
     bool is_left_eye_frame = vr->m_presenter_frame_count % 2 == vr->m_left_eye_interval;
     bool is_right_eye_frame = !is_left_eye_frame;
+    // menuproj: while the flat screen shows, each eye swapchain gets one image per headset frame, the panel drawn right before
+    // xrEndFrame; the usual eye copies are skipped (a second acquire of the same swapchain in one frame hung OFXR's layer, 9 Nov 11:46).
+    const bool fc5_menu_proj_frame = runtime->is_openxr() && runtimes::OpenXR::s_fc5_menu_proj.load() && ModSettings::showFlatScreenDisplay();
 
     // Duplicate frames can sometimes cause the UI to get stuck on the screen.
     // and can lock up the compositor.
@@ -307,7 +318,9 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
         if (runtime->is_openxr() && runtime->ready()) {
             LOG_VERBOSE("Copying left eye");
             // Far Cry 5 DLSS upscaling: the eye image composed at the eye's size replaces the back buffer.
-            m_openxr.copy(0, vr->m_fc5_eye_override ? vr->m_fc5_eye_override : (ID3D11Texture2D*)copy_from_tex.Get());
+            if (!fc5_menu_proj_frame) m_openxr.copy(0, vr->m_fc5_eye_override ? vr->m_fc5_eye_override : (ID3D11Texture2D*)copy_from_tex.Get());
+            // Never the swap chain's own back buffer: a reference held on it would make the game's ResizeBuffers fail.
+            g_fc5_menu_src = vr->m_fc5_eye_override ? vr->m_fc5_eye_override : backbufferIs8Bit ? m_left_eye_tex.Get() : (ID3D11Texture2D*)copy_from_tex.Get();
             {
                 // Bring-up probe (Far Cry 5): the centre pixel of the game image and of what goes to the left eye.
                 static auto last = std::chrono::steady_clock::now();
@@ -334,7 +347,7 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
                                  backbufferIs8Bit);
                 }
             }
-            if (vr->is_using_async_aer()) {
+            if (vr->is_using_async_aer() && !fc5_menu_proj_frame) {
                 ID3D11Texture2D* fresh_tex = vr->m_fc5_eye_override ? vr->m_fc5_eye_override : (ID3D11Texture2D*)copy_from_tex.Get();
                 // Far Cry 5 AFW without a held image yet (just switched on): the fresh image for both eyes, never an unwritten eye copy.
                 auto other_eye_tex = vr->m_afw_held_texture ? vr->m_afw_held_texture : vr->m_fc5_afw_active.load() ? fresh_tex : (backbufferIs8Bit ? m_right_eye_tex.Get() : (ID3D11Texture2D*)m_right_eye_rt.tex.Get());
@@ -408,8 +421,8 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
         if (runtime->ready() && runtime->is_openxr()) {
             LOG_VERBOSE("Copying right eye");
             // Far Cry 5 DLSS upscaling: the eye image composed at the eye's size replaces the back buffer.
-            m_openxr.copy(1, vr->m_fc5_eye_override ? vr->m_fc5_eye_override : (ID3D11Texture2D*)copy_from_tex.Get());
-            if (vr->is_using_async_aer()) {
+            if (!fc5_menu_proj_frame) m_openxr.copy(1, vr->m_fc5_eye_override ? vr->m_fc5_eye_override : (ID3D11Texture2D*)copy_from_tex.Get());
+            if (vr->is_using_async_aer() && !fc5_menu_proj_frame) {
                 ID3D11Texture2D* fresh_tex = vr->m_fc5_eye_override ? vr->m_fc5_eye_override : (ID3D11Texture2D*)copy_from_tex.Get();
                 auto other_eye_tex = vr->m_afw_held_texture ? vr->m_afw_held_texture : vr->m_fc5_afw_active.load() ? fresh_tex : (backbufferIs8Bit ? m_left_eye_tex.Get() : (ID3D11Texture2D*)m_left_eye_rt.tex.Get());
                 m_openxr.copy(0, other_eye_tex);
@@ -547,6 +560,64 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
             }();
             if (vr->m_fc5_xr_flush.load() || (simulator && vr->m_fc5_xr_flush_sim.load())) {
                 context->Flush();
+            }
+            // Far Cry 5 (menuproj): the flat screen drawn into both eye images, sent as the projection layer (OpenXR::end_frame).
+            {
+                auto& oxr = vr->m_openxr;
+                static bool menu_proj_was = false;
+                bool        menu_proj_now = false;
+                const auto& sv            = oxr->get_pipeline_state().stage_views;
+                if (runtimes::OpenXR::s_fc5_menu_proj.load() && ModSettings::showFlatScreenDisplay() && g_fc5_menu_src && oxr->should_render() &&
+                    sv.size() >= 2 && sv[0].fov.angleRight > sv[0].fov.angleLeft && sv[1].fov.angleRight > sv[1].fov.angleLeft) {
+                    glm::mat4 panel = glm::mat4(1.0f);
+                    panel[3][2]     = -oxr->m_flat_screen_distance;
+                    panel           = (oxr->fc5_flat_anchor_on ? oxr->fc5_flat_anchor : oxr->m_center_stage) * panel;
+                    glm::mat4 rigid = glm::mat4_cast(glm::normalize(glm::quat_cast(panel)));
+                    rigid[3]        = glm::vec4{glm::vec3{panel[3]}, 1.0f};
+                    const glm::mat4 to_panel = glm::inverse(rigid);
+                    const auto&     sc0      = oxr->swapchains[oxr->eye_swapchain(0)];
+                    const float     aspect   = sc0.height > 0 ? (float)sc0.width / (float)sc0.height : 1.0f;
+                    float           consts[2][20]{};
+                    for (int e = 0; e < 2; ++e) {
+                        const auto& p   = sv[e].pose;
+                        glm::mat4   eye = glm::mat4_cast(glm::normalize(glm::quat{p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z}));
+                        eye[3]          = glm::vec4{p.position.x, p.position.y, p.position.z, 1.0f};
+                        const glm::mat4 ep = to_panel * eye;
+                        for (int r = 0; r < 3; ++r) {
+                            consts[e][r * 4 + 0] = ep[0][r];
+                            consts[e][r * 4 + 1] = ep[1][r];
+                            consts[e][r * 4 + 2] = ep[2][r];
+                            consts[e][r * 4 + 3] = ep[3][r];
+                        }
+                        consts[e][12] = std::tan(sv[e].fov.angleLeft);
+                        consts[e][13] = std::tan(sv[e].fov.angleRight);
+                        consts[e][14] = std::tan(sv[e].fov.angleUp);
+                        consts[e][15] = std::tan(sv[e].fov.angleDown);
+                        consts[e][16] = 2.0f;            // the quad layer's size: 2 m wide, the eye image's aspect
+                        consts[e][17] = 2.0f / aspect;
+                    }
+                    ID3D11Texture2D *out0 = nullptr, *out1 = nullptr;
+                    if (fc5_menu_panel(g_framework->get_d3d11_hook()->get_device(), context.Get(), g_fc5_menu_src.Get(), consts, &out0, &out1)) {
+                        m_openxr.copy(0, out0);
+                        m_openxr.copy(1, out1);
+                        for (int e = 0; e < 2; ++e) {
+                            oxr->fc5_menu_proj_pose[e] = sv[e].pose;
+                            oxr->fc5_menu_proj_fov[e]  = sv[e].fov;
+                        }
+                        oxr->fc5_menu_proj_ready = true;
+                        menu_proj_now            = true;
+                    }
+                }
+                if (fc5_menu_proj_frame && !menu_proj_now && g_fc5_menu_src) {
+                    // The panel could not be drawn: the flat screen's picture as before (the quad layer shows eye 0).
+                    m_openxr.copy(0, g_fc5_menu_src.Get());
+                    m_openxr.copy(1, g_fc5_menu_src.Get());
+                }
+                if (menu_proj_now != menu_proj_was) {
+                    menu_proj_was = menu_proj_now;
+                    spdlog::info("[VR] menuproj: {}", menu_proj_now ? "the flat screen drawn into both eye images, sent as the 3D view (no quad layer)"
+                                                                    : "back to the game's own eye images");
+                }
             }
             auto result = vr->m_openxr->end_frame(quad_layers, vr->m_presenter_frame_count, scene_depth_tex != nullptr);
 
@@ -1060,6 +1131,171 @@ struct StretchBlit {
     }
 };
 StretchBlit g_stretch{};
+
+// Far Cry 5 (menuproj, runtimes::OpenXR::s_fc5_menu_proj): the flat screen (menus, map, loading screens, flat cinematics) drawn
+// into each eye's image as a panel in space, where its quad layer would hang, so it can go to the headset as the projection layer.
+// Frame generation tools build their extra frames from the projection layer; a quad alone left those frames without the menu.
+// Per pixel: the eye's ray (its field's tangents) taken into the panel's space, met with the panel's plane, the menu image sampled
+// there (mipmapped, anisotropic: the panel is smaller than the image in the headset), black around it.
+struct MenuPanel {
+    ComPtr<ID3D11VertexShader> vs{};
+    ComPtr<ID3D11PixelShader> ps{};
+    ComPtr<ID3D11SamplerState> samp{};
+    ComPtr<ID3D11Buffer> cb{};
+    ComPtr<ID3DDeviceContextState> state{};
+    ComPtr<ID3D11Texture2D> mip{};
+    ComPtr<ID3D11ShaderResourceView> mip_srv{};
+    ComPtr<ID3D11Texture2D> out[2]{};
+    ComPtr<ID3D11RenderTargetView> out_rtv[2]{};
+    D3D11_TEXTURE2D_DESC src_desc{};
+    bool failed{false};
+
+    struct Consts {
+        float row[3][4];   // eye space -> panel space (rotation | eye position)
+        float tan[4];      // left, right, up, down tangents of the eye's field
+        float size[4];     // panel width, height (m)
+    };
+
+    bool init(ID3D11Device* dev) {
+        if (vs || failed) return vs != nullptr;
+        const char* src =
+            "cbuffer C : register(b0) { float4 r0; float4 r1; float4 r2; float4 tn; float4 sz; };\n"
+            "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
+            "V vsmain(uint id : SV_VertexID) { V o; float2 uv = float2((id << 1) & 2, id & 2); o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = uv; return o; }\n"
+            "Texture2D t : register(t0); SamplerState s : register(s0);\n"
+            "float4 psmain(V i) : SV_Target {\n"
+            "  float3 d = float3(lerp(tn.x, tn.y, i.uv.x), lerp(tn.z, tn.w, i.uv.y), -1.0);\n"
+            "  float3 o = float3(r0.w, r1.w, r2.w);\n"
+            "  float3 dp = float3(dot(r0.xyz, d), dot(r1.xyz, d), dot(r2.xyz, d));\n"
+            "  float k = abs(dp.z) > 1e-6 ? -o.z / dp.z : -1.0;\n"
+            "  float2 h = o.xy + k * dp.xy;\n"
+            "  float2 uv = float2(h.x / sz.x + 0.5, 0.5 - h.y / sz.y);\n"
+            "  float4 c = t.Sample(s, saturate(uv));\n"
+            "  bool inside = k > 0.0 && all(uv >= 0.0) && all(uv <= 1.0);\n"
+            "  return inside ? float4(c.rgb, 1.0) : float4(0, 0, 0, 1);\n"
+            "}\n";
+        using Fn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+        auto fn = (Fn)GetProcAddress(LoadLibraryA("d3dcompiler_47.dll"), "D3DCompile");
+        ComPtr<ID3DBlob> b1, b2, err;
+        bool ok = fn && SUCCEEDED(fn(src, strlen(src), "menuproj", nullptr, nullptr, "vsmain", "vs_5_0", 0, 0, &b1, &err)) &&
+                  SUCCEEDED(fn(src, strlen(src), "menuproj", nullptr, nullptr, "psmain", "ps_5_0", 0, 0, &b2, &err));
+        if (!ok && err) spdlog::error("[VR] menuproj shader: {}", (const char*)err->GetBufferPointer());
+        ok = ok && SUCCEEDED(dev->CreateVertexShader(b1->GetBufferPointer(), b1->GetBufferSize(), nullptr, &vs)) &&
+             SUCCEEDED(dev->CreatePixelShader(b2->GetBufferPointer(), b2->GetBufferSize(), nullptr, &ps));
+        D3D11_SAMPLER_DESC sd{};
+        sd.Filter = D3D11_FILTER_ANISOTROPIC;
+        sd.MaxAnisotropy = 8;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        ok = ok && SUCCEEDED(dev->CreateSamplerState(&sd, &samp));
+        D3D11_BUFFER_DESC bd{};
+        bd.ByteWidth = sizeof(Consts);
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ok = ok && SUCCEEDED(dev->CreateBuffer(&bd, nullptr, &cb));
+        ComPtr<ID3D11Device1> dev1;
+        if (ok && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dev1)))) {
+            const D3D_FEATURE_LEVEL lvl = dev->GetFeatureLevel();
+            ok = SUCCEEDED(dev1->CreateDeviceContextState(0, &lvl, 1, D3D11_SDK_VERSION, __uuidof(ID3D11Device1), nullptr, &state));
+        } else {
+            ok = false;
+        }
+        if (!ok) {
+            spdlog::error("[VR] menuproj unavailable: menus stay on the flat screen's own layer");
+            failed = true;
+            vs.Reset();
+        }
+        return ok;
+    }
+
+    bool textures(ID3D11Device* dev, const D3D11_TEXTURE2D_DESC& sd) {
+        if (mip && sd.Width == src_desc.Width && sd.Height == src_desc.Height && sd.Format == src_desc.Format) return true;
+        mip.Reset(); mip_srv.Reset();
+        for (int e = 0; e < 2; ++e) { out[e].Reset(); out_rtv[e].Reset(); }
+        const DXGI_FORMAT view = StretchBlit::unorm_of(sd.Format);
+        D3D11_TEXTURE2D_DESC m{};
+        m.Width = sd.Width; m.Height = sd.Height; m.MipLevels = 0; m.ArraySize = 1; m.Format = view; m.SampleDesc = {1, 0};
+        m.Usage = D3D11_USAGE_DEFAULT; m.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET; m.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+        if (FAILED(dev->CreateTexture2D(&m, nullptr, &mip)) || FAILED(dev->CreateShaderResourceView(mip.Get(), nullptr, &mip_srv))) {
+            mip.Reset(); mip_srv.Reset();
+            return false;
+        }
+        D3D11_TEXTURE2D_DESC o = sd;
+        o.Format = view;
+        o.MipLevels = 1; o.ArraySize = 1; o.SampleDesc = {1, 0}; o.Usage = D3D11_USAGE_DEFAULT;
+        o.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE; o.CPUAccessFlags = 0; o.MiscFlags = 0;
+        D3D11_RENDER_TARGET_VIEW_DESC r{};
+        r.Format = view;
+        r.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        for (int e = 0; e < 2; ++e) {
+            if (FAILED(dev->CreateTexture2D(&o, nullptr, &out[e])) || FAILED(dev->CreateRenderTargetView(out[e].Get(), &r, &out_rtv[e]))) {
+                mip.Reset(); mip_srv.Reset();
+                return false;
+            }
+        }
+        src_desc = sd;
+        spdlog::info("[VR] menuproj: panel images {}x{} (format {}, {} mip levels in the menu copy)", sd.Width, sd.Height, (int)sd.Format, [&] {
+            D3D11_TEXTURE2D_DESC md{};
+            mip->GetDesc(&md);
+            return md.MipLevels;
+        }());
+        return true;
+    }
+
+    // Draws both eyes; the caller copies out[0] and out[1] to the eye swapchains.
+    bool run(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* src, const Consts (&c)[2]) {
+        if (!init(dev) || !src) return false;
+        D3D11_TEXTURE2D_DESC sd{};
+        src->GetDesc(&sd);
+        if (sd.SampleDesc.Count != 1 || sd.ArraySize != 1 || !textures(dev, sd)) return false;
+        ctx->CopySubresourceRegion(mip.Get(), 0, 0, 0, 0, src, 0, nullptr);
+        ctx->GenerateMips(mip_srv.Get());
+
+        ComPtr<ID3D11DeviceContext1> ctx1;
+        if (FAILED(ctx->QueryInterface(IID_PPV_ARGS(&ctx1)))) return false;
+        ComPtr<ID3DDeviceContextState> prev;
+        ctx1->SwapDeviceContextState(state.Get(), &prev);
+        D3D11_VIEWPORT vp{0, 0, (float)sd.Width, (float)sd.Height, 0, 1};
+        ctx->RSSetViewports(1, &vp);
+        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx->IASetInputLayout(nullptr);
+        ctx->VSSetShader(vs.Get(), nullptr, 0);
+        ctx->PSSetShader(ps.Get(), nullptr, 0);
+        ID3D11SamplerState* smp = samp.Get();
+        ctx->PSSetSamplers(0, 1, &smp);
+        ID3D11Buffer* b = cb.Get();
+        ctx->PSSetConstantBuffers(0, 1, &b);
+        ID3D11ShaderResourceView* srv = mip_srv.Get();
+        for (int e = 0; e < 2; ++e) {
+            D3D11_MAPPED_SUBRESOURCE m{};
+            if (FAILED(ctx->Map(cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) continue;
+            std::memcpy(m.pData, &c[e], sizeof(Consts));
+            ctx->Unmap(cb.Get(), 0);
+            ID3D11RenderTargetView* r = out_rtv[e].Get();
+            ctx->OMSetRenderTargets(1, &r, nullptr);
+            ctx->PSSetShaderResources(0, 1, &srv);
+            ctx->Draw(3, 0);
+            ID3D11ShaderResourceView* none = nullptr;
+            ctx->PSSetShaderResources(0, 1, &none);
+        }
+        ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        ctx1->SwapDeviceContextState(prev.Get(), nullptr);
+        return true;
+    }
+};
+MenuPanel g_menu_panel{};
+
+// menuproj: draw both eyes; out0 / out1 are the panel images to copy to the eye swapchains.
+bool fc5_menu_panel(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* src, const float (&consts)[2][20], ID3D11Texture2D** out0, ID3D11Texture2D** out1) {
+    MenuPanel::Consts c[2]{};
+    static_assert(sizeof(MenuPanel::Consts) == sizeof(float) * 20);
+    std::memcpy(c, consts, sizeof(c));
+    if (!g_menu_panel.run(dev, ctx, src, c)) return false;
+    *out0 = g_menu_panel.out[0].Get();
+    *out1 = g_menu_panel.out[1].Get();
+    return true;
+}
 }
 
 void D3D11Component::OpenXR::clear(uint32_t swapchain_idx) {

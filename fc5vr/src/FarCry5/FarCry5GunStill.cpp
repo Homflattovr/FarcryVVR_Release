@@ -26,6 +26,7 @@
 #include "FarCry5Reload.h"
 #include "FarCry5Dlss.h"
 #include "FarCry5GunPoseTable.h"
+#include "FarCry5StockEye.h"
 #include "ModPath.h"
 
 #include <algorithm>
@@ -358,7 +359,7 @@ void FarCry5Stereo::one_hand_match(glm::mat4& k, const glm::mat4& k_ctrl, bool c
     float      dt  = m_ohm_t == clock::time_point{} ? 0.0f : std::chrono::duration<float>(now - m_ohm_t).count();
     m_ohm_t        = now;
     dt             = std::clamp(dt, 0.0f, 0.1f);
-    if (m_gsl_on.load() && std::chrono::duration<float>(now - m_gsl_t0).count() >= 8.0f) gunstock_learn_finish();
+    if (m_gsl_on.load() && std::chrono::duration<float>(now - m_gsl_t0).count() >= 5.0f) gunstock_learn_finish();   // (8 s before 9 Nov)
     const uint32_t sig = m_weapon_sig.load();
     // The gun's own barrel in the weapon controller's axes as its one-hand hold draws it (gun_still's pose this frame, axes or pose).
     glm::vec3 b{ 0.0f };
@@ -366,7 +367,7 @@ void FarCry5Stereo::one_hand_match(glm::mat4& k, const glm::mat4& k_ctrl, bool c
     const bool b_ok = glm::length(b) > 0.5f;
     // gunstocklearn: from 1.5 s into the window, the drawn barrel of a long gun in two hands (weapon controller's axes; k is the hold's here),
     // not while firing or reloading. Sampled with the switch off too.
-    if (m_gsl_on.load() && two && can && b_ok && data_long_gun(sig) && !fc5::gesture::kept() && std::chrono::duration<float>(now - m_gsl_t0).count() > 1.5f &&
+    if (m_gsl_on.load() && two && can && b_ok && data_long_gun(sig) && !fc5::gesture::kept() && std::chrono::duration<float>(now - m_gsl_t0).count() > 1.0f &&
         !m_trigger.load() && !fc5::reload::hides_game_reload() && !(m_gst && m_gst->reload)) {
         std::lock_guard _{ m_gsl_mtx };
         m_gsl_samples.push_back(glm::normalize(glm::transpose(glm::mat3{ k_ctrl }) * glm::mat3{ k } * glm::normalize(b)));
@@ -426,10 +427,11 @@ void FarCry5Stereo::one_hand_match(glm::mat4& k, const glm::mat4& k_ctrl, bool c
 }
 
 // reloadzonesfollow (Stereo.h): the drawn gun's turn against the weapon controller's raw axes (set in update_motion), false when none.
-bool FarCry5Stereo::draw_turn(glm::mat3& E)
+bool FarCry5Stereo::draw_turn(glm::mat3& E, glm::vec3& off)
 {
     std::lock_guard _{ m_draw_turn_mtx };
-    E = m_draw_turn;
+    E   = m_draw_turn;
+    off = m_draw_off;   // stockeye: the gun moved off its controller (zero otherwise)
     return m_draw_turn_on;
 }
 
@@ -437,6 +439,7 @@ bool FarCry5Stereo::draw_turn(glm::mat3& E)
 // k itself when none is applied (onehandmatch off, two hands, not a long gun): bit for bit as before.
 glm::mat4 FarCry5Stereo::one_hand_drawn(const glm::mat4& k) const
 {
+    if (m_se_applied) return k * m_se_rel4;   // stockeye: the gun as the stock places it (last frame's placement)
     if (!m_ohm_on.load() || !m_ohm_cur_ok || m_ohm_was_two || m_ohm_last_turn.load() <= 0.0f) return k;
     glm::mat4       r = k;
     const glm::mat3 K = glm::mat3{ k } * glm::mat3_cast(m_ohm_cur);
@@ -444,6 +447,256 @@ glm::mat4 FarCry5Stereo::one_hand_drawn(const glm::mat4& k) const
     r[1]              = glm::vec4{ K[1], 0.0f };
     r[2]              = glm::vec4{ K[2], 0.0f };
     return r;
+}
+
+// stockeye (Stereo.h, FarCry5StockEye.h): called from update_motion right after onehandmatch's place, with k as the holds left it and k_ctrl
+// the weapon controller's own frame. can: a weapon in hand on its controller (not slung, a bow, mounted, in a vehicle). True: k is the
+// stock's placement (onehandmatch is then not run).
+bool FarCry5Stereo::stock_eye_place(glm::mat4& k, const glm::mat4& k_ctrl, bool can)
+{
+    using clock    = std::chrono::steady_clock;
+    const auto now = clock::now();
+    float      dt  = m_se_t_last == clock::time_point{} ? 0.0f : std::chrono::duration<float>(now - m_se_t_last).count();
+    m_se_t_last    = now;
+    dt             = std::clamp(dt, 0.0f, 0.1f);
+    const uint32_t sig = m_weapon_sig.load();
+    auto not_placed = [&](const char* why, bool log) {
+        m_se_applied = m_se_rel_ok = false;
+        m_se_sig                   = sig;
+        m_se_last_turn             = 0.0f;
+        m_se_last_off_cm           = 0.0f;
+        {
+            std::lock_guard _{ m_se_mtx };
+            m_se_why = why;
+        }
+        if (log && sig != 0 && m_se_why_said != sig) {
+            m_se_why_said = sig;
+            spdlog::info("[Motion] stockeye: weapon {} held as without stockeye: {}", sig, why);
+        }
+        return false;
+    };
+    if (!m_se_on.load()) {   // (off: no lock, no message, every frame)
+        m_se_applied = m_se_rel_ok = false;
+        m_se_last_turn             = 0.0f;
+        return false;
+    }
+    if (!can || sig == 0 || m_unarmed || fc5::gesture::kept()) return not_placed("no weapon on the controller", false);
+    if (!data_long_gun(sig)) return not_placed("not a long gun (handguns, launchers, bows keep their hold)", false);
+    glm::vec3   o{ 0.0f }, d{ 0.0f };
+    const char* how = "";
+    if (!stock_sight_line(o, d, how)) return not_placed("no sight line known for this gun yet", true);
+    // The gun's pose (its own, else all guns'; raw controller axes) in k_ctrl's axes and k units.
+    bool                      own = false;
+    const fc5::stockeye::Pose ps  = gunstock_pose(sig, &own);
+    glm::vec3                 a_raw{ 0.0f }, f_raw{ 0.0f };
+    fc5::stockeye::pose_line(ps, a_raw, f_raw);
+    const float     ws = std::max(1e-3f, m_world_scale.load());
+    const glm::mat3 Gt = glm::transpose(fc5::stockeye::grip_turn(m_grip_pitch.load()));
+    const glm::vec3 ac = Gt * a_raw * ws, fc = glm::normalize(Gt * f_raw);
+    const float turn = fc5::stockeye::deg_between(d, fc);
+    if (turn > 60.0f) return not_placed("the gun would turn over 60 deg (calibrate again with the cheek on the stock)", true);
+    const fc5::stockeye::Rel r     = fc5::stockeye::place(o, d, ac, fc, 0.01f * ps.z * ws);
+    const float              off_m = glm::length(r.t) / ws;
+    if (off_m > 0.35f) return not_placed("the grip would move over 35 cm off the hand (calibrate again with the cheek on the stock)", true);
+    const float ease = 1.0f - std::exp(-dt / 0.05f);   // ~95 % in 0.15 s
+    if (m_se_rel_ok && sig == m_se_sig) {
+        m_se_q = glm::normalize(glm::slerp(m_se_q, r.q, ease));
+        m_se_t = glm::mix(m_se_t, r.t, ease);
+    } else {
+        m_se_q = r.q;   // a new weapon, or just turned on: at once
+        m_se_t = r.t;
+    }
+    m_se_rel_ok = true;
+    m_se_sig    = sig;
+    fc5::stockeye::Rel cur;
+    cur.q            = m_se_q;
+    cur.t            = m_se_t;
+    k                = fc5::stockeye::apply(k_ctrl, cur);
+    m_se_rel4        = glm::inverse(k_ctrl) * k;
+    m_se_applied     = true;
+    m_se_last_turn   = turn;
+    m_se_last_off_cm = 100.0f * off_m;
+    {
+        std::lock_guard _{ m_se_mtx };
+        m_se_why.clear();
+    }
+    if (m_se_said != sig) {
+        m_se_said = sig;
+        spdlog::info("[Motion] stockeye: weapon {} ({}): its {} on the {} gunstock pose ({:.1f} up {:.1f} right, x {:.1f} y {:.1f} z {:.1f} cm): turned {:.1f} deg, "
+                     "its grip {:.1f} cm off your hand",
+                     sig, gunstock_gun_name(sig), how, own ? "gun's own" : "all guns'", ps.up, ps.right, ps.x, ps.y, ps.z, turn, 100.0f * off_m);
+    }
+    return true;
+}
+
+fc5::stockeye::Pose FarCry5Stereo::gunstock_pose(uint32_t sig, bool* own)
+{
+    std::lock_guard _{ m_se_mtx };
+    const auto      it = m_gsp_gun.find(sig);
+    if (own) *own = it != m_gsp_gun.end();
+    return it != m_gsp_gun.end() ? it->second : m_gsp;
+}
+
+std::string FarCry5Stereo::gunstock_pose_line()
+{
+    std::lock_guard _{ m_se_mtx };
+    return fmt::format("gunstockpose {:.1f} {:.1f} {:.1f} {:.1f} {:.1f}", m_gsp.up, m_gsp.right, m_gsp.x, m_gsp.y, m_gsp.z);
+}
+
+std::string FarCry5Stereo::gunstock_guns_line()
+{
+    std::lock_guard _{ m_se_mtx };
+    std::string     s = "gunstockguns";
+    if (m_gsp_gun.empty()) return s + " none";
+    for (const auto& [sig, p] : m_gsp_gun) s += fmt::format(" {},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f}", sig, p.up, p.right, p.x, p.y, p.z);
+    return s;
+}
+
+bool FarCry5Stereo::gunstock_gun_ok(uint32_t sig) { return sig != 0 && !m_unarmed && data_long_gun(sig); }
+
+std::string FarCry5Stereo::gunstock_gun_name(uint32_t sig)
+{
+    const auto* w = fc5::gameweapon::info(sig);
+    if (!w || !w->name) return fmt::format("weapon {}", sig);
+    std::string n  = w->name;
+    const auto  sl = n.find_last_of('/');
+    return sl == std::string::npos ? n : n.substr(sl + 1);
+}
+
+// gun: the pose of the gun in hand (its own), else of all long guns.
+void FarCry5Stereo::stock_eye_learn_start(bool gun)
+{
+    const uint32_t sig = m_weapon_sig.load();
+    if (gun && (sig == 0 || m_unarmed || !data_long_gun(sig))) {
+        std::lock_guard _{ m_se_mtx };
+        m_se_msg = "not learnt: hold the rifle, SMG, shotgun or machine gun to calibrate it alone";
+        spdlog::info("[Motion] stockeye: calibrate this gun: no long gun in hand");
+        return;
+    }
+    {
+        std::lock_guard _{ m_se_mtx };
+        m_se_l_e.clear();
+        m_se_l_f.clear();
+        m_se_l_good = 0.0f;
+        m_se_msg    = "learning...";
+    }
+    m_se_l_gun = gun;
+    m_se_l_sig = gun ? sig : 0;
+    m_se_l_t0  = std::chrono::steady_clock::now();
+    m_se_l_on  = true;
+    gunstock_tick();
+    spdlog::info("[Motion] stockeye: calibrating {} for 5 s: gunstock against your cheek, aim, hold still", gun ? gunstock_gun_name(sig) : std::string{ "all long guns" });
+}
+
+// update_motion, each frame while learning: head is the headset in the recentred space, k units (as k_ctrl).
+void FarCry5Stereo::stock_eye_learn_tick(const glm::mat4& k_ctrl, const glm::mat4& head, bool can)
+{
+    if (!m_se_l_on.load()) return;
+    using clock      = std::chrono::steady_clock;
+    const auto  now  = clock::now();
+    const float age  = std::chrono::duration<float>(now - m_se_l_t0).count();
+    static clock::time_point last{};
+    const float dt   = last == clock::time_point{} ? 0.0f : std::clamp(std::chrono::duration<float>(now - last).count(), 0.0f, 0.1f);
+    last             = now;
+    if (age >= 5.0f) {
+        stock_eye_learn_finish();
+        return;
+    }
+    if (age < 1.0f || !can) return;
+    if (m_se_l_gun && m_weapon_sig.load() != m_se_l_sig) return;   // another gun meanwhile: not its samples
+    // The dominant eye: scopeeye (left, right; auto: the weapon hand's side). Half the eyes' distance from the last frames' eye cameras.
+    const int   se   = m_scope_eye.load();
+    const float side = se == 0 ? -1.0f : se == 1 ? 1.0f : (m_left_handed.load() ? -1.0f : 1.0f);
+    const float ws   = std::max(1e-3f, m_world_scale.load());
+    float       half = 0.5f * glm::length(m_sight_eye_cam[1] - m_sight_eye_cam[0]);
+    if (!(half >= 0.025f * ws && half <= 0.040f * ws)) half = 0.032f * ws;
+    glm::vec3 e{ 0.0f }, f{ 0.0f };
+    fc5::stockeye::sample(head, k_ctrl, side, half, e, f);
+    const glm::mat3 G = fc5::stockeye::grip_turn(m_grip_pitch.load());
+    std::lock_guard _{ m_se_mtx };
+    m_se_l_e.push_back(G * e / ws);   // raw controller axes, m
+    m_se_l_f.push_back(glm::normalize(G * f));
+    m_se_l_good += dt;
+}
+
+void FarCry5Stereo::stock_eye_learn_finish()
+{
+    m_se_l_on = false;
+    gunstock_tick();
+    std::vector<glm::vec3> es, fs;
+    float                  good = 0.0f;
+    {
+        std::lock_guard _{ m_se_mtx };
+        es   = std::move(m_se_l_e);
+        fs   = std::move(m_se_l_f);
+        good = m_se_l_good;
+        m_se_l_e.clear();
+        m_se_l_f.clear();
+    }
+    auto fail = [&](const std::string& why) {
+        std::lock_guard _{ m_se_mtx };
+        m_se_msg = "not learnt: " + why + "; the last values kept";
+        spdlog::info("[Motion] stockeye not learnt: {}; the last values kept", why);
+    };
+    if (good < 2.0f || es.size() < 20) return fail(fmt::format("{:.1f} s of samples, 2 s needed (hold the gun on its controller)", good));
+    glm::vec3 me{ 0.0f }, mf{ 0.0f };
+    for (const auto& v : es) me += v;
+    for (const auto& v : fs) mf += v;
+    me /= float(es.size());
+    mf = glm::normalize(mf);
+    float se2 = 0.0f, sf2 = 0.0f;
+    for (const auto& v : es) se2 += glm::dot(v - me, v - me);
+    for (const auto& v : fs) {
+        const float a = fc5::stockeye::deg_between(v, mf);
+        sf2 += a * a;
+    }
+    const float spread_cm = 100.0f * std::sqrt(se2 / float(es.size())), spread_deg = std::sqrt(sf2 / float(fs.size()));
+    const float dist      = glm::length(me);
+    // 9 Nov (author 10:58: the calibration did not lower the gun): his two 5 s holds in the headset spread 4.6 cm / 6.8 deg and 5.6 cm / 12.8 deg,
+    // both refused at 3 cm / 4 deg, so nothing changed. The mean over 5 s holds well within these: 8 cm / 15 deg.
+    if (spread_cm > 8.0f || spread_deg > 15.0f)
+        return fail(fmt::format("the head moved against the gun ({:.1f} cm, {:.1f} deg): hold still with your cheek on the stock", spread_cm, spread_deg));
+    if (dist < 0.08f || dist > 0.70f) return fail(fmt::format("the eye {:.0f} cm from the gun's controller: put your cheek on the stock", 100.0f * dist));
+    fc5::stockeye::Pose p = fc5::stockeye::line_pose(me, mf);
+    p.up                  = std::clamp(p.up, -80.0f, 30.0f);
+    p.right               = std::clamp(p.right, -30.0f, 30.0f);
+    p.x                   = std::clamp(p.x, -25.0f, 25.0f);
+    p.y                   = std::clamp(p.y, -25.0f, 25.0f);
+    const std::string who = m_se_l_gun ? gunstock_gun_name(m_se_l_sig) : std::string{ "all long guns" };
+    {
+        std::lock_guard _{ m_se_mtx };
+        if (m_se_l_gun) m_gsp_gun[m_se_l_sig] = p;
+        else m_gsp = p;
+        m_se_msg = fmt::format("learnt for {}: {:.1f} up {:.1f} right, x {:.1f} y {:.1f} cm (your eye {:.0f} cm from the controller; spread {:.1f} cm, {:.1f} deg)", who, p.up,
+                               p.right, p.x, p.y, 100.0f * dist, spread_cm, spread_deg);
+    }
+    m_se_on       = true;
+    m_se_rel_ok   = false;
+    m_se_said     = 0;
+    m_se_why_said = 0;
+    if (m_se_l_gun) m_persist["gunstockguns"] = gunstock_guns_line();
+    else m_persist["gunstockpose"] = gunstock_pose_line();
+    m_persist["stockeye"] = "stockeye on";
+    save_settings();
+    spdlog::info("[Motion] stockeye learnt for {} and on: {:.1f} up {:.1f} right, x {:.1f} y {:.1f} z {:.1f} cm (the eye at ({:.3f}, {:.3f}, {:.3f}) m of the weapon controller, "
+                 "raw axes); {} samples, spread {:.1f} cm {:.1f} deg",
+                 who, p.up, p.right, p.x, p.y, p.z, me.x, me.y, me.z, es.size(), spread_cm, spread_deg);
+}
+
+std::string FarCry5Stereo::stock_eye_text()
+{
+    std::string learn;
+    if (m_se_l_on.load()) {
+        const float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - m_se_l_t0).count();
+        learn         = fmt::format("Calibrating: gunstock against your cheek, aim, hold still: {:.0f} s left", std::max(0.0f, std::ceil(5.0f - t)));
+    }
+    std::lock_guard _{ m_se_mtx };
+    if (learn.empty()) learn = m_se_msg;
+    std::string now;
+    if (!m_se_on.load()) now = "";
+    else if (m_se_applied) now = fmt::format("gun in hand: sights on the gunstock line, turned {:.1f} deg, grip {:.1f} cm off your hand", m_se_last_turn.load(), m_se_last_off_cm.load());
+    else if (!m_se_why.empty()) now = "gun in hand: " + m_se_why;
+    return learn.empty() ? now : now.empty() ? learn : learn + "\n" + now;
 }
 
 void FarCry5Stereo::gunstock_learn_start()
@@ -457,7 +710,7 @@ void FarCry5Stereo::gunstock_learn_start()
     m_gsl_t0 = std::chrono::steady_clock::now();
     m_gsl_on = true;
     gunstock_tick();
-    spdlog::info("[Motion] gunstock calibration: learning for 8 s: hold a two-handed weapon and aim with it");
+    spdlog::info("[Motion] gunstock calibration: learning for 5 s: hold a two-handed weapon and aim with it");
 }
 
 void FarCry5Stereo::gunstock_learn_finish()
@@ -512,7 +765,7 @@ std::string FarCry5Stereo::gunstock_learn_text()
             std::lock_guard _{ m_gsl_mtx };
             good = m_gsl_good_s;
         }
-        return fmt::format("Learning: hold a two-handed weapon and aim with it: {:.0f} s left ({:.1f} s of two-handed aim so far)", std::max(0.0f, std::ceil(8.0f - t)), good);
+        return fmt::format("Learning: hold a two-handed weapon and aim with it: {:.0f} s left ({:.1f} s of two-handed aim so far)", std::max(0.0f, std::ceil(5.0f - t)), good);
     }
     std::lock_guard _{ m_gsl_mtx };
     return m_gsl_msg;
@@ -1916,7 +2169,54 @@ bool FarCry5Stereo::gun_still_command(const std::string& cmd, const std::string&
                      m_two_hand_level_ref[1].load(), m_two_hand_level_ref[0].load(), m_two_hand_level_ref[1].load());
         return true;
     }
-    if (cmd == "gunstocklearn") { gunstock_learn_start(); return true; }   // test / F11 button, not saved: the 8 s gunstock calibration window (Stereo.h)
+    if (cmd == "stockeyelearn") { stock_eye_learn_start(arg == "gun"); return true; }   // [gun] F11 button, not saved: the 5 s gunstock calibration (Stereo.h stockeye)
+    if (cmd == "stockeye") {   // on | off (default), saved: each long gun's sights put on the gunstock pose's line
+        m_se_on     = on;
+        m_se_rel_ok = false;
+        m_se_said = m_se_why_said = 0;
+        persist     = true;
+        spdlog::info("[Motion] stockeye {}", on ? "on: each long gun's sight line on the gunstock pose (Calibrate gunstock)" : "off: the holds as before");
+        return true;
+    }
+    if (cmd == "gunstockpose") {   // up right x y z (deg, deg, cm, cm, cm), saved: the gunstock pose of all long guns (FarCry5StockEye.h Pose)
+        fc5::stockeye::Pose p{};
+        p.up = fv;
+        rest >> p.right >> p.x >> p.y >> p.z;
+        if (rest.fail() || !std::isfinite(p.up + p.right + p.x + p.y + p.z)) {
+            spdlog::info("[Motion] gunstockpose: 5 numbers expected (up right deg, x y z cm), kept");
+            return true;
+        }
+        p.up    = std::clamp(p.up, -80.0f, 30.0f);
+        p.right = std::clamp(p.right, -30.0f, 30.0f);
+        p.x     = std::clamp(p.x, -25.0f, 25.0f);
+        p.y     = std::clamp(p.y, -25.0f, 25.0f);
+        p.z     = std::clamp(p.z, -25.0f, 25.0f);
+        {
+            std::lock_guard _{ m_se_mtx };
+            m_gsp = p;
+        }
+        persist = true;
+        return true;
+    }
+    if (cmd == "gunstockguns") {   // none | sig,up,right,x,y,z ... (saved): the guns with their own gunstock pose
+        std::map<uint32_t, fc5::stockeye::Pose> guns;
+        std::string tok = arg, more;
+        do {
+            if (tok.empty() || tok == "none") continue;
+            std::replace(tok.begin(), tok.end(), ',', ' ');
+            std::istringstream  is{ tok };
+            uint32_t            sig = 0;
+            fc5::stockeye::Pose p{};
+            if ((is >> sig >> p.up >> p.right >> p.x >> p.y >> p.z) && sig != 0 && std::isfinite(p.up + p.right + p.x + p.y + p.z)) guns[sig] = p;
+        } while ((rest >> more) && !(tok = more).empty());
+        {
+            std::lock_guard _{ m_se_mtx };
+            m_gsp_gun = std::move(guns);
+        }
+        persist = true;
+        return true;
+    }
+    if (cmd == "gunstocklearn") { gunstock_learn_start(); return true; }   // test / F11 button, not saved: the 5 s gunstock calibration window (Stereo.h)
     if (cmd == "onehandmatch") {   // on (default) | off [P Y], saved: every long gun in one hand along one fixed line, P up and Y right (deg) of the weapon controller
         m_ohm_on = on;
         if (!on) m_ohm_cur_ok = false;
@@ -1959,9 +2259,7 @@ bool FarCry5Stereo::gun_still_command(const std::string& cmd, const std::string&
     if (cmd == "fireready") { m_fire_ready = on; persist = true; return true; }   // the game's aim kept on the barrel with the weapon in hand (motion_post_present)
     if (cmd == "snapready") { m_snap_ready = on; persist = true; return true; }   // snap turns synced with the culled camera with the weapon in hand too
     if (cmd == "vehpitchguard") { m_veh_pitch_guard = on; return true; }   // a car's pitch read against the head look is kept (vehicle follow)
-    if (cmd == "settlepitch") { m_settle_pitch = on; return true; }   // the culled camera looks up / down with the head while getting in
     if (cmd == "wheelforce") { m_wheel_force = on; return true; }   // test: the aim loop as with the weapon wheel open
-    if (cmd == "wheellook") { m_wheel_look = on; return true; }   // the culled camera on the head while the weapon wheel is open
     if (cmd == "bodystarthead") { m_body_start_head = on; return true; }   // the body frame starts from the head (else the controller)
     if (cmd == "aimbacklimit") { m_aim_back_limit = arg == "off" ? 0.0f : std::clamp(fv, 0.0f, 180.0f); return true; }   // the game's aim at most N deg round from the head (0/off: no limit)
     if (cmd == "splitevpitch") { m_split_ev_pitch = std::clamp(fv, 69.0f, 160.0f); return true; }   // firing offset pitch limit (handed deg)

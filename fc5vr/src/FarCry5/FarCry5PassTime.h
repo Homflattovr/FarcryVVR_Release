@@ -1,6 +1,6 @@
 #pragma once
 
-// GPU time per pass (Metro Exodus VR review, 6 Nov 2026, item 1; cmd gputime passes N): for the next N stereo pairs, a timestamp at every
+// GPU time per pass (pipeline review, 6 Nov 2026, item 1; cmd gputime passes N): for the next N stereo pairs, a timestamp at every
 // change of the bound colour/depth targets and at every switch between draws and compute, in each call of the pair. Each segment is named
 // by the call (left, right, scope) and what it drew into (known targets by name: scene depth, sun shadow, far-shadow atlas; others by
 // size and format) or, for compute, by the compute shader's census name. After N pairs the mean ms per pair of each name is logged,

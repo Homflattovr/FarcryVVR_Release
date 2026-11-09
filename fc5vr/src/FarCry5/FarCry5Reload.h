@@ -81,7 +81,11 @@ namespace fc5::reload
     bool reload_button_pass(bool down); // reloadbuttonguard (manualreload51): left Y as the game gets it (held back during a manual step); notes it too
     bool hides_game_casings();
     bool relearn_armed(uint32_t sig, int item);   // manualreload52: a "Something wrong" button asked to learn this part again (1 the magazine)          // reloadcasinghide (manualreload51): the game's spent casing hidden now (FarCry5Stereo::casing_hide_tick)
-    bool keep_one();                    // reloadkeepone (manualreload39, default on): a magazine gun runs dry with one round left in the game's clip
+    bool keep_one();                    // the kept round (manualreload39; always on since 9 Nov, for the guns the ammo ledger does not cover: pump and lever shotguns): one round left in the game's clip
+    void ledger_on_shot();              // the game's shot code, for the player's weapon (FarCry5BulletSpeed.cpp): the one-shot hold
+    bool ledger_shot_hold();            // the ammo ledger's last round has left: the trigger held now (ModConfig's pad output)
+    bool ledger_low();                  // the ledger's gun with 4 real rounds or fewer (its clip read every update: the game's may read full after a top-up)
+    bool ledger_now();                  // ammoledger: the gun in hand is the ledger's this poll (its clip read every update while low, as keep_one's)
     bool b_heal_only();                 // bheal (manualreload38, default on): right B held heals, never switches weapon
     bool b_heal_y(bool b_down);         // bheal: whether right B is the pad's Y now (held back for reloadtap ms, then held at least bhealms ms)
     void b_heal_throw();                // bheal: this right B press is the throw (left grip + B): no Y

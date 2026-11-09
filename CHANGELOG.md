@@ -1,5 +1,13 @@
 # Changelog
 
+## Beta 0.4.6 (9 November 2026): culling follows the headset, every round fires
+Full notes: [release/RELEASE_NOTES_beta_0_4_6.md](release/RELEASE_NOTES_beta_0_4_6.md).
+- **New:** culling from your eyes (no missing edges looking down, in or out of cars), every round of a magazine fires
+  with no game reload at empty, recoil on by default, one Calibrate gunstock section (controllers or a physical gunstock),
+  Reset to default buttons, a quick automatic wheel turn when you get in a vehicle.
+- **Removed:** the OFXR menu pause (it could fight other frame generation software); menus can blink black again with
+  frame generation.
+
 ## Beta 0.4.5 (8 November 2026): new home, recoil and two-handed aim
 Full notes: [release/RELEASE_NOTES_beta_0_4_5.md](release/RELEASE_NOTES_beta_0_4_5.md).
 - **New home:** https://github.com/Homflattovr/FarcryVVR_Release.

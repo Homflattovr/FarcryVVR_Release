@@ -61,6 +61,7 @@ struct Input
     bool      weapon_rot_ok{ false };
     glm::mat3 weapon_draw_rot{ 1.0f };   // reloadzonesfollow (FarCry5Stereo.h draw_turn): the gun as drawn (tracking space), when turned off the controller
     bool      weapon_draw_rot_ok{ false };
+    glm::vec3 weapon_draw_pos{ 0.0f };   // stockeye: the drawn gun's grip point (tracking space), set with weapon_draw_rot
     bool      reload{ false };         // reloadmanual (FarCry5Reload.cpp): reloadmanual on and the weapon in hand is one of reloadweapons
     bool      b_down{ false };         // reloadmanual: the weapon hand's B (pad Y) now, a pop-up's Esc press excluded
     bool      b_mod{ false };          // reloadmanual: the other hand's grip held raw (left grip + B is the throw)

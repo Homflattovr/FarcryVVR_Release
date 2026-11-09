@@ -40,7 +40,6 @@ namespace fc5 {
 inline constexpr const char* kReleaseSettings = R"FC5VR(
 # Far Cry 5 VR settings: the same commands as fc5vr_cmd.txt, replayed at start (edited by the mod).
 adsprobe optic
-aimlead 1.0
 airfollow on
 airroll 1.00
 aniso 16
@@ -245,7 +244,6 @@ throwv2hand right
 throwv2rb grab
 tracersfromgun off
 upright on
-vehfade off
 vehicleperpair on
 vehicles on
 vehplayerfov on

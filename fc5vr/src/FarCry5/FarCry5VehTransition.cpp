@@ -79,6 +79,7 @@
 // gives its size.
 #include "FarCry5Stereo.h"
 #include "FarCry5Lua.h"
+#include "FarCry5CullHead.h"
 
 #include <glm/gtc/constants.hpp>
 #include <spdlog/spdlog.h>
@@ -108,21 +109,9 @@ bool FarCry5Stereo::vehtrans_command(const std::string& cmd, const std::string& 
         return true;
     }
     if (cmd == "vehaimfrontnow") { veh_aim_front_arm(std::chrono::steady_clock::now(), "vehaimfrontnow"); return true; }   // test
-    if (cmd == "exitpitch") { m_exit_pitch = on; persist = true; return true; }            // exitpitch on|off (saved)
-    if (cmd == "cullpitch") {                                                               // cullpitch N (deg, saved)
-        try {
-            m_cull_pitch_deg = std::clamp(std::stof(arg), 0.0f, 10.0f);
-        } catch (...) {
-            return false;
-        }
-        spdlog::info("[Cull] cullpitch {:.1f} deg: {}", m_cull_pitch_deg.load(),
-                     m_cull_pitch_deg.load() > 0.0f ? "the game's culled camera aimed that far below the head wherever the mod turns it" : "off (as before 7 Nov)");
-        persist = true;
-        return true;
-    }
     if (cmd == "exityaw") {                                                                 // exityaw on|off (saved)
         m_exit_yaw_ev = on;
-        spdlog::info("[Vehicle] exityaw {}", on ? "on (getting out, the culled camera follows the head's yaw through Extended View)" : "off (as before 7 Nov: pitch only)");
+        spdlog::info("[Vehicle] exityaw {}", on ? "on (getting out, the culled camera follows the head's yaw through Extended View)" : "off (as before 7 Nov)");
         persist = true;
         return true;
     }
@@ -265,21 +254,6 @@ bool FarCry5Stereo::veh_seat_update(int frame)
 }
 
 // One step of the view following the enter / exit animation (vehentryfollow), applied between pairs as m_body_yaw_pending.
-float FarCry5Stereo::cull_bias() const
-{
-    return glm::radians(std::clamp(m_cull_pitch_deg.load(), 0.0f, 10.0f));
-}
-
-glm::vec3 FarCry5Stereo::cull_target(const glm::vec3& head_world) const
-{
-    // The head's direction with its pitch lowered by cullpitch (yaw as yaw_of: 0 = +y, counter-clockwise; pitch = asin(z)).
-    const glm::vec3 h = glm::normalize(head_world);
-    const float     b = cull_bias();
-    if (b == 0.0f) return h;
-    const float y = std::atan2(-h.x, h.y), p = std::asin(std::clamp(h.z, -1.0f, 1.0f)) - b;
-    return glm::vec3{ -std::sin(y) * std::cos(p), std::cos(y) * std::cos(p), std::sin(p) };
-}
-
 float FarCry5Stereo::veh_anim_cam_yaw() const
 {
     // exityaw: the camera carries the head's yaw handed through Extended View; the animation's own camera is the camera less it.
@@ -340,21 +314,6 @@ void FarCry5Stereo::draw_vehtrans_menu(const std::function<void(const char*, std
     }
     hint("Getting out first looks like a change of seat to the mod. On (default): that is not settled while no vehicle is under you, so getting out has one settle. "
          "Off: as before 23 Oct (a cut and a recentre 0.6 s before the exit's own).");
-    v = m_exit_pitch.load();
-    if (ImGui::Checkbox("Vehicles: getting out, the game draws where you look up or down", &v)) {
-        m_exit_pitch = v;
-        keep("exitpitch", v ? "exitpitch on" : "exitpitch off");
-    }
-    hint("On (default; author 29 Oct: getting out of a car while looking down, the lower part of the view was not drawn for a second): during the exit animation the "
-         "game's head look tilts the camera the game draws with up or down with your head, as when getting in. Off: as before 29 Oct.");
-    float cp = m_cull_pitch_deg.load();
-    if (ImGui::SliderFloat("Culling: the game's view aimed below the head (deg, test)##cullpitch", &cp, 0.0f, 10.0f, "%.1f")) {
-        m_cull_pitch_deg = cp;
-        keep("cullpitch", fmt::format("cullpitch {:.1f}", cp));
-    }
-    hint("0 (default): as before 7 Nov. The game draws a little less below the centre of its view than above it, and the headset's eyes see further down "
-         "than up, so the bottom edge of the view is the first to be cut. N deg aims the camera the game draws with that far below where you look, wherever "
-         "the mod turns it (holding a weapon, the weapon wheel, in vehicles, getting in and out). 4.5 evens out the spare room at the top and bottom.");
     v = m_exit_yaw_ev.load();
     if (ImGui::Checkbox("Vehicles: getting out, the game draws where you look left or right", &v)) {
         m_exit_yaw_ev = v;

@@ -855,7 +855,7 @@ Output update(const Input& in_game)
         ri.listed   = in.reload && fc5::reload::on();
         ri.active   = ri.listed && in.allowed && in.weapon && !g_slung.load() && !bow_on;   // (the sling's state of the last poll)
         ri.sig      = in.sig;
-        ri.gun_pos  = in.hand[kWeaponHand].pos;
+        ri.gun_pos  = in.weapon_draw_rot_ok ? in.weapon_draw_pos : in.hand[kWeaponHand].pos;   // stockeye: the gun moved off the controller
         ri.gun_rot  = in.weapon_draw_rot_ok ? in.weapon_draw_rot : in.weapon_rot;   // reloadzonesfollow: the gun as drawn (gunstock calibration, two hands)
         ri.gun_ok   = in.hand[kWeaponHand].tracked && in.weapon_rot_ok;
         ri.hand_pos = in.hand[kOtherHand].pos;

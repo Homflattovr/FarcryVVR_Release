@@ -25,14 +25,13 @@ namespace fc5::dlss
     void set_ofxr_fallback(bool on);
     bool ofxr_fallback();
     std::string ofxr_status();   // OFXR's route, whether it takes DLSS data, its publication count (F11)
-    // ofxrmenupause on|off (saved, default on; author 8 Nov 10:34): OFXR's own "pause frame generation" signal (the tray's
-    // Ctrl+Alt+F7) set while the flat screen shows (menus, map, loading screens, flat cinematics) and reset after: no black
-    // blinking from frames generated with no new DLSS data. A pause set by hand is left alone.
-    void        set_ofxr_menu_pause(bool on);
-    bool        ofxr_menu_pause();
-    void        ofxr_flat_screen(bool flat);   // every frame, from update_menu_screen
-    std::string ofxr_menu_pause_status();
     // NGX DLSS feature flags (1 HDR, 2 MV low res, 4 MV jittered, 8 depth inverted, 64 auto exposure); recreates the features.
+    // dlssmenurelease on|off (saved, default on; author 9 Nov 11:05): the mod's DLSS features released at the flat screen's start
+    // (menus, map, loading screens), made again at the first evaluation in play: frame generation tools that take DLSS's data
+    // stop in menus, as at the game's start. flat_screen is called every frame from update_menu_screen (present thread).
+    void set_menu_release(bool on);
+    bool menu_release();
+    void flat_screen(bool flat);
     void set_flags(int flags);
     // The DLSS model preset (0 default, 10 J, 11 K = DLSS 4 transformer); recreates the features.
     void set_preset(int preset);

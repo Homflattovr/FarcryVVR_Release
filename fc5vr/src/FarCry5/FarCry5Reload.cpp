@@ -548,22 +548,12 @@ namespace
     // A press is held back for reloadtap ms (quick: nothing, or with manual reload the magazine drop); held longer it is the pad's Y, kept down
     // at least bhealms ms from when it starts, so the game sees a hold (heal), never a tap (switch). A throw (left grip + B) sends no Y.
     // Off: right B is the pad's Y as before (tap: previous weapon; held: heal).
-    // reloadkeepone on|off (manualreload39; saved, default on; author 3 Nov 12:39): a magazine or belt-fed gun is empty for the mod with one round left in the game's clip (the round in the
-    // chamber, as a real gun's), so the clip never reaches 0 and the game never starts its own reload; the manual reload's tap refills it as
-    // before (no rounds made or lost). With no reserve left, the last round fires.
-    // manualreload45 (author 3 Nov 16:25; his log of 17:20: the M133's clip went 1 -> 0 at a
-    // shot and the game reloaded it by itself): pump and lever shotguns and revolvers too. The mod counts their shells and rounds itself; the
-    // game's clip is kept one above them (a shell or round loaded by hand taps the game's reload, hidden, while its clip is not above what is
-    // loaded), and the gun does not fire with one left in the game's clip while there is a reserve: load another first. Not the break actions,
-    // the M79 nor the RPG (a clip of 1 or 2: their last round would never fire): the game's reload at their empty clip stays kept out of the view.
-    std::atomic<bool>  g_keep_one{ true };
-    // reloadfullmag on|off (saved, default on; author 8 Nov 10:34): a
-    // magazine gun fires its whole magazine (the AR-C 30 of 30). Instead of reloadkeepone's round kept in the clip, the game's own reload at
-    // an empty clip is switched off in the gun's own data (bAutoReload, FarCry5SwitchSpeed.cpp autoreload_*). Until its block is found and
-    // written (about 250 ms after the gun comes into the hand), when it cannot be, and with no spare ammo (noautoswitch), the round is kept
-    // as before. If the game reloads by itself at empty anyway, it is put back and the round kept for the rest of the session (log [FullMag]).
-    std::atomic<bool>  g_full_mag{ true };
-    std::atomic<bool>  g_fm_want_now{ false };   // this poll: a magazine gun in hand that reloadfullmag applies to
+    // The kept round (manualreload39 / manualreload45, author 3 Nov; the switch reloadkeepone retired 9 Nov, always on): now only for the guns the
+    // ammo ledger does not cover (below), the pump and lever shotguns: the mod counts their shells itself, the game's clip is kept one above them
+    // (a shell loaded by hand fills it, silently), and the gun does not fire with one left in the game's clip while there is a reserve: load
+    // another first. The M79 and the rockets keep no round (reloadgrenadefill / reloadrocketfill fill their clip at 0 instead).
+    // reloadfullmag (bAutoReload written 0 in the gun's data) retired 9 Nov: it never stopped the game's reload at empty (research\2026-11-08_ammosystem
+    // \TEST.md round 1: 580 blocks written, the game still reloaded); the ledger does it instead.
     // noautoswitch on|off (saved, default on; author 7 Nov 08:53; his log
     // of 09:50:55: the AR-C's last round fired with no reserve, clip 0 reserve 0, and 260 ms later the game put the bow in his hands by itself):
     // reloadkeepone's kept round also with no reserve left, so the game's clip never reaches 0 with nothing to reload and the game never
@@ -571,6 +561,33 @@ namespace
     // while reloadkeepone is on and with the manual reload's guns (not the double barrels, the M79 nor the RPG, which keep no round). Off: the
     // last round fires and the game switches to another weapon, as before.
     std::atomic<bool>  g_no_switch{ true };
+    // The ammo ledger (author 8 Nov 20:51; research\2026-11-08_ammosystem\DESIGN.md "top-up ledger"; always on since 9 Nov 08:28,
+    // Author, its switch ammoledger retired). For magazine and belt guns, revolvers and break actions of 2 or more (not tubes, the M79, rockets or bows): the game's clip is kept
+    // from ever reaching 0 by silent top-ups (RefillPocketedWeaponClip, nothing taken from the reserve) when it falls to 1 with a real round left,
+    // so the game never starts its reload and no round is kept back (reloadkeepone, its "filled again" and keep_last are off for these guns).
+    // The rounds a top-up adds are the gun's surplus: a magazine gun's reload logic sees the game's clip less its surplus (the real count: the
+    // wrist shows it at full size, the trigger stops at 0, the handle is owed at 0); a revolver's and break action's count stays its chambers.
+    // The reserve: a magazine's load (the fill at the drop) takes what the fill put in plus the surplus it replaced (at most the reserve), so
+    // exactly what the magazine was missing; a round loaded by hand into a chamber takes 1; a top-up takes nothing. A rack's thrown round
+    // becomes surplus. The trigger is held while the game's clip is at 1 with a real round left and its top-up not landed (a failed top-up:
+    // that round stays held, as reloadkeepone did, and the top-up is asked again every 2 s), so the game's clip never reaches 0.
+    std::atomic<bool>  g_led_now{ false };
+    std::atomic<int>   g_led_real{ -1 };
+    // The one-shot hold (coordinator 9 Nov: a full-auto gun at 900 rpm fires every ~65 ms, a long frame could let one more through): with one
+    // real round left the hold is armed, and the player's next shot (the game's shot code, FarCry5BulletSpeed.cpp) holds the trigger at once
+    // (ModConfig's pad output: RT 0), not at the next clip read. Cleared by the poll at 0 (the empty gun's own hold) or above 1 (a load).
+    std::atomic<bool>  g_led_arm{ false }, g_led_shot_hold{ false };      // the ledger's real count this poll (ledger_low: the game's clip read every update while it is low)    // this poll: the gun in hand is the ledger's (keep_one() is off for it)
+    std::atomic<bool>  g_led_hold{ false };   // the trigger held: the game's clip at 1, its top-up not landed
+    struct Ledger
+    {
+        int               surplus = 0;    // rounds in the game's clip from top-ups (and a rack's thrown rounds): not real
+        int               fired   = 0;    // rounds fired since the last load (the game's clip going down), logged when the gun is empty
+        int               real_last = -1;
+        int               g_last  = -1;   // the game's clip at the last poll
+        bool              topup   = false, absorb = false;
+        clock::time_point t{};
+    };
+    std::map<uint32_t, Ledger> g_ledger_st;   // per weapon sig (g_mtx)
     // reloadbutton on|off (manualreload48; saved, default on; author 3 Nov 19:55): the reload button (left Y, the pad's X) still goes to
     // the game, and its reload is shown as the game plays it (not kept out of the view). Whatever the hands were doing is dropped (a magazine
     // or shell in the left hand, a handle being racked, the cylinder or feed cover open), and the weapon counts as loaded from the game's clip:
@@ -582,9 +599,10 @@ namespace
     std::atomic<bool>  g_btn_now{ false };                         // button_reload(), for the render thread
     std::atomic<bool>  g_rec{ false }, g_game_hand{ false };       // reloadrec, reloadgamehand (reloadmatch; tests, not saved)
     std::atomic<bool>  g_hand_game{ true };                        // reloadhandgame (reloadmatch; saved)
-    // reloadnogame on|off (saved, default on; author 4 Nov: the drop played the whole reload's sounds, the AK's right hand moved, the revolver's barrel out of nowhere, the AR-C's rounds at the well): where the manual reload tapped the game's reload to fill its clip (hidden, but its sounds, its hands and
-    // some of its parts still showed), the clip is now filled by the game's own call with no reload. The buttons that learn from the game's reload ("Something wrong") still tap it. Off: as before.
-    std::atomic<bool>  g_no_game{ true };
+    // reloadnogame (author 4 Nov: the drop played the whole reload's sounds, the revolver's barrel
+    // out of nowhere, the AR-C's rounds at the well; the switch retired 9 Nov, always on: the ammo ledger's loads need it): where the manual reload tapped the game's reload to fill its clip
+    // (hidden, but its sounds, its hands and some of its parts still showed), the clip is filled by the game's own call with no reload. The buttons that learn from the game's reload
+    // ("Something wrong") still tap it; a fill that fails falls back to the game's reload by itself (clip_fill_failed / clip_fill_short).
     bool               g_tap_real = false;                         // this tap is to be seen and learnt: the real reload
     // reloadbuttonguard on|off, reloadbuttonguardms N (manualreload51; saved, default on, 500; author 3 Nov 21:59): while a manual step is under way (a magazine, shell or round in the
     // left hand or going in, the handle or pump held, the magazine out of the gun, the cylinder or feed cover open, a lever moving, and
@@ -1621,11 +1639,21 @@ bool pump_aim_hold() { return g_pump_aim.load(); }
 bool pump_grip() { return g_pump_grip.load(); }
 bool mag_in_left_hand() { return g_mag_hand_now.load(); }
 bool b_heal_only() { return g_b_heal.load(); }
-bool keep_one() { return g_keep_one.load() && (g_empty_sig.load() == 0 || g_empty_sig.load() != g_sig_now.load()); }
+bool keep_one() { return !g_led_now.load() && (g_empty_sig.load() == 0 || g_empty_sig.load() != g_sig_now.load()); }   // (ammoledger: no round kept)
+bool ledger_now() { return g_led_now.load(); }
+// (9 Nov, run 9DC155EC: after a top-up the game's clip reads 30 while the gun holds its last round; read every 100 ms by the game's clip, the
+// mod missed 30 -> 29 and a 31st round, a surplus one, left before the trigger was held. Read every update while the real count is low.)
+void ledger_on_shot()
+{
+    if (g_led_arm.exchange(false)) {
+        g_led_shot_hold = true;
+        if (g_log.load()) spdlog::info("[Reload] ammoledger: the last round left: the trigger held at once (the game's shot, before the next clip read)");
+    }
+}
+bool ledger_shot_hold() { return g_led_shot_hold.load(); }
+bool ledger_low() { return g_led_now.load() && g_led_real.load() >= 0 && g_led_real.load() <= 4; }
 // reloadkeepone's round kept with this reserve: with a reserve, or with none while noautoswitch is on (the game then never sees the gun empty).
-// reloadfullmag: the gun in hand's data has the game's reload at empty off (written and read back), so no round need be kept with a reserve.
-static bool full_mag_now() { return g_full_mag.load() && g_keep_one.load() && g_on.load() && g_fm_want_now.load() && fc5::switchspeed::autoreload_off(fc5::lua::weapon_object()); }
-static bool keep_res(int reserve) { return reserve > 0 ? !full_mag_now() : g_no_switch.load(); }
+static bool keep_res(int reserve) { return reserve > 0 || g_no_switch.load(); }
 bool button_reload() { return g_btn_now.load(); }
 bool hides_game_casings() { return g_casing_now.load(); }
 bool relearn_armed(uint32_t sig, int item) { return sig != 0 && sig == g_relearn_sig.load() && (g_relearn_items.load() & (1u << item)); }
@@ -2267,7 +2295,10 @@ void update(const In& in_game, Out& out)
     // reloadrackloss: from here on the clip is the game's less the rounds a rack threw out.
     In in = in_game;
     in.sig = reload_sig(in.sig);   // reloadsamegun
-    if (in.sig != 0 && in.ammo_ok && in.clip >= 0) {
+    // ammoledger: its guns count a rack's thrown round as surplus instead (below), so reloadrackloss is for tubes only then.
+    const Builtin* bt0     = builtin(in.sig);
+    const bool     led_any = !(bt0 && bt0->kind == kTube);
+    if (in.sig != 0 && in.ammo_ok && in.clip >= 0 && !led_any) {
         MagLoss& ml = g_mag_loss[in.sig];
         if (ml.lost > 0 && in.clip > ml.real) {   // filled
             const int n = std::min(ml.lost, std::max(in.reserve, 0));
@@ -2338,8 +2369,6 @@ void update(const In& in_game, Out& out)
         g_seat_hold = g_hand_was = false;
         g_btn_reload = false;
         g_btn_now    = false;
-        g_fm_want_now = false;
-        fc5::switchspeed::autoreload_want(g_full_mag.load() && g_keep_one.load() && g_on.load(), 0);   // reloadfullmag: nothing in hand to apply to
         // allreloadfire: another weapon while not active (the weapon wheel, the sling, a heal) starts the state again too. Without it the
         // next weapon kept the last one's chambers and clip (3 Nov 16:23 log: the 1887 came in with the M133's empty tube and chamber, and
         // the RPG-7 with the revolver's chambers known and the M249's clip 57, read as a shot that emptied it): held from firing for good.
@@ -2401,14 +2430,6 @@ void update(const In& in_game, Out& out)
         g_cyl_n = std::clamp(revolver_parts(in.sig, rvp) ? rvp.nround : 6, 1, 6);
         for (int i = g_cyl_n; i < 6; ++i) g_cyl[i] = 3;
     }
-    // reloadfullmag: a magazine or belt-fed gun (not a tube, a revolver or a break action), and not while its reload from empty is being
-    // learnt (g_empty_sig: that one is the game's own).
-    {
-        const bool fm_on = g_full_mag.load() && g_keep_one.load();   // (reloadkeepone off: the game's own reload at empty is wanted)
-        const bool fm    = fm_on && !tube && !rev && g_empty_sig.load() != in.sig;
-        g_fm_want_now    = fm;
-        fc5::switchspeed::autoreload_want(fm_on, fm ? uintptr_t(fc5::lua::weapon_object()) : 0);
-    }
     // allreload: the RPG-7 has nothing to open (always open for loading, a quick B does nothing), its rocket goes in at the muzzle and
     // leaves nothing when fired. The M79 is a break action of one chamber. A bolt action (the .308, reloadbolt) works its bolt after each shot.
     const bool     noopen = rev && rvp.noopen;
@@ -2457,6 +2478,74 @@ void update(const In& in_game, Out& out)
         if (g_log.load()) spdlog::info("[Reload] reloadforce {}: {}", f == 1 ? "dry" : f == 2 ? "out" : f == 3 ? "full" : f == 4 ? "take" : "geom", state_text());
     }
 
+    // The ammo ledger (see Ledger): which guns, the surplus, the top-up, the trigger hold; a magazine gun's clip from here on is the real count.
+    // Kept per weapon object (a gun spawned again is a new object with a real clip), else per sig.
+    const bool led_mag = led_any && in.ammo_ok && in.clip >= 0 && !tube && !rev;
+    const bool led_rev = led_any && in.ammo_ok && in.clip >= 0 && rev && !noopen && !gone && !(brk && bt && bt->rround) && !rvp.rigid_rounds && g_cyl_n >= 2;
+    g_led_now = led_mag || led_rev;
+    Ledger* led = nullptr;
+    if (led_mag || led_rev) {
+        const uint64_t wobj = fc5::lua::weapon_object();
+        led                 = &g_ledger_st[wobj ? uint32_t(wobj ^ (wobj >> 32)) | 1u : in.sig];
+        const int G         = in.clip;
+        if (led->g_last >= 0 && G > led->g_last) {
+            if (led->topup) {
+                led->surplus += G - led->g_last;
+                if (g_log.load()) spdlog::info("[Reload] ammoledger: topped up {} -> {} (nothing taken): {} surplus round(s) in the game's clip", led->g_last, G, led->surplus);
+            } else if (led_mag && led->surplus > 0) {
+                // A load (the mod's fill at the drop, or the game's own reload): the clip is real again, and the reserve gives the surplus it replaced.
+                const int n = std::min(led->surplus, std::max(in.reserve, 0));
+                if (n > 0) fc5::lua::reserve_take_request(n);
+                if (g_log.load()) spdlog::info("[Reload] ammoledger: loaded {} -> {}: {} more round(s) off the reserve {} for the surplus replaced ({} left)", led->g_last, G, n, in.reserve, led->surplus - n);
+                led->surplus -= n;
+            } else if (led_rev) {
+                led->surplus = 0;   // (a revolver's count is its chambers: the clip is a tank either way)
+            }
+            if (!led->topup) led->fired = 0;   // a load: the count starts again
+            led->topup  = false;
+            led->absorb = false;
+        } else if (led->absorb && led_mag && G > 0 && g_clip_max.count(in.sig) && G >= g_clip_max[in.sig]) {
+            // A load asked with the game's clip already full (of surplus): the reserve gives what the magazine was missing.
+            const int n = std::min(led->surplus, std::max(in.reserve, 0));
+            if (n > 0) fc5::lua::reserve_take_request(n);
+            if (g_log.load()) spdlog::info("[Reload] ammoledger: loaded with the clip already full ({}): {} round(s) off the reserve {} for the surplus replaced", G, n, in.reserve);
+            led->surplus -= n;
+            led->absorb = false;
+        }
+        if (led->g_last >= 0 && G < led->g_last) led->fired += led->g_last - G;   // shots (every one a real round: the trigger stops at 0)
+        led->g_last = G;
+        led->surplus = std::clamp(led->surplus, 0, std::max(0, G));
+        int live_now = 0;
+        for (int i = 0; i < g_cyl_n; ++i) live_now += g_cyl[i] == 1;
+        const int real = led_mag ? G - led->surplus : (g_cyl_known ? live_now : G);
+        if (led_rev && led->real_last == 0 && real > 0) led->fired = 0;   // a revolver loaded again by hand
+        if (real == 0 && led->real_last > 0 && g_log.load())
+            spdlog::info("[Reload] ammoledger: weapon {} fired empty: {} round(s) since its load, no game reload (the game's clip at {}, {} surplus)", in.sig, led->fired, G, led->surplus);
+        led->real_last = real;
+        g_led_real     = real;
+        if (real >= 2 || real <= 0) { g_led_arm = false; g_led_shot_hold = false; }   // a load, or the empty gun's own hold from here
+        else if (!g_led_shot_hold.load()) g_led_arm = true;                          // one round left: its shot holds the trigger at once
+        // The top-up: the game's clip at 1 with a real round still in (its next shot would take the game's clip to 0).
+        if (G <= 1 && real >= 1) {
+            if (!led->topup || ms_since(led->t, now) > 2000.0f) {
+                if (led->topup && g_log.load()) spdlog::info("[Reload] ammoledger: the top-up asked {:.0f} ms ago never landed (clip {}): asked again; the round stays held", ms_since(led->t, now), G);
+                led->topup = true;
+                led->t     = now;
+                fc5::lua::clip_fill_request(0);
+                if (g_log.load()) spdlog::info("[Reload] ammoledger: the game's clip at {} with {} real round(s): topped up silently (no reload of the game's, nothing taken)", G, real);
+            }
+            g_led_hold = true;
+        } else {
+            g_led_hold = false;
+        }
+        if (led_mag) in.clip = std::max(0, real);
+    } else {
+        g_led_hold      = false;
+        g_led_real      = -1;
+        g_led_arm       = false;
+        g_led_shot_hold = false;
+    }
+
     // The game's ammo. Its clip at 0: the round in the chamber is gone too, so the handle must be racked once a fresh magazine is in. The
     // game then reloads by itself (bAutoReload): kept out of the view as the tapped one.
     const int prev_clip = g_last_clip;
@@ -2492,7 +2581,7 @@ void update(const In& in_game, Out& out)
             if (g_log.load()) spdlog::info("[Reload] {} {} in hand: {} live round(s) in the {} (from the game's clip, reserve {})", brk ? "break action" : "revolver", in.sig,
                                            std::min(in.clip, g_cyl_n), brk ? "barrels" : "cylinder", in.reserve);
             // reloadlauncherfill: a launcher taken in hand empty: its clip filled at once, so the game draws its round (at the hip); the chamber stays empty.
-            if (g_launcher_fill.load() && rvp.rigid_rounds && in.clip == 0 && in.reserve > 0 && g_no_game.load() && !g_game_pending && !g_key_pending) {
+            if (g_launcher_fill.load() && rvp.rigid_rounds && in.clip == 0 && in.reserve > 0 && !g_game_pending && !g_key_pending) {
                 g_key_pending  = true;
                 g_game_pending = true;
                 g_clip_at_tap  = in.clip;
@@ -2517,7 +2606,7 @@ void update(const In& in_game, Out& out)
             // reloadrocketfill (author 5 Nov: the RAT's rocket; RPG: "leftover of animation after shooting (automatic reload)"): the hip's rocket is drawn in the game's own draw of it, and the game draws
             // none with an empty clip; its automatic reload starts then, too. Filled at once (reloadnogame), it has nothing to reload, and the mod's count says the launcher is empty.
             // reloadgrenadefill: the M79 too (its fired grenade stays in the chamber, counted fired: it fires again only loaded by hand).
-            if ((gone || (g_grenade_fill.load() && rvp.rigid_rounds)) && in.clip == 0 && in.reserve > 0 && g_no_game.load() && !g_game_pending && !g_key_pending) {
+            if ((gone || (g_grenade_fill.load() && rvp.rigid_rounds)) && in.clip == 0 && in.reserve > 0 && !g_game_pending && !g_key_pending) {
                 g_key_pending  = true;
                 g_game_pending = true;
                 g_clip_at_tap  = in.clip;
@@ -2557,22 +2646,8 @@ void update(const In& in_game, Out& out)
                                  dry_at ? "one round kept in the game's clip (reloadkeepone): the game starts no reload of its own"
                                         : "the game's own reload kept out of the view");
             }
-            if (in.clip == 0 && !full_mag_now())   // (reloadfullmag: no reload of the game's to keep out of the view)
+            if (in.clip == 0)
                 g_busy_until = std::max(g_busy_until, now + std::chrono::milliseconds(int(std::max(kBusySecs, rev ? rvp.busy_s : 0.0f) * 1000.0f)));
-        }
-        // reloadfullmag: the clip ran to 0 with the game's reload at empty written off and then grew with no reload of the mod's asked (no
-        // fill or tap pending, not the reload button): the game reloaded by itself after all. Put back; the round is kept from now.
-        static uint32_t fm_dry_sig = 0;
-        if (fm_dry_sig != 0 && fm_dry_sig == in.sig && prev_clip == 0 && in.clip > 0 && !g_game_pending && !g_key_pending && !g_btn_reload) {
-            fc5::switchspeed::autoreload_failed();
-            if (g_log.load()) spdlog::info("[Reload] reloadfullmag: weapon {}'s clip 0 -> {} (reserve {}) with no reload asked: the game reloaded by itself; reloadkeepone's round from now", in.sig,
-                                           in.clip, in.reserve);
-        }
-        if (in.clip == 0 && prev_clip > 0) {
-            fm_dry_sig = full_mag_now() ? in.sig : 0;
-            if (fm_dry_sig != 0 && g_log.load()) spdlog::info("[Reload] reloadfullmag: weapon {} fired its whole magazine (reserve {}): the game's own reload at empty is off", in.sig, in.reserve);
-        } else if (in.clip > 0 || in.sig != fm_dry_sig) {
-            fm_dry_sig = 0;
         }
         if (g_game_pending && g_clip_at_tap >= 0 && in.clip > g_clip_at_tap) {
             g_game_pending = false;
@@ -2601,7 +2676,11 @@ void update(const In& in_game, Out& out)
     const int  tube_cap  = std::max(cmax_it != g_clip_max.end() ? cmax_it->second : 0, bt && bt->clip > 0 ? bt->clip : 8);
     const bool tube_full = tube && by_hand >= tube_cap;
     // reloadkeepone (manualreload45): a shotgun or revolver keeps one round more in the game's clip than it holds by hand.
-    const bool keep_tr   = keep_one() && (tube || (rev && !brk && !noopen)) && tube_cap >= 4;
+    // (8 Nov, author 20:44: the revolver fires all 6 with no game reload, the Sledge played the game's at empty: a break action of two barrels
+    // keeps one too: the clip at 1 with a barrel still live is filled again by the same hidden tap as the revolver's (reloadnogame, below),
+    // so both barrels fire and the clip never reaches 0. Not the M79: one round, nothing to keep beside it: its clip is filled at 0 by
+    // reloadgrenadefill, the same hidden tap.)
+    const bool keep_tr   = keep_one() && (tube || (rev && !noopen && !(brk && bt && bt->rround))) && tube_cap >= (brk ? 2 : 4);
     const bool keep_last = keep_tr && in.ammo_ok && in.clip <= 1 && keep_res(in.reserve);
     int        cyl_live = 0, cyl_target = -1;
     // reloadbutton (manualreload48): the reload button pressed: the game's own reload, shown; the hands' part dropped, the weapon loaded.
@@ -3428,6 +3507,10 @@ void update(const In& in_game, Out& out)
                 g_insert         = 0.0f;
                 g_cyl[rev_target] = 1;
                 g_cyl_known      = true;
+                if (led_rev && in.ammo_ok && in.reserve > 0) {
+                    fc5::lua::reserve_take_request(1);   // ammoledger: the round off the reserve (the game's fills for it take nothing)
+                    if (g_log.load()) spdlog::info("[Reload] ammoledger: a round loaded by hand: 1 off the reserve {}", in.reserve);
+                }
                 buzz(out, kHand, 0.5f, 0.04f);
                 buzz(out, kGun, 0.4f, 0.04f);
                 sound(kSndMagIn);
@@ -3527,7 +3610,8 @@ void update(const In& in_game, Out& out)
                 g_ejects++;
                 sound(kSndEject);
                 const bool lost = g_rack_loss.load() && in.ammo_ok && !fired_case;
-                if (lost) g_mag_loss[in.sig].lost++;
+                if (lost && led && led_mag) led->surplus++;   // ammoledger: the thrown round is surplus
+                else if (lost) g_mag_loss[in.sig].lost++;
                 if (g_log.load()) spdlog::info("[Reload] bolt back: {} ejected ({}; the game's clip {}, the mod's {})", fired_case ? "the fired case" : "a live round", lost ? "one less in the magazine" : "nothing lost",
                                                in.ammo_ok ? std::to_string(g_mag_loss[in.sig].real) : std::string{ "?" }, in.ammo_ok ? std::to_string(in.clip - (lost ? 1 : 0)) : std::string{ "?" });
             } else if (g_log.load()) {
@@ -3617,7 +3701,8 @@ void update(const In& in_game, Out& out)
                 sound(kSndEject);
                 // (author 5 Nov: g_mag_loss. A bolt's fired case is no round.)
                 const bool lost = g_rack_loss.load() && in.ammo_ok && !g_bolt_owed;
-                if (lost) g_mag_loss[in.sig].lost++;
+                if (lost && led && led_mag) led->surplus++;   // ammoledger: the thrown round is surplus
+                else if (lost) g_mag_loss[in.sig].lost++;
                 if (g_log.load()) spdlog::info("[Reload] a round ejected by the pull ({}; the game's clip {}, the mod's {})", lost ? "one less in the magazine" : "nothing lost", in.ammo_ok ? std::to_string(g_mag_loss[in.sig].real) : std::string{ "?" }, in.ammo_ok ? std::to_string(in.clip - (lost ? 1 : 0)) : std::string{ "?" });
             }
             if (g_bolt_owed && !g_need_rack) {
@@ -3657,12 +3742,15 @@ void update(const In& in_game, Out& out)
         }
         filling = false;
     }
-    if (g_key_pending && g_no_game.load() && !g_tap_real && !fc5::lua::clip_fill_failed() && g_empty_sig.load() != in.sig) {
+    if (g_key_pending && !g_tap_real && !fc5::lua::clip_fill_failed() && g_empty_sig.load() != in.sig) {
         // reloadnogame: no reload of the game's behind the manual one.
         g_key_pending = false;
         g_busy_until  = now;
         filling       = true;
-        fc5::lua::clip_fill_request();
+        // ammoledger: a magazine gun's load (the surplus it replaces taken by the ledger once it lands); a revolver's or break action's fill takes
+        // nothing (each round loaded by hand took its own).
+        if (led && led_mag) { led->topup = false; led->absorb = true; }
+        fc5::lua::clip_fill_request(led_mag ? 1 : led_rev ? 0 : -1);
     } else if (g_key_pending) {
         g_key_pending = false;
         g_tap_real    = false;
@@ -3746,7 +3834,7 @@ void update(const In& in_game, Out& out)
     keep_said = keep_last;
     // reloadkeepone with a full cylinder or tube: the clip has no room for the round it keeps, so the last round by hand met "one left in the game's clip: no shot" (author 5 Nov: 6 live, 5 shots): filled again
     // (reloadnogame), so every round by hand fires.
-    if (keep_tr && g_no_game.load() && in.ammo_ok && in.clip <= 1 && in.reserve > 0 && !g_game_pending && !g_key_pending && !g_btn_reload && (rev ? cyl_live : by_hand) >= 1) {
+    if (keep_tr && in.ammo_ok && in.clip <= 1 && in.reserve > 0 && !g_game_pending && !g_key_pending && !g_btn_reload && (rev ? cyl_live : by_hand) >= 1) {
         g_key_pending  = true;
         g_game_pending = true;
         g_clip_at_tap  = in.clip;
@@ -3761,6 +3849,7 @@ void update(const In& in_game, Out& out)
                             : (!g_mag_in_gun || g_need_rack || g_bolt_owed || g_game_pending || g_engaged || g_racking || (belt && (g_open || open_f > 0.01f)) ||
                                (boltt && (g_bolt_open || g_bolt_up > 0.0f || g_rack > 0.0f)) ||   // reloadboltturn: fires only locked down
                                (keep_one() && in.ammo_ok && in.clip <= 1 && keep_res(in.reserve)));   // reloadkeepone: the round kept in the clip
+    if (g_led_hold.load()) out.no_fire = true;   // ammoledger: the game's clip at 1, its top-up not landed
     const bool busy = now < g_busy_until && !g_btn_reload;   // reloadbutton: the game's reload shown, not kept out of the view
     g_busy_now      = busy;
     g_pending_now   = g_game_pending;
@@ -4007,12 +4096,9 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
     if (cmd == "reloadtravel") { g_travel = std::clamp(arg.empty() ? kTravelDefault : fv, 0.02f, 0.12f); persist = true; return true; }
     if (cmd == "reloadrack") { g_rack_len = std::clamp(arg.empty() ? kRackDefault : fv, 0.02f, 0.15f); persist = true; return true; }
     if (cmd == "reloadlog") { g_log = arg.empty() || on; return true; }
-    if (cmd == "reloadnogame") {
-        g_no_game = arg.empty() || on;
-        persist   = true;
-        spdlog::info("[Reload] reloadnogame {}", g_no_game.load() ? "on: the clip filled with no reload of the game's behind the manual one" : "off: the game's reload tapped, hidden, to fill the clip");
-        return true;
-    }
+    // Switches retired 9 Nov with the ammo ledger always on (author 08:28): reloadnogame and reloadkeepone (always on), ammoledger (always on), reloadfullmag (removed: it never worked). A saved line of
+    // theirs from an older settings file is taken and dropped (not saved again), with nothing done.
+    if (cmd == "reloadnogame" || cmd == "reloadkeepone" || cmd == "ammoledger" || cmd == "reloadfullmag") return true;
     if (cmd == "reloadhandgame") {
         g_hand_game = arg.empty() || on;
         fc5::fingers::use_builtin_grips(g_hand_game.load());
@@ -4508,21 +4594,6 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
         persist     = true;
         spdlog::info("[Reload] reloadcasinghide {}", g_casing_on.load() ? "on: the game's own spent casing hidden with a gun whose shell leaves by the pump, lever or bolt"
                                                                         : "off: the game's own spent casing shown too");
-        return true;
-    }
-    if (cmd == "reloadkeepone") {
-        g_keep_one = arg.empty() || on;
-        persist    = true;
-        spdlog::info("[Reload] reloadkeepone {}", g_keep_one.load() ? "on: a magazine runs dry with one round left in the game's clip, so the game starts no reload of its own"
-                                                                    : "off: the game reloads by itself when its clip runs dry (kept out of the view)");
-        return true;
-    }
-    if (cmd == "reloadfullmag") {
-        g_full_mag = arg.empty() || on;
-        persist    = true;
-        if (!g_full_mag.load()) fc5::switchspeed::autoreload_want(false, 0);   // put back at once
-        spdlog::info("[Reload] reloadfullmag {}", g_full_mag.load() ? "on: a magazine gun fires its whole magazine; the game's own reload at empty is switched off in its data instead of keeping a round"
-                                                                      : "off: reloadkeepone keeps one round in the game's clip (the AR-C fires 29 of 30)");
         return true;
     }
     if (cmd == "noautoswitch") {
@@ -5263,34 +5334,18 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
         ImGui::Unindent(16.0f);
     }
     if (sub("Gun: magazine, handle, pump##rlsub")) {
-        bool nog = g_no_game.load();
-        if (ImGui::Checkbox("No game reload behind the manual one##reloadnogame", &nog)) cmds += nog ? "reloadnogame on\n" : "reloadnogame off\n";
-        hint("On (default, author 4 Nov): the gun's clip is filled directly. Off: the game's own reload runs hidden to fill it, as before: its sounds, its hand moves and some of its parts can show. "
-             "Command reloadnogame on/off.");
         bool ns = g_no_stuck.load();
         if (ImGui::Checkbox("Never left unable to fire##reloadnostuck", &ns)) cmds += ns ? "reloadnostuck on\n" : "reloadnostuck off\n";
         hint("On (default, author 3 Nov): a weapon the manual reload holds as empty (a shotgun, a revolver, a double barrel, the M79, the RPG-7, a handle "
              "or bolt to work) while the game still has rounds in its clip is loaded from the game's clip: at once if nothing can go in by hand (its "
              "well or muzzle not measured yet), else after 6 s with nothing done towards the reload. Off: it stays held until loaded by hand. "
              "Command reloadnostuck on/off.");
-        bool k1 = g_keep_one.load();
-        if (ImGui::Checkbox("Empty magazine: the game does not reload by itself##reloadkeepone", &k1)) cmds += k1 ? "reloadkeepone on\n" : "reloadkeepone off\n";
-        hint("On (default, author 3 Nov): a magazine gun is empty for the manual reload with one round left in the game's clip (the round in the chamber), "
-             "so the game's own reload never starts when you shoot it empty; the next magazine refills it as before. With no spare ammo left, the last "
-             "round fires. Shotguns and revolvers too (3 Nov): the game holds one round more than you loaded by hand, and with one left in its clip "
-             "the gun waits for the next shell or round. Not the double barrels, the M79 nor the RPG. Off: the game reloads by itself at empty, hidden. "
-             "Command reloadkeepone on/off.");
-        bool fmg = g_full_mag.load();
-        if (ImGui::Checkbox("Fire the whole magazine (30 of 30 on the AR-C)##reloadfullmag", &fmg)) cmds += fmg ? "reloadfullmag on\n" : "reloadfullmag off\n";
-        hint("On (default, author 8 Nov): instead of keeping one round in the game's clip (the AR-C fired 29), the game's own reload at an empty "
-             "magazine is switched off in the gun's data, so every round fires and the game still starts no reload. Magazine and belt-fed guns. "
-             "Until the gun's data is found (a quarter second after it comes into your hand), or with no spare ammo left, the round is kept as "
-             "before. Needs the option above. Command reloadfullmag on/off.");
         bool nsw = g_no_switch.load();
-        if (ImGui::Checkbox("Out of ammo: the game does not switch weapon by itself##noautoswitch", &nsw)) cmds += nsw ? "noautoswitch on\n" : "noautoswitch off\n";
-        hint("On (default, author 7 Nov): with no spare ammo left, the last round stays in the gun unfired (the wrist shows 0), so the game never "
-             "sees the gun empty and does not put another weapon in your hands; pick up ammo and it fires again. Needs the option above. Off: the last "
-             "round fires and the game switches to another weapon by itself. Command noautoswitch on/off.");
+        if (ImGui::Checkbox("Out of ammo: the game does not switch weapon by itself (pump and lever shotguns)##noautoswitch", &nsw)) cmds += nsw ? "noautoswitch on\n" : "noautoswitch off\n";
+        hint("On (default, author 7 Nov): a pump or lever shotgun with no spare ammo left keeps its last shell unfired (the wrist shows 0), so the game "
+             "never sees it empty and does not put another weapon in your hands; pick up ammo and it fires again. Off: the last shell fires and the game "
+             "switches weapon by itself. (Magazine guns, revolvers and double barrels never let the game's clip reach 0: every round fires and the "
+             "game reloads nothing by itself, since 9 Nov.) Command noautoswitch on/off.");
         {
             bool ao = g_act_on.load();
             if (ImGui::Checkbox("Lever and pump: stay open once thrown, shells go in from near the port##reloadactionopen", &ao)) cmds += ao ? "reloadactionopen on\n" : "reloadactionopen off\n";

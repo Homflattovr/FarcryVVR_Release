@@ -5,6 +5,7 @@
 #include "FarCry5Gesture.h"
 #include "FarCry5Drive.h"
 #include "FarCry5LocalLights.h"
+#include "FarCry5StockEye.h"
 #include <d3d11.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
@@ -1661,11 +1662,9 @@ public:
     bool              cull_heads_now() const { return m_cull_heads.load() || (m_cine_cull.load() && m_cine_on && m_cine_mode.load() == 1 && !m_menu_screen_on) ||
                                                       (m_veh_cull_heads.load() && m_in_vehicle.load() && !m_menu_screen_on); }
     // Vehicles (author 14 Oct): vehcullheads (default on): the GPU culling planes around the head in every vehicle (the game culls
-    // with ~86 deg there); vehfade (default on): black while getting in / out until the culled camera is back on the head;
-    // vehentryfollow (default on): during the entry / exit animation the view follows the game camera; vehstick (default on):
+    // with ~86 deg there); vehentryfollow (default on): during the entry / exit animation the view follows the game camera; vehstick (default on):
     // the right stick goes to the game while piloting with head look (turns a helicopter).
     std::atomic<bool> m_veh_cull_heads{ true };
-    std::atomic<bool> m_veh_fade{ true };
     bool              m_veh_settle_entry{ false };   // the running settle is getting in (not a seat change)
     std::atomic<bool> m_veh_entry_follow{ true };
     std::atomic<bool> m_veh_stick{ true };
@@ -1779,10 +1778,6 @@ public:
     bool              mounted_command(const std::string& cmd, const std::string& arg, bool& persist);
     void              draw_mounted_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint);
     void              spawn_back_axis(float& bx, float& by) const;   // spawnfacing: the player's back axis now, for the spawn commands
-    float             m_fade_level{ 0.0f };
-    bool              m_fade_was_want{ false }, m_fade_hold{ false };
-    int               m_fade_cov_good{ 0 };
-    std::chrono::steady_clock::time_point m_fade_hold_t0{};
     float             m_head_rel_yaw{ 0.0f };   // the head's yaw in the body frame (last update_motion)
     // airfollow (default on; author 14 Oct): driving any vehicle with head look, the body frame is the vehicle's own attitude, taken from the game
     // camera with the head look offset it carries taken out (heading and pitch in full, roll times airroll, default 1);
@@ -2046,10 +2041,6 @@ private:
     // snapsync (default on): a snap turn turns the game camera first (the whole angle in one mouse send) and the eyes
     // turn at the first upload whose camera has turned, so the eyes never face where the game has not culled for.
     std::atomic<bool>  m_snap_sync{ true };
-    // aimlead N (pairs): the game camera aimed ahead of a turning head by its turn speed (see motion_post_present).
-    std::atomic<float> m_aim_lead{ 1.0f };
-    bool               m_lead_valid{ false };
-    float              m_lead_prev_yaw{ 0.0f }, m_lead_prev_pitch{ 0.0f }, m_lead_vel_yaw{ 0.0f }, m_lead_vel_pitch{ 0.0f };
     float              m_snap_sync_pend{ 0.0f };   // body yaw waiting for the game camera (rad)
     float              m_snap_sync_game0{ 0.0f };  // game camera yaw when the turn was sent
     int                m_snap_sync_frame0{ 0 };
@@ -2061,30 +2052,18 @@ private:
     float              m_veh_pitch_ref{ 0.0f };
     bool               m_veh_pitch_ref_ok{ false };
     int                m_veh_pitch_guarded{ 0 };
-    std::atomic<bool>  m_settle_pitch{ true };     // cmd settlepitch (23 Oct): Extended View pitch follows the head during a vehicle's entry animation
-    // exitpitch on|off (default on, saved; F11 Comfort > Cinematics and vehicles; author 29 Oct 10:12 playtest: he got out of a car
-    // looking down, and for a second the eyes were 55 deg below the camera the game culls with, every frame past its view): settlepitch's
-    // Extended View pitch during the exit animation too, so the culled camera looks up / down with the head while getting out.
-    std::atomic<bool>  m_exit_pitch{ true };
     // exityaw on|off (default on since author 7 Nov 19:59Z, saved; F11 Comfort > Cinematics and vehicles, next to exitpitch; author 7 Nov 14:11, research\2026-11-07_camera_culling_transitions.md T2 / F2): during the exit animation the
     // head's yaw too goes to the game through Extended View (up to splitevmax handed), so the camera the game culls with stays on the head
     // while the animation swings it (up to 261 deg in the author's logs). The exit's follow snaps and its end read the animation's camera less
     // that offset (veh_anim_cam_yaw); once the animation is over firesplit carries on from the offset while the aim comes back (as wheellook).
-    // One "[Vehicle] exityaw" line at each exit's start and end. Off: as before 7 Nov (pitch only, exitpitch).
+    // One "[Vehicle] exityaw" line at each exit's start and end. Off: as before 7 Nov. Kept with cullhead (9 Nov cleanup): the exit's view follow
+    // reads the animation's camera through it, so the head look's offset leaving the camera at the exit is not taken for a turn.
     std::atomic<bool>  m_exit_yaw_ev{ true };
     std::atomic<bool>  m_exy_active{ false };      // exityaw: handing the yaw now
     std::atomic<float> m_exy_oy{ 0.0f };           // exityaw: the yaw offset the current camera carries (radians)
     int                m_exy_n{ 0 }, m_exy_clamped{ 0 };
     float              m_exy_max{ 0.0f };
     float              veh_anim_cam_yaw() const;   // the game camera's yaw less exityaw's offset (the exit animation's own camera)
-    // cullpitch N (degrees 0-10, default 0 = off, saved; F11 Comfort > Cinematics and vehicles; research\2026-11-07_camera_culling_transitions.md F1):
-    // wherever the mod points the game's culled camera through Extended View (firesplit, wheellook, the head look in vehicles, settlepitch,
-    // exitpitch / exityaw), it aims N deg below the head. The game's view reaches 58 deg down and 64.3 up from its centre, Quest 3 eyes 55 down
-    // and 44 up: only 3 deg spare at the bottom (362 of 598 headset culling episodes short there), 20 at the top; 4.5 deg evens them (7.5 / 15.8).
-    // The game's aim is read as the camera less the offset, so shots do not move. Not on foot with empty hands (the mouse aims there, no offset).
-    std::atomic<float> m_cull_pitch_deg{ 0.0f };
-    float              cull_bias() const;                              // cullpitch in radians
-    glm::vec3          cull_target(const glm::vec3& head_world) const; // the head's direction tilted cullpitch down (normalised)
     // chutelevel on|off (default on, saved; F11 Comfort > Cinematics and vehicles; author 29 Oct 10:15 playtest: bailing out of the plane,
     //). A fall held as a vehicle (chutelook) put the view on the fall's attitude: the game's
     // camera less the head look, which in a free fall points at the ground (his log: 47-53 deg down, vehpitchguard 451 times), so the
@@ -2159,7 +2138,6 @@ private:
     int                m_vsc_n{ 0 }, m_vsc_game_in{ 0 }, m_vsc_rules_in{ 0 }, m_vsc_in_out{ 0 }, m_vsc_out_in{ 0 }, m_vsc_unknown{ 0 }, m_vsc_drv{ 0 };
     std::chrono::steady_clock::time_point m_vsc_t0{};
     std::atomic<bool>  m_wheel_force{ false };     // cmd wheelforce (test): the aim loop acts as if the weapon wheel were open
-    std::atomic<bool>  m_wheel_look{ true };       // cmd wheellook (23 Oct): Extended View keeps the culled camera on the head while the weapon wheel is open
     std::atomic<bool>  m_body_start_head{ true };  // cmd bodystarthead (23 Oct): the body frame starts with the head where the game looks (was the controller)
     std::atomic<float> m_aim_back_limit{ 160.0f };  // cmd aimbacklimit (author 22 Oct, 0 = off): the game's aim at most this far round from the head
     float              m_aim_back_r{ 0.0f };
@@ -2706,9 +2684,12 @@ private:
     // markers are placed by the game for it.
     glm::mat4                m_hud_game_vrp{ 1.0f };
     int                      m_hud_game_vrp_frame{ -1 };
-    std::atomic<float> m_grip_off[3]{ 0.10f, -0.10f, -0.28f };   // the weapon's grip in the game camera's view (m)
+    // Shipped defaults of F11 Weapon > Weapon on the controller (its "Reset to default" button, author 9 Nov 09:29).
+    static constexpr float kGripOffDefault[3]{ 0.10f, -0.10f, -0.28f };
+    static constexpr float kGripPitchDefault = -5.0f;
+    std::atomic<float> m_grip_off[3]{ kGripOffDefault[0], kGripOffDefault[1], kGripOffDefault[2] };   // the weapon's grip in the game camera's view (m)
     std::atomic<float> m_barrel_off[3]{ 0.0f, 0.03f, -0.30f };   // the muzzle from the grip, controller axes (m)
-    std::atomic<float> m_grip_pitch{ -5.0f };   // grippitch (saved; -5 default, author 30 Oct 15:09)
+    std::atomic<float> m_grip_pitch{ kGripPitchDefault };   // grippitch (saved; -5 default, author 30 Oct 15:09)
     std::atomic<float> m_model_yaw{ 0.0f }, m_model_pitch{ 0.0f };
     std::atomic<float> m_converge_m{ 25.0f };
     std::atomic<bool>  m_converge_auto{ true };
@@ -3479,10 +3460,11 @@ private:
     // for the press tests made before one_hand_match runs (the fore-end grab point, gripnearweapon).
     std::mutex         m_draw_turn_mtx;
     glm::mat3          m_draw_turn{ 1.0f };
+    glm::vec3          m_draw_off{ 0.0f };   // stockeye: the drawn gun's offset from its controller (raw controller axes, m); zero otherwise
     bool               m_draw_turn_on = false;
-    bool               draw_turn(glm::mat3& E);
+    bool               draw_turn(glm::mat3& E, glm::vec3& off);
     glm::mat4          one_hand_drawn(const glm::mat4& k) const;
-    // gunstocklearn (author 8 Nov 10:33: click, hold a two-handed weapon and aim with it, after 8 s the
+    // gunstocklearn (author 8 Nov 10:33: click, hold a two-handed weapon and aim with it, after 5 s (8 before 9 Nov) the
     // angle correction is saved): an 8 s window; from 1.5 s on, each frame a long gun is held in two hands (not firing, not reloading) gives a
     // sample of its drawn barrel in the weapon controller's axes; at 8 s, with 2 s of samples or more, onehandmatch P Y become their mean (saved).
     // The only way the value is learnt (nothing in play). Position: the two-handed hold turns the gun about the weapon controller's point, as
@@ -3498,6 +3480,52 @@ private:
     std::string        gunstock_learn_text();
     void               gunstock_tick();   // a light buzz on the weapon hand's controller (Stereo.cpp)
     std::string        one_hand_match_text();
+    // stockeye, "Physical gunstock: each gun's sights before your eye" in F11 (author 8 Nov 21:52: they play with a physical gunstock;
+    // research\2026-11-08_stockeye; FarCry5StockEye.h holds the maths). Off by default, saved. On a stock both controllers are fixed to it:
+    // the line between them steers nothing new, and onehandmatch only matched one hand to two; what a stock needs is each gun's sights before
+    // the eye with the cheek on the stock. stockeyelearn (F11 button, 5 s: from 1 s on, the cheek on the stock, aiming) measures the dominant
+    // eye (scopeeye; auto: the weapon hand's side) and the head's look in the weapon controller's raw axes (kept as a pose, below).
+    // On, every long gun on its controller (one or two hands; not slung, kept, a bow, mounted, in a vehicle, handguns, launchers) is turned
+    // so its own sight line (sight_line: learnt or the model's; else the sight table's point) lies along that look and moved, square to
+    // the look only, so the line passes through the eye. The grip so moves off the hand by the stock's and the gun's difference (logged per
+    // weapon). onehandmatch and the two-handed line do not steer the gun meanwhile; the two-handed hold itself (the game's, the pump) stays.
+    // A gun with no sight line known keeps the hold as without stockeye (logged once). Changes of the placement (a sight line learnt, a
+    // slider) are eased over ~0.15 s; a new weapon at once.
+    // gunstockpose / gunstockguns (author 9 Nov 08:32: one subsection to change the angle and also the X Y Z position, for all
+    // two handed guns or per gun, with a reset to default button; the calibration changes both position and angle): the calibration is
+    // kept as a pose (FarCry5StockEye.h Pose: the look up / right deg, the point x right / y up of the controller cm, the gun z forward cm),
+    // for all long guns (m_gsp, saved as gunstockpose) or per gun (m_gsp_gun by weapon id, saved as one gunstockguns line). stockeyelearn
+    // (5 s) writes the pose of all guns, or of the gun in hand with stockeyelearn gun. Every value moves the gun (k), so the manual reload's
+    // zones, the fore-end grab and gripnearweapon follow it (draw_turn's turn and offset, one_hand_drawn).
+    std::atomic<bool>  m_se_on{ false };
+    std::mutex         m_se_mtx;                                    // the poses, the learn's samples and message
+    fc5::stockeye::Pose m_gsp{};                                    // all long guns
+    std::map<uint32_t, fc5::stockeye::Pose> m_gsp_gun;              // per gun (weapon id)
+    bool               m_gsp_edit_gun = false;                      // F11 only: the sliders, button and reset act on the gun in hand
+    fc5::stockeye::Pose gunstock_pose(uint32_t sig, bool* own = nullptr);   // the gun's pose (its own, else all guns')
+    std::string        gunstock_pose_line();                        // "gunstockpose up right x y z"
+    std::string        gunstock_guns_line();                        // "gunstockguns sig,up,right,x,y,z ..."
+    std::string        gunstock_gun_name(uint32_t sig);
+    bool               gunstock_gun_ok(uint32_t sig);               // a long gun in hand (F11: this gun only)
+    bool               m_se_l_gun = false;                          // this learn is for the gun in hand
+    uint32_t           m_se_l_sig = 0;
+    bool               m_se_applied = false, m_se_rel_ok = false;  // update_motion's thread
+    glm::mat4          m_se_rel4{ 1.0f };                           // the last placement: k_ctrl^-1 k (one_hand_drawn)
+    glm::quat          m_se_q{ 1.0f, 0.0f, 0.0f, 0.0f };
+    glm::vec3          m_se_t{ 0.0f };
+    uint32_t           m_se_sig = 0, m_se_said = 0, m_se_why_said = 0;
+    std::atomic<float> m_se_last_turn{ 0.0f }, m_se_last_off_cm{ 0.0f };
+    std::chrono::steady_clock::time_point m_se_t_last{}, m_se_l_t0{};
+    std::atomic<bool>  m_se_l_on{ false };
+    std::vector<glm::vec3> m_se_l_e, m_se_l_f;
+    float              m_se_l_good = 0.0f;
+    std::string        m_se_msg, m_se_why;                          // the last learn's result; why the gun in hand is not placed
+    bool               stock_eye_place(glm::mat4& k, const glm::mat4& k_ctrl, bool can);
+    bool               stock_sight_line(glm::vec3& o, glm::vec3& d, const char*& how);   // FarCry5Sight.cpp
+    void               stock_eye_learn_start(bool gun);
+    void               stock_eye_learn_tick(const glm::mat4& k_ctrl, const glm::mat4& head, bool can);
+    void               stock_eye_learn_finish();
+    std::string        stock_eye_text();
     // weaponaudit (test, not saved; all-weapons pass 7 Nov): one [Audit] line for the gun in hand: how it is held (axes, sight line, grip
     // point, the game's right and left hands on it, its hand line), and with two hands how far the hold turned it from the one-hand pose.
     std::atomic<bool>  m_weapon_audit{ false };
@@ -3829,6 +3857,10 @@ private:
     // drivewheelscan (test; FarCry5VehHands.cpp): from vehicle_probe, each Vehicle_ draw within 1.5 m of the camera while the scan runs,
     // logged with its place and turn in the vehicle's axes, to find the steering wheel's own draw (or its bone).
     void               veh_wheel_scan(ID3D11DeviceContext* ctx, const float* f, UINT count, const glm::vec3& rel);
+    // vehdump full|pal NAME (test, not saved; FarCry5VehHands.cpp): the draws near the camera (the vehicle's parts, the player's arms) written to
+    // VRMod_dev\dumps\vehdump_NAME (b1, scale, palette, vertices) for tools\wheelglue\vehdump_fit.py. kind 0 world draw, 1 the player's hidden body.
+    void               veh_dump_arm(const std::string& mode, const std::string& name);
+    void               veh_dump_draw(ID3D11DeviceContext* ctx, int kind, UINT count, UINT start, INT base);
     std::atomic<bool>  m_dh_grip[2]{};          // drive_poll: the raw grips by physical side (0 right, 1 left)
     std::atomic<bool>  m_dh_held[2]{};          // drive_poll: the gesture drive (drive on) holds its control with that hand
     // drivehandsdirect: the bare arm's indirect draw (veh_hands_draw, path B) drawn instead as a direct draw of one instance with the counts

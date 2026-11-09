@@ -38,8 +38,8 @@ namespace fc5::lua
     // drive (FarCry5Drive.cpp): the archetype a vehicle entity was spawned from by vehicle_request this session (0: not one of those).
     uint64_t    spawned_vehicle_archetype(uint64_t id);
     // reloadnogame (FarCry5Reload.cpp): the held weapon's clip filled at the next script update, with no reload of the game's: its reserve goes down by what went in.
-    void        clip_fill_request();
-    // reloadfullmag (FarCry5Reload.cpp): the weapon object in hand at the latest ammo read (inventory vtable +0x308), 0 with none or no
+    void        clip_fill_request(int mode = -1);   // mode (ammoledger): -1 as before, 0 a top-up (nothing taken from the reserve), 1 a load (a clip already full is no failure)
+    // the ammo ledger (FarCry5Reload.cpp): the weapon object in hand at the latest ammo read (inventory vtable +0x308), 0 with none or no
     // answer in the last second. Only its address: read through FarCry5SwitchSpeed.cpp's checked reads, never dereferenced here.
     uint64_t    weapon_object();
     void        reserve_take_request(int n);   // n rounds out of the weapon in hand's reserve (on the script thread, as RemoveItem does it)

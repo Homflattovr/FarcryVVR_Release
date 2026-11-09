@@ -1,6 +1,6 @@
 #pragma once
 
-// sunshare (Metro Exodus VR review, 6 Nov 2026, item 5): the sun's cascaded shadow map is drawn once per stereo pair. Both eye calls
+// sunshare (pipeline review, 6 Nov 2026, item 5): the sun's cascaded shadow map is drawn once per stereo pair. Both eye calls
 // replay the same game frame with the same sun, and the cascade fit is widened to both eyes (shadowfit, default on), so the right
 // eye's call reuses what the left call drew: its depth-only draws and its clears into the cascade target are skipped, and the
 // cascade rows it uploads (CSMSlice0..2) are set to the rows the map was drawn with.

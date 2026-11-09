@@ -1781,9 +1781,12 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
     XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     const bool flat            = ModSettings::showFlatScreenDisplay();
     const bool keep_projection = flat && fc5_simulator_runtime() && s_fc5_sim_projection.load();
+    // menuproj: the flat screen already drawn into both eye images this frame (D3D11Component): a projection layer, no quad.
+    const bool menu_proj = flat && this->fc5_menu_proj_ready;
+    this->fc5_menu_proj_ready = false;
     if (current_pipeline->frame_state.shouldRender == XR_TRUE) {
         projection_layer_views.resize(current_pipeline->stage_views.size(), {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
-        if (!flat || keep_projection) {
+        if (!flat || keep_projection || menu_proj) {
             for (auto i = 0; i < projection_layer_views.size(); ++i) {
                 const auto& swapchain = this->swapchains[this->eye_swapchain((uint32_t)i)];
                 int         actual_frame = i == 0 ? l_frame : r_frame;
@@ -1888,13 +1891,22 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
                     }
                 }
             }
+            if (menu_proj) {
+                for (size_t i = 0; i < projection_layer_views.size() && i < 2; ++i) {
+                    const auto& swapchain = this->swapchains[this->eye_swapchain((uint32_t)i)];
+                    projection_layer_views[i].pose                    = this->fc5_menu_proj_pose[i];
+                    projection_layer_views[i].fov                     = this->fc5_menu_proj_fov[i];
+                    projection_layer_views[i].subImage.imageRect.offset = {0, 0};
+                    projection_layer_views[i].subImage.imageRect.extent = {(int32_t)swapchain.width, (int32_t)swapchain.height};
+                }
+            }
             layer.space = this->stage_space;
             layer.viewCount = (uint32_t)projection_layer_views.size();
             layer.views = projection_layer_views.data();
             layers.push_back((XrCompositionLayerBaseHeader*)&layer);
 
         }
-        if (flat) {
+        if (flat && !menu_proj) {
             l_quad_layers.resize(1);
             // Initialize quad layers for each eye
             for (size_t i = 0; i < 1; ++i) {

@@ -29,6 +29,7 @@
 //    the author's 13:59-14:01 drives (D2DEA5E8) found none: the skin's palm was 43-63 cm from the hair's hand in every space, because it was taken
 //    from slot 0, the root (patch 13: the palm from the hand's own slots, slot 0 moved with it; see the bare arm's grab below).
 #include "FarCry5Stereo.h"
+#include "FarCry5SteerTune.h"
 #include "FarCry5BoneMap.h"
 #include "FarCry5Drive.h"
 #include "FarCry5Record.h"
@@ -73,21 +74,25 @@ namespace
         float     r{ 0.0f };
         int       votes{ 0 };
         bool      builtin{ false };
+        int       style{ 0 };   // 0 wheel, 1 handlebars (c: their centre, r: half width), 2 stick (c: the grip) (infer_table.py, author 9 Nov 07:57)
     };
     std::vector<VehWheel> g_vw;
     bool                  g_vw_loaded{ false };
 
     bool vw_sane(const VehWheel& w)
     {
+        if (w.style != 0)   // handlebars / stick: the centre (and the bars' half width) only
+            return w.count > 0 && std::isfinite(w.c.x + w.c.y + w.c.z + w.r + w.seat.x + w.seat.y + w.seat.z) && glm::length(w.c) < 1.2f &&
+                   (w.style == 2 || (w.r > 0.08f && w.r < 0.6f));
         return w.count > 0 && std::isfinite(w.c.x + w.c.y + w.c.z + w.n.x + w.n.y + w.n.z + w.r + w.seat.x + w.seat.y + w.seat.z) && w.r > 0.08f && w.r < 0.4f &&
                glm::length(w.c) < 1.2f && std::abs(glm::length(w.n) - 1.0f) < 0.05f;
     }
-    int vw_find(UINT count, const glm::vec3& seat)
+    int vw_find(UINT count, const glm::vec3& seat, int style = 0)
     {
         int   best = -1;
         float bd   = 0.08f;
         for (int i = 0; i < int(g_vw.size()); ++i) {
-            if (g_vw[i].count != count) continue;
+            if (g_vw[i].count != count || g_vw[i].style != style) continue;
             const float d = glm::length(g_vw[i].seat - seat);
             if (d < bd || (d == bd && best >= 0 && !g_vw[i].builtin)) bd = d, best = i;
         }
@@ -106,6 +111,7 @@ namespace
             w.r       = e.r;
             w.votes   = 99;
             w.builtin = true;
+            w.style   = e.style;
             if (vw_sane(w)) g_vw.push_back(w);
         }
         const size_t  nb = g_vw.size();
@@ -132,7 +138,7 @@ namespace
              "# (centre, axis, radius: the recentred reference in game metres: x right, y up, z back from the head). Delete a line to learn it again.\n";
         int n = 0;
         for (const auto& w : g_vw) {
-            if (w.builtin) continue;
+            if (w.builtin || w.style != 0) continue;
             f << fmt::format("wheel {} {:.3f} {:.3f} {:.3f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {}\n", w.count, w.seat.x, w.seat.y, w.seat.z, w.c.x, w.c.y, w.c.z, w.n.x,
                              w.n.y, w.n.z, w.r, w.votes);
             ++n;
@@ -256,6 +262,9 @@ struct FarCry5Stereo::VehHandsState
     glm::vec3 key_seat{ 0.0f };
     bool      from_table{ false };
     bool      dirty{ false };
+    int       tbl_style{ -1 };                          // the vehicle's handlebars or stick from the table (drive units: recentred metres)
+    glm::vec3 tbl_c{ 0.0f };
+    float     tbl_r{ 0.0f };
     bool wheel_ok() const { return wl.votes >= 2; }
 
     void reset_model()
@@ -272,6 +281,7 @@ struct FarCry5Stereo::VehHandsState
         stick_hand  = -1;
         holder      = -1;
         key_tried = key_ok = from_table = dirty = false;
+        tbl_style = -1;
         key_count = 0;
         model_lines = learn_lines = 0;
     }
@@ -1299,15 +1309,30 @@ void FarCry5Stereo::veh_hands_place(ID3D11DeviceContext* ctx, std::vector<float>
     const char*     ctl = !have_cv ? "control" : cv.style == fc5::drive::kWheel ? "wheel" : cv.style == fc5::drive::kBars ? "handlebars" : "stick";
     // vehwheels: once this vehicle's seat is known, its wheel from the table (the ring on the vehicle's own wheel before any turn); a wheel
     // learnt here (or learnt again) saved for it.
-    if (ho.model && have_cv && cv.style == fc5::drive::kWheel) {
+    // Handlebars and sticks (9 Nov): from the table too (built in only), kept while the game's hands are not on them.
+    if (ho.model && have_cv) {
         if (!st.key_tried && m_vsh_valid && m_vsh_count != 0 && m_vsh_learn_frame >= st.drive_frame - 600) {
             st.key_tried = true;
             st.key_ok    = true;
             st.key_count = m_vsh_count;
             st.key_seat  = m_vsh_seat;
             vw_load();
-            const int i = vw_find(st.key_count, st.key_seat);
-            if (i >= 0 && !st.wheel_ok()) {
+            const int sty = cv.style == fc5::drive::kWheel ? 0 : cv.style == fc5::drive::kBars ? 1 : 2;
+            const int i   = vw_find(st.key_count, st.key_seat, sty);
+            if (sty != 0) {
+                fc5::steertune::auto_turn(350);   // driveautoturn for handlebars and sticks too (author 9 Nov 11:20)
+                if (i >= 0) {
+                    st.tbl_style = cv.style;
+                    st.tbl_c     = g_vw[i].c;
+                    st.tbl_r     = g_vw[i].r;
+                    spdlog::info("[VehHands] drivehandsmodel: this vehicle's {} from the built-in table (model {} indices, the seat at ({:.2f}, {:.2f}, {:.2f}) on it): ({:+.0f}, "
+                                 "{:+.0f}, {:+.0f}) cm from the eyes{}", ctl, st.key_count, st.key_seat.x, st.key_seat.y, st.key_seat.z, st.tbl_c.x * 100.0f,
+                                 st.tbl_c.y * 100.0f, st.tbl_c.z * 100.0f, sty == 1 ? fmt::format(", half width {:.0f} cm", st.tbl_r * 100.0f) : std::string{});
+                } else {
+                    spdlog::info("[VehHands] drivehandsmodel: no {} in the table for this vehicle (model {} indices, the seat at ({:.2f}, {:.2f}, {:.2f}) on it): placed from "
+                                 "the game's hands when they hold it", ctl, st.key_count, st.key_seat.x, st.key_seat.y, st.key_seat.z);
+                }
+            } else if (i >= 0 && !st.wheel_ok()) {
                 const VehWheel& w = g_vw[i];
                 st.wl.c           = w.c;
                 st.wl.n           = w.n;
@@ -1321,9 +1346,17 @@ void FarCry5Stereo::veh_hands_place(ID3D11DeviceContext* ctx, std::vector<float>
             } else if (i < 0) {
                 spdlog::info("[VehHands] drivehandsmodel: no wheel known yet for this vehicle (model {} indices, the seat at ({:.2f}, {:.2f}, {:.2f}) on it): learnt from its "
                              "first turn of 30 deg or more, then saved", st.key_count, st.key_seat.x, st.key_seat.y, st.key_seat.z);
+                fc5::steertune::auto_turn(350);   // driveautoturn (author 9 Nov 11:09): a quick small turn now, so that first turn comes at once
             }
         }
-        if (st.dirty && st.key_ok && st.wheel_ok()) {
+        if (cv.style != fc5::drive::kWheel && st.tbl_style == cv.style) {   // the game's hands, when seen this frame, send theirs after this
+            fc5::drive::Model m{};
+            m.style  = cv.style;
+            m.centre = st.tbl_c;
+            m.radius = st.tbl_r;
+            fc5::drive::set_model(m);
+        }
+        if (cv.style == fc5::drive::kWheel && st.dirty && st.key_ok && st.wheel_ok()) {
             st.dirty = false;
             vw_load();
             VehWheel w;
@@ -1678,4 +1711,279 @@ void FarCry5Stereo::veh_wheel_scan(ID3D11DeviceContext* ctx, const float* f, UIN
     spdlog::info("[VehHands] wheelscan: draw {} {:.2f} m from the camera, at ({:+.2f}, {:+.2f}, {:+.2f}) m in the vehicle's axes (across, along, up); its x axis "
                  "({:+.3f}, {:+.3f}, {:+.3f}), z axis ({:+.3f}, {:+.3f}, {:+.3f}); scale {:.4f}; VS b3 {} B; drive {}", count, glm::length(rel), o.x, o.y, o.z,
                  ax.x, ax.y, ax.z, az.x, az.y, az.z, sc, b3, fc5::drive::status());
+}
+
+// vehdump full|pal NAME (test, not saved; vehcontrol research, author 9 Nov 08:36): in the next frame, every draw whose object origin (VS b1) is within 3.5 m of
+// the camera, world draws (kind w: the vehicle's parts, whatever their material) and the player's own hidden body draws (kind b: the arms on
+// the wheel), written once each to VRMod_dev\dumps\vehdump_NAME\: its VS b1 matrix, the vertex scale (VS b2), its skinning palette (VS b3, the
+// CPU copy) and, for "full", its vertices (position, palette slots and weights; round 2: the position's 4th component and the vertex's bytes). Read by tools\wheelglue\vehdump_fit.py. "pal": no vertices
+// (cheap: the bones at another steering angle). A draw recorded on a deferred context has its vertex read done at the next immediate draw.
+namespace
+{
+    struct VDumpJob
+    {
+        std::string   path, head;
+        ID3D11Buffer* vb{ nullptr };
+        ID3D11Buffer* ib{ nullptr };
+        UINT          stride{ 0 }, voff{ 0 }, ib_off{ 0 }, count{ 0 }, start{ 0 };
+        INT           base{ 0 };
+        bool          i32{ false };
+        int           pos_off{ -1 }, pos_fmt{ 0 }, bi_off{ -1 }, w_off{ -1 };
+        bool          w_bgra{ false };
+    };
+    struct VDump
+    {
+        std::mutex                                     mtx;
+        int                                            mode{ 0 };   // 0 off, 1 full, 2 pal
+        int                                            from{ 0 }, until{ 0 };
+        std::string                                    dir, name;
+        std::set<std::tuple<char, UINT, UINT, INT, void*>> done;
+        std::vector<VDumpJob>                          jobs;
+        std::map<ID3D11Buffer*, std::vector<uint8_t>>  cache;   // buffers read in this dump
+        int                                            files{ 0 };
+        bool                                           frame_written{ false };
+    };
+    VDump g_vd;
+
+    void vdump_write(ID3D11DeviceContext* ctx, VDumpJob& j)
+    {
+        std::ofstream f(j.path, std::ios::out | std::ios::trunc);
+        if (!f) return;
+        f << j.head;
+        if (j.vb && j.ib && j.pos_off >= 0) {
+            auto get = [&](ID3D11Buffer* b) -> const std::vector<uint8_t>* {
+                auto it = g_vd.cache.find(b);
+                if (it == g_vd.cache.end()) {
+                    std::vector<uint8_t> d;
+                    if (g_vd.cache.size() > 48 || !read_gpu(ctx, b, d)) return nullptr;
+                    it = g_vd.cache.emplace(b, std::move(d)).first;
+                }
+                return &it->second;
+            };
+            const std::vector<uint8_t>* vbd = get(j.vb);
+            const std::vector<uint8_t>* ibd = get(j.ib);
+            if (vbd && ibd) {
+                std::set<uint32_t>   seen;
+                std::vector<int64_t> order;
+                std::ostringstream   tri;
+                for (UINT k = 0; k < j.count; ++k) {
+                    const size_t io = size_t(j.ib_off) + size_t(j.start + k) * (j.i32 ? 4 : 2);
+                    if (io + (j.i32 ? 4 : 2) > ibd->size()) break;
+                    uint32_t idx = 0;
+                    std::memcpy(&idx, ibd->data() + io, j.i32 ? 4 : 2);
+                    if (seen.insert(idx).second) order.push_back(idx);
+                }
+                f << "verts " << order.size() << " (qx qy qz  slot0..3  weight0..3  qw  the vertex's bytes; position x the scale, then the slot's palette matrix)\n";
+                for (const int64_t idx : order) {
+                    const size_t vo = size_t(j.voff) + size_t(idx + j.base) * j.stride;
+                    if (vo + j.stride > vbd->size()) continue;
+                    const uint8_t* v = vbd->data() + vo;
+                    float p[3]{};
+                    int   qw = 0;
+                    if (j.pos_fmt == DXGI_FORMAT_R16G16B16A16_SINT) {
+                        int16_t q[4];
+                        std::memcpy(q, v + j.pos_off, 8);
+                        p[0] = q[0], p[1] = q[1], p[2] = q[2];
+                        qw   = q[3];   // round 2: the 4th component (a vehicle's draws have no BLENDINDICES: its bone, perhaps)
+                    } else {
+                        std::memcpy(p, v + j.pos_off, 12);
+                    }
+                    int sl[4]{}, w[4]{ 255, 0, 0, 0 };
+                    if (j.bi_off >= 0) {
+                        const uint8_t* bi = v + j.bi_off;
+                        for (int c = 0; c < 4; ++c) sl[c] = bi[j.w_bgra ? (c == 0 ? 2 : c == 2 ? 0 : c) : c];
+                    }
+                    if (j.w_off >= 0) {
+                        const uint8_t* wp = v + j.w_off;
+                        for (int c = 0; c < 4; ++c) w[c] = wp[c];
+                    }
+                    f << p[0] << ' ' << p[1] << ' ' << p[2] << "  " << sl[0] << ' ' << sl[1] << ' ' << sl[2] << ' ' << sl[3] << "  " << w[0] << ' ' << w[1] << ' '
+                      << w[2] << ' ' << w[3] << "  " << qw << ' ';
+                    for (UINT b = 0; b < j.stride; ++b) f << fmt::format("{:02x}", v[b]);
+                    f << '\n';
+                }
+            } else {
+                f << "verts 0 (the vertex or index buffer could not be read)\n";
+            }
+        }
+        g_vd.files++;
+    }
+}
+
+void FarCry5Stereo::veh_dump_arm(const std::string& mode, const std::string& name)
+{
+    std::lock_guard _{ g_vd.mtx };
+    for (auto& j : g_vd.jobs) { if (j.vb) j.vb->Release(); if (j.ib) j.ib->Release(); }
+    g_vd.jobs.clear();
+    g_vd.cache.clear();
+    g_vd.done.clear();
+    g_vd.files         = 0;
+    g_vd.frame_written = false;
+    g_vd.name          = name.empty() ? std::string{ "x" } : name;
+    const std::string root = "fc5vr_dumps";
+    CreateDirectoryA(root.c_str(), nullptr);
+    g_vd.dir = root + "/vehdump_" + g_vd.name;
+    CreateDirectoryA(g_vd.dir.c_str(), nullptr);
+    g_vd.mode  = mode == "pal" ? 2 : 1;
+    g_vd.from  = m_frame.load() + 1;
+    g_vd.until = g_vd.from;   // round 2: one frame (each draw once: a palette moves between frames)
+    m_keep_bones = true;   // the palettes' CPU copies (note_object_constants)
+    spdlog::info("[VehHands] vehdump {} {}: the draws within 3.5 m of the camera in the next frame, to {}", g_vd.mode == 2 ? "pal" : "full", g_vd.name, g_vd.dir);
+}
+
+void FarCry5Stereo::veh_dump_draw(ID3D11DeviceContext* ctx, int kind, UINT count, UINT start, INT base)
+{
+    if (g_vd.mode == 0) return;
+    const int  frame    = m_frame.load();
+    const bool deferred = fc5::rec::is_deferred(ctx);
+    std::lock_guard _{ g_vd.mtx };
+    if (g_vd.mode == 0) return;
+    // The vertex reads waiting for an immediate context.
+    if (!deferred && !g_vd.jobs.empty()) {
+        for (auto& j : g_vd.jobs) {
+            vdump_write(ctx, j);
+            if (j.vb) j.vb->Release();
+            if (j.ib) j.ib->Release();
+        }
+        g_vd.jobs.clear();
+    }
+    if (frame < g_vd.from) return;
+    if (frame > g_vd.until) {
+        if (!g_vd.jobs.empty() && frame < g_vd.until + 30) return;   // still waiting for an immediate draw
+        spdlog::info("[VehHands] vehdump {}: {} draws written to {}{}", g_vd.name, g_vd.files, g_vd.dir,
+                     g_vd.jobs.empty() ? "" : fmt::format(" ({} deferred draws never read)", g_vd.jobs.size()));
+        for (auto& j : g_vd.jobs) { if (j.vb) j.vb->Release(); if (j.ib) j.ib->Release(); }
+        g_vd.jobs.clear();
+        g_vd.cache.clear();
+        g_vd.mode = 0;
+        return;
+    }
+    if (!g_vd.frame_written) {
+        g_vd.frame_written = true;
+        std::ofstream f(g_vd.dir + "/frame.txt", std::ios::out | std::ios::trunc);
+        f << "frame " << frame << "\ncam " << m_world_cam_pos.x << ' ' << m_world_cam_pos.y << ' ' << m_world_cam_pos.z << "\nvehmesh_o " << m_veh_mesh_o.x << ' '
+          << m_veh_mesh_o.y << ' ' << m_veh_mesh_o.z << "\nvehmesh_x " << m_veh_mesh_x.x << ' ' << m_veh_mesh_x.y << ' ' << m_veh_mesh_x.z << "\nvehmesh_y "
+          << m_veh_mesh_y.x << ' ' << m_veh_mesh_y.y << ' ' << m_veh_mesh_y.z << "\nvehmesh_frame " << m_veh_mesh_frame << "\nin_vehicle " << int(m_in_vehicle.load())
+          << " driving " << int(m_veh_driving.load()) << "\ndrive " << fc5::drive::status() << '\n';
+    }
+    // b1: the object's world matrix (3x4 rows); only the draws near the camera.
+    float b1[12]{};
+    {
+        ID3D11Buffer* cb = nullptr;
+        ctx->VSGetConstantBuffers(1, 1, &cb);
+        if (!cb) return;
+        std::lock_guard o{ m_obj_mtx };
+        const auto      it = m_obj_consts.find(cb);
+        cb->Release();
+        if (it == m_obj_consts.end()) return;
+        std::memcpy(b1, it->second.f, sizeof(b1));
+    }
+    const glm::vec3 rel = glm::vec3{ b1[3], b1[7], b1[11] } - m_world_cam_pos;
+    if (glm::length(rel) > 3.5f || g_vd.done.size() > 400) return;
+    ID3D11Buffer* vb = nullptr;
+    UINT          stride = 0, voff = 0;
+    ctx->IAGetVertexBuffers(0, 1, &vb, &stride, &voff);
+    ID3D11Buffer* ib = nullptr;
+    DXGI_FORMAT   ib_fmt{};
+    UINT          ib_off = 0;
+    ctx->IAGetIndexBuffer(&ib, &ib_fmt, &ib_off);
+    float scale = 0.0f;
+    std::vector<float> pal;
+    {
+        ID3D11Buffer* cb2 = nullptr;
+        ID3D11Buffer* cb3 = nullptr;
+        ctx->VSGetConstantBuffers(2, 1, &cb2);
+        ctx->VSGetConstantBuffers(3, 1, &cb3);
+        std::lock_guard o{ m_obj_mtx };
+        if (cb2) {
+            if (auto it = m_obj_consts.find(cb2); it != m_obj_consts.end()) scale = it->second.f[5];
+            cb2->Release();
+        }
+        if (cb3) {
+            if (auto it = m_bone_data.find(cb3); it != m_bone_data.end()) pal = it->second;
+            cb3->Release();
+        }
+    }
+    // Round 2: one draw = its count, start, base, vertex buffer and palette (the two bare arms share a mesh and differ by their palettes).
+    uint64_t ph = 1469598103934665603ull;
+    for (size_t k = 0; k < pal.size() && k < 12 * 64; ++k) {
+        uint32_t u = 0;
+        std::memcpy(&u, &pal[k], 4);
+        ph = (ph ^ u) * 1099511628211ull;
+    }
+    const auto key = std::make_tuple(kind == 1 ? 'b' : 'w', count, start, base, (void*)(uintptr_t(vb) ^ uintptr_t(ph)));
+    if (!g_vd.done.insert(key).second) {
+        if (vb) vb->Release();
+        if (ib) ib->Release();
+        return;
+    }
+    bool vehicle_ps = false;
+    {
+        ID3D11PixelShader* ps = nullptr;
+        ctx->PSGetShader(&ps, nullptr, nullptr);
+        if (ps) {
+            std::lock_guard p{ m_ps_mtx };
+            vehicle_ps = m_vehicle_shaders.contains(ps);
+            ps->Release();
+        }
+    }
+    VDumpJob j;
+    // Round 2: the same count, start and base can be two draws (the left and right bare arms: 4110 each): a number for each other buffer.
+    int nth = 0;
+    for (const auto& k : g_vd.done)
+        if (std::get<0>(k) == std::get<0>(key) && std::get<1>(k) == count && std::get<2>(k) == start && std::get<3>(k) == base && std::get<4>(k) != std::get<4>(key)) nth++;
+    j.path = fmt::format("{}/{}_{}_{}_{}{}{}.txt", g_vd.dir, kind == 1 ? 'b' : 'w', count, start, base, nth ? fmt::format("_{}", nth) : std::string{}, g_vd.mode == 2 ? "_pal" : "");
+    std::ostringstream h;
+    h << "draw " << (kind == 1 ? "body" : "world") << " count " << count << " start " << start << " base " << base << " stride " << stride << " frame " << frame
+      << " vehicle_ps " << int(vehicle_ps) << " deferred " << int(deferred) << '\n';
+    h << "b1";
+    for (float v : b1) h << ' ' << v;
+    h << "\ncam " << m_world_cam_pos.x << ' ' << m_world_cam_pos.y << ' ' << m_world_cam_pos.z << "\nscale " << scale << '\n';
+    // The palette's slots up to the last one that is not all zero.
+    int last = -1;
+    for (int s = 0; s < 256 && size_t(s + 1) * 12 <= pal.size(); ++s)
+        for (int k = 0; k < 12; ++k)
+            if (pal[size_t(s) * 12 + k] != 0.0f) { last = s; break; }
+    h << "pal " << (last + 1) << '\n';
+    for (int s = 0; s <= last; ++s) {
+        for (int k = 0; k < 12; ++k) h << (k ? " " : "") << pal[size_t(s) * 12 + k];
+        h << '\n';
+    }
+    j.head = h.str();
+    if (g_vd.mode == 1 && vb && ib) {
+        ID3D11InputLayout* il = nullptr;
+        ctx->IAGetInputLayout(&il);
+        std::vector<LayoutElem> layout;
+        {
+            std::lock_guard p{ m_ps_mtx };
+            if (auto it = m_layouts.find(il); it != m_layouts.end()) layout = it->second;
+        }
+        if (il) il->Release();
+        std::string all;   // round 2: every element of the layout (semantic index, format, stream, offset)
+        for (const auto& e : layout) all += fmt::format(" {}{}:{}:s{}:+{}", e.semantic, e.index, int(e.format), e.slot, e.offset);
+        j.head += "layout_all" + all + "\n";
+        for (const auto& e : layout) {
+            if (e.index != 0 || e.slot != 0) continue;
+            if (_stricmp(e.semantic.c_str(), "POSITION") == 0 && (e.format == DXGI_FORMAT_R16G16B16A16_SINT || e.format == DXGI_FORMAT_R32G32B32_FLOAT ||
+                                                                 e.format == DXGI_FORMAT_R32G32B32A32_FLOAT)) {
+                j.pos_off = int(e.offset);
+                j.pos_fmt = int(e.format);
+            }
+            if (_stricmp(e.semantic.c_str(), "BLENDINDICES") == 0) j.bi_off = int(e.offset);
+            if (_stricmp(e.semantic.c_str(), "BLENDWEIGHT") == 0) { j.w_off = int(e.offset); j.w_bgra = e.format == DXGI_FORMAT_B8G8R8A8_UNORM; }
+        }
+        j.head += fmt::format("layout pos {} fmt {} blendindices {} blendweight {}{}\n", j.pos_off, j.pos_fmt, j.bi_off, j.w_off, j.w_bgra ? " bgra" : "");
+        if (stride == 0 || stride > 256) j.pos_off = -1;
+        j.vb = vb; j.ib = ib; vb = nullptr; ib = nullptr;   // kept (one reference each) until written
+        j.stride = stride; j.voff = voff; j.ib_off = ib_off; j.count = count; j.start = start; j.base = base; j.i32 = ib_fmt == DXGI_FORMAT_R32_UINT;
+    }
+    if (vb) vb->Release();
+    if (ib) ib->Release();
+    if (deferred && j.vb) {
+        g_vd.jobs.push_back(std::move(j));
+    } else {
+        vdump_write(ctx, j);
+        if (j.vb) j.vb->Release();
+        if (j.ib) j.ib->Release();
+    }
 }

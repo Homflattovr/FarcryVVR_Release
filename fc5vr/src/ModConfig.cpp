@@ -494,9 +494,11 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         const auto la    = axis_of(m_left_joystick);
         const bool combo = is_right_b_button_down || system_button_down || is_left_joystick_click_down ||
                            (grip_dpad_right && (std::abs(ra.x) >= 0.5f || std::abs(ra.y) >= 0.5f)) || (grip_dpad_left && (std::abs(la.x) >= 0.5f || std::abs(la.y) >= 0.5f));
-        if (!is_left_grip_down) mt_combo = false;
-        else if (combo) mt_combo = true;
-        menu_lt = menu_tabs && is_left_grip_down && !mt_wait.load() && !mt_combo.load() && input_now - left_grip_pressed_at >= std::chrono::milliseconds(150);
+        // dpadear: the grip's own press (is_left_grip_free), so away from the ear it is still LT here; only a press that is the modifier (at the
+        // ear, or any with dpadear off) makes a combo. Before 9 Nov the left grip sent LT in menus only with the hand at the ear.
+        if (!is_left_grip_free) mt_combo = false;
+        else if (combo && is_left_grip_down) mt_combo = true;
+        menu_lt = menu_tabs && is_left_grip_free && !mt_wait.load() && !mt_combo.load() && input_now - left_grip_pressed_at >= std::chrono::milliseconds(150);
     }
     const bool menu_rt       = menu_tabs && is_right_grip_down;
     bool       menu_rb       = false;   // menutabs: RB sent from the right trigger this poll (not a throw: note_rb below)
@@ -767,6 +769,8 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     // Throwable: from the grab to the end of the throw the right trigger does not fire (the game is throwing). reloadmanual: nor with the
     // magazine out, the handle to rack or the game's reload not done (FarCry5Reload.cpp).
     if (gesture.no_fire) pXinputGamepad->bRightTrigger = 0;
+    // The ammo ledger's one-shot hold (FarCry5Reload.cpp): its last real round has left, held at once, before the next clip read.
+    if (fc5::reload::ledger_shot_hold()) pXinputGamepad->bRightTrigger = 0;
     const bool motion_view = FarCry5Stereo::Get()->motion_enabled() && !FarCry5Stereo::Get()->flat_screen_on();
     if (float wx = 0.0f, wy = 0.0f; FarCry5Stereo::Get()->wheel_test(wx, wy)) {
         pXinputGamepad->wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;

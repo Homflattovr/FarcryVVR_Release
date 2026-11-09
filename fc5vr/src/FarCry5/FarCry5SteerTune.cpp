@@ -628,6 +628,19 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
     return false;
 }
 
+void auto_turn(int ms)
+{
+    ms = std::clamp(ms, 50, 1000);
+    {
+        std::lock_guard _{ g_step_mtx };
+        g_steps   = { { -1.0f, ms }, { 1.0f, ms }, { 0.0f, 100 } };
+        g_step_rt = 0;
+        g_step_t0 = clock::now();
+        g_step_on = true;
+    }
+    spdlog::info("[Steer] driveautoturn: the wheel turned full left {} ms, full right {} ms, then the controllers again (to find the car's wheel)", ms, ms);
+}
+
 void note_poll(float lx)
 {
     const int64_t t = us_now(), was = g_poll_us.exchange(t);

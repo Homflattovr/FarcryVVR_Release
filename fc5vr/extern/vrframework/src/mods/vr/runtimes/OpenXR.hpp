@@ -68,6 +68,14 @@ struct OpenXR final : public VRRuntime {
     // NVIDIA driver log an error (nvlddmkm 153) at every such switch, and about one in five left the simulator's xrEndFrame
     // waiting forever. With the projection layer kept under the quad there is no switch and no error (simprojection).
     static inline std::atomic<bool> s_fc5_sim_projection{true};
+    // Far Cry 5 (menuproj, author 9 Nov 09:50): frame generation tools (OFXR's NVIDIA DLSS frame generation) make their extra frames
+    // from the projection layer only; with menus sent as a quad alone those frames had no menu: black blinking. With menuproj the
+    // flat screen is drawn into both eye images (D3D11Component, from the eye poses below) and sent as the projection layer.
+    // Default off since 9 Nov 11:46: with OFXR (DLSS frame generation) the game hung in xrEndFrame inside OFXR on a menuproj frame.
+    static inline std::atomic<bool> s_fc5_menu_proj{false};
+    bool                            fc5_menu_proj_ready{false};
+    XrPosef                         fc5_menu_proj_pose[2]{};
+    XrFovf                          fc5_menu_proj_fov[2]{};
     static bool fc5_simulator_runtime() {
         static const bool sim = [] {
             char rt[512]{};

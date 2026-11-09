@@ -1,5 +1,5 @@
-// vehfade: each eye's picture darkened (to black) while getting in or out of a vehicle, until the camera the game culls
-// with is back on the head (author 14 Oct when getting in: a fade to black asked for).
+// vehfade (black while getting in or out until the game culled around the head again) was removed on 9 Nov: the culling camera
+// follows the headset (FarCry5CullHead.cpp), and it was off by default. What is left is vehvignette:
 // vehvignette (FarCry5VehComfort.cpp): the same pass darkens only the picture's edges, by the angle from the eye's own
 // view axis (its XR field of view), while the vehicle moves hard.
 #include "FarCry5Stereo.h"
@@ -126,32 +126,9 @@ void main(uint2 p : SV_DispatchThreadID)
     }
 }
 
-// Once per present (on_post_present): the fade's target and level. Black while the entry / exit animation plays (the
-// vehicle "settle"), then held until the culled camera is back on the head (cull_coverage: 6 frames with the eye's centre
-// within 4 deg of the game camera's) or 1 s; to black in 0.15 s, back in 0.35 s.
+// Once per present (on_post_present): the vignette's level.
 void FarCry5Stereo::fade_tick(float dt)
 {
-    const auto now  = std::chrono::steady_clock::now();
-    bool       want = m_veh_fade.load() && m_motion.load() && ((m_in_vehicle.load() && m_veh_settle.load() > 0 && m_veh_settle_entry) || (!m_in_vehicle.load() && m_exit_settle > 0));
-    if (m_fade_was_want && !want && m_veh_fade.load()) {
-        m_fade_hold     = true;
-        m_fade_hold_t0  = now;
-        m_fade_cov_good = 0;
-    }
-    if (want && !m_fade_was_want) spdlog::info("[Fade] getting {} a vehicle: picture to black", m_in_vehicle.load() ? "into" : "out of");
-    m_fade_was_want = want;
-    if (m_fade_hold) {
-        const bool done = m_fade_cov_good >= 6 || now - m_fade_hold_t0 > std::chrono::seconds(1);
-        if (done) {
-            spdlog::info("[Fade] back in after {:.2f} s ({})", std::chrono::duration<float>(now - m_fade_hold_t0).count(),
-                         m_fade_cov_good >= 6 ? "the culled camera is on the head" : "time limit");
-            m_fade_hold = false;
-        } else {
-            want = true;
-        }
-    }
-    if (m_menu_screen_on || !m_veh_fade.load()) { want = false; m_fade_hold = false; }
-    m_fade_level = want ? std::min(1.0f, m_fade_level + dt / 0.15f) : std::max(0.0f, m_fade_level - dt / 0.35f);
     // vehvignette: in a vehicle, in in 0.15 s, out in 0.6 s.
     const bool  vig_on = m_veh_vignette.load() > 0.001f && m_motion.load() && m_in_vehicle.load() && m_veh_settle.load() == 0 && !m_menu_screen_on;
     const float vig_t  = vig_on ? m_vig_target : 0.0f;
@@ -162,15 +139,15 @@ void FarCry5Stereo::fade_tick(float dt)
 void FarCry5Stereo::fade_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* eye)
 {
     const float vig = std::clamp(m_veh_vignette.load(), 0.0f, 1.0f) * m_vig_level;   // vehvignette
-    if (!ctx || !eye || (m_fade_level <= 0.001f && vig <= 0.01f)) return;
+    if (!ctx || !eye || vig <= 0.01f) return;
     ID3D11Device* dev = nullptr;
     ctx->GetDevice(&dev);
     if (!dev) return;
     const bool ok = ready(dev, eye);
     dev->Release();
     if (!ok) return;
-    Cb cb{ 1.0f - std::clamp(m_fade_level, 0.0f, 1.0f), g_desc.Width, g_desc.Height, 0.0f, { -1.0f, 1.0f, 1.0f, -1.0f }, 0.0f, 0.0f, { 0.0f, 0.0f } };
-    if (vig > 0.01f) {
+    Cb cb{ 1.0f, g_desc.Width, g_desc.Height, 0.0f, { -1.0f, 1.0f, 1.0f, -1.0f }, 0.0f, 0.0f, { 0.0f, 0.0f } };
+    {
         // The clear area's half-angle from 60 deg (a touch of shade at the far edges) down to 25 deg, its edge 12 deg wide.
         const int   fr = m_frame.load();
         const auto& v  = m_xr_views[fr & 7];
@@ -209,5 +186,5 @@ void FarCry5Stereo::fade_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* eye)
     if (prev_uav) prev_uav->Release();
     if (prev_cb) prev_cb->Release();
     ctx->CopyResource(eye, g_mid);
-    if ((++g_drawn % 90) == 1) spdlog::info("[Fade] {} eye pictures darkened (level now {:.2f}, vignette {:.2f})", g_drawn, m_fade_level, vig);
+    if ((++g_drawn % 90) == 1) spdlog::info("[Fade] {} eye pictures darkened (vignette {:.2f})", g_drawn, vig);
 }

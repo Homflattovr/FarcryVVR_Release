@@ -6,6 +6,7 @@
 // Every scan runs on its own thread: a 13 GB scan on the render thread (60 s) made the game lose its device and close.
 #include "FarCry5BulletSpeed.h"
 #include "FarCry5CamScan.h"
+#include "FarCry5Reload.h"
 
 #include <Windows.h>
 
@@ -266,6 +267,8 @@ namespace fc5::bullet
         // shotbuzz: the callback, the press whose first shot named the player's weapon, that weapon (r14).
         std::atomic<void (*)()>            g_shot_cb{ nullptr };
         std::atomic<uint64_t>              g_buzz_press{ 0 }, g_buzz_weapon{ 0 };
+        // The ammo ledger's one-shot hold (FarCry5Reload.cpp ledger_on_shot): the player's shots, told as they happen (as shotbuzz finds them).
+        std::atomic<uint64_t>              g_pl_press{ 0 }, g_pl_weapon{ 0 };
 
         bool read_f(const float* p, float& v)
         {
@@ -283,6 +286,12 @@ namespace fc5::bullet
         void speed_probe(safetyhook::Context& c)
         {
             const uint64_t n = ++g_shots;
+            if (GetTickCount64() - g_player_fire_ms.load() <= 500) {
+                // the ammo ledger: the first shot code call of a press is the player's weapon; later calls count only from that weapon (as shotbuzz).
+                const uint64_t press = g_press_ms.load();
+                if (g_pl_press.exchange(press) != press) g_pl_weapon = c.r14;
+                if (c.r14 == g_pl_weapon.load()) fc5::reload::ledger_on_shot();
+            }
             if (auto cb = g_shot_cb.load(); cb && GetTickCount64() - g_player_fire_ms.load() <= 500) {
                 // shotbuzz: the first shot code call of a press is the player's weapon; later calls count only from that weapon.
                 const uint64_t press = g_press_ms.load();

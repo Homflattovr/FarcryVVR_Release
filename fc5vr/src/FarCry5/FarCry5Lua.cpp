@@ -366,7 +366,8 @@ namespace fc5::lua
         // play). What went in leaves the reserve as RemoveItem +0x2FB3740 does it: inventory vtable +0x170 (ammo item, count, 0x12), the ammo the am_read below reads. (GiveAmmoToPlayer with a
         // negative count raised the reserve to its maximum, 67 -> 72 in the 4 Nov campaign run: free ammo.)
         std::atomic<bool> g_fill_req{ false }, g_fill_failed{ false }, g_fill_short{ false };
-        std::atomic<uint64_t> g_am_obj{ 0 };   // reloadfullmag: the weapon object in hand at the latest ammo read (am_tick), 0 with none
+        std::atomic<int>  g_fill_mode{ -1 };   // ammoledger: the next fill_tick: -1 as before, 0 a top-up (nothing taken), 1 a load (a full clip no failure)
+        std::atomic<uint64_t> g_am_obj{ 0 };   // the weapon object in hand at the latest ammo read (am_tick), 0 with none (the ammo ledger keys its state by it)
         int               g_fill_misses = 0;   // script thread only
         std::atomic<int>  g_take_req{ 0 };
         using FillFn   = void(__fastcall*)(uint64_t* id);
@@ -393,7 +394,7 @@ namespace fc5::lua
 
         // Under SEH (no C++ objects): 1 read, 0 no weapon or inventory (not an error), -1 a fault. cap: the clip's size (the weapon's vtable +0x48: GiveAmmoClipsToPlayer reads it so). take: that many
         // rounds out of the reserve first.
-        // obj: the weapon object in hand (reloadfullmag: FarCry5SwitchSpeed.cpp finds its common properties block from it), 0 with none.
+        // obj: the weapon object in hand (weapon_object(): the ammo ledger keys its state by it), 0 with none.
         int am_read(uint64_t me, int& clip, int& reserve, int* cap = nullptr, int take = 0, uint64_t* obj = nullptr)
         {
             __try {
@@ -451,6 +452,21 @@ namespace fc5::lua
                 spdlog::error("[Reload] reloadnogame: a fault in the game's ammo calls: turned off");
                 return;
             }
+            // ammoledger (FarCry5Reload.cpp; research\2026-11-08_ammosystem\DESIGN.md "top-up ledger"): mode 0, a top-up: the clip filled with nothing
+            // taken (the rounds added are the ledger's surplus, never fired beyond the mod's count), whatever the reserve; mode 1, a load: as before, but a
+            // clip already full is no failure (the ledger then takes what the load needs itself). Mode -1: as before.
+            const int mode = g_fill_mode.exchange(-1);
+            if (mode >= 0 && cap > 0 && c0 >= cap) {
+                spdlog::info("[Reload] ammoledger: clip {} of {} already full: nothing to fill ({})", c0, cap, mode == 0 ? "top-up" : "load: the ledger takes its rounds");
+                return;
+            }
+            if (mode == 0) {
+                const uint64_t item0 = g_eq_item.load();
+                const bool     ok    = item0 != 0 && refill_call(me, item0);
+                if (ok) am_read(me, c1, r1);
+                spdlog::info("[Reload] ammoledger: top-up {}: clip {} -> {} of {}, reserve {} -> {} (nothing taken)", c1 > c0 ? "done" : "NOT done", c0, c1, cap, r0, r1);
+                return;
+            }
             // The last rounds, fewer than the clip lacks: the calls fill it whole, so the game's own reload, this once. (Its count is exact; its sounds are heard behind this one magazine.)
             if (cap > 0 && (c0 >= cap || r0 < cap - c0)) {
                 g_fill_short = true;
@@ -488,7 +504,7 @@ namespace fc5::lua
             int       clip = -1, reserve = -1, cap = -1;
             uint64_t  obj  = 0;
             const int r    = am_read(me, clip, reserve, &cap, 0, &obj);
-            g_am_obj       = r == 1 ? obj : 0;   // reloadfullmag
+            g_am_obj       = r == 1 ? obj : 0;   // weapon_object() (the ammo ledger)
             if (r < 0) {
                 g_am_on     = false;
                 g_am_failed = true;
@@ -1889,7 +1905,7 @@ namespace fc5::lua
         return -1;
     }
 
-    void clip_fill_request() { g_fill_short = false; g_fill_req = true; }
+    void clip_fill_request(int mode) { g_fill_mode = mode; g_fill_short = false; g_fill_req = true; }
     uint64_t weapon_object() { return (g_am_on.load() && now_ms() - g_am_t.load() < 1000) ? g_am_obj.load() : 0; }
     void reserve_take_request(int n) { g_take_req += n; }
     bool clip_fill_failed() { return g_fill_failed.load(); }

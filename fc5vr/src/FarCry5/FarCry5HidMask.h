@@ -1,6 +1,6 @@
 #pragma once
 
-// hidmask (Metro Exodus VR review, 6 Nov 2026, item 3): the part of each eye image the headset's lens never shows (the runtime's
+// hidmask (pipeline review, 6 Nov 2026, item 3): the part of each eye image the headset's lens never shows (the runtime's
 // hidden-area mesh, XR_KHR_visibility_mask) is stamped into the scene depth right after the game clears it, at the near plane of the
 // game's reversed depth (1.0). Every later draw that tests depth fails there, so the G-buffer and the passes that test depth skip
 // those pixels. Mode "restore" puts far depth (0.0, sky) back over the same triangles when the scene depth is first unbound, so the

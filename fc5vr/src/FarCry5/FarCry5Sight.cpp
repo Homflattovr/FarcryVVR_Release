@@ -307,6 +307,33 @@ bool FarCry5Stereo::sight_line(glm::vec3& o_ctrl, glm::vec3& d_ctrl)
     return true;
 }
 
+// stockeye (Stereo.h): the sight line to put on the eye, the gun frame's axes: sight_line's (learnt, or the model's with sightdata on); else,
+// sightdata off and none learnt, the sight table's point for the gun (and its optic, when one is on and known) along the barrel, as
+// sight_line takes it with sightdata on. how: which.
+bool FarCry5Stereo::stock_sight_line(glm::vec3& o, glm::vec3& d, const char*& how)
+{
+    if (sight_line(o, d)) {
+        how = "sight line";
+        return true;
+    }
+    if (!m_sight || m_hand_map.empty) return false;
+    const uint32_t sig   = m_weapon_sig.load();
+    const auto*    point = fc5::sighttable::find(sig);
+    if (!point) return false;
+    glm::vec3 p{ point->x, point->y, point->z };
+    if (optic_now(sig)) {
+        const auto* opt = fc5::sighttable::find_optic(m_sight_optic_count.load());
+        if (!opt || !(point->mz > -0.5f)) return false;
+        p = glm::vec3{ point->mx + opt->x, point->my + opt->y, point->mz + opt->z };
+    }
+    glm::mat4 H{ 1.0f };
+    if (!sight_gun_pose(sig, H)) return false;
+    o   = m_hand_map.corr * (glm::vec3{ H * glm::vec4{ p, 1.0f } } - m_hand_map.grip0);
+    d   = glm::normalize(m_hand_map.corr * glm::mat3{ H } * glm::vec3{ 0.0f, 1.0f, 0.0f });
+    how = "model's sight point (sight table)";
+    return true;
+}
+
 // update_motion: the shots' line. In: the muzzle and (aim_dir) the controller's axis; out: the sight line when sightaim can.
 void FarCry5Stereo::sight_motion(const glm::vec3& barrel_origin, glm::vec3& aim_origin, glm::vec3& aim_dir)
 {
