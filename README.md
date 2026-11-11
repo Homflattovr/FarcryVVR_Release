@@ -7,6 +7,8 @@ you, and comfort options for driving, flying and cutscenes.
 
 > **Beta 0.4.** Expect some rough edges. Read [KNOWN_ISSUES.txt](release/KNOWN_ISSUES.txt) before you report something.
 
+**Support this project**: https://ko-fi.com/homard47885
+
 **[Download the latest release](https://github.com/Homflattovr/FarcryVVR_Release/releases)** (the `FC5VR_<version>.zip` file)
 
 ---
