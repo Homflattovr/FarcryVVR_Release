@@ -26,6 +26,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -433,6 +434,9 @@ namespace wc
         int                       main_st{ 0 }, side_st{ 0 };
         float                     main_wait{ 0 }, side_wait{ 0 }, main_zero{ 0 }, side_zero{ 0 };   // s of play waited; s of play answered "not carried"
         bool                      watching{ false }, trust{ false }, distrust{ false };
+        // weapongone in play (author 13 Nov 20:43Z): the weapon on the sling / the hip the game answered "not carried" for, and for how long (s of play).
+        uint32_t                  gone_main_sig{ 0 }, gone_side_sig{ 0 };
+        float                     gone_main{ 0 }, gone_side{ 0 };
         clock::time_point         ask_last{};
         // Saving.
         std::unique_ptr<Job>      job;
@@ -765,14 +769,36 @@ void FarCry5Stereo::holster_glove_note(const void* mesh, UINT count, UINT start,
     }
 }
 
-// holsterglove: this frame's recorded hands kept for later sessions (fc5vr_holsterhands.txt).
+namespace
+{
+    // holsterhandsasync (15 Nov hiccups): fc5vr_holsterhands.txt is written on its own thread; one write at a time.
+    std::atomic<bool> g_hands_writing{ false };
+
+    // The same recorded hand within 1 mm and about 0.3 deg in every bone: nothing new to write.
+    bool same_hand(const std::vector<std::pair<int, glm::mat4>>& a, const std::vector<std::pair<int, glm::mat4>>& b)
+    {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (a[i].first != b[i].first) return false;
+            for (int col = 0; col < 4; ++col)
+                for (int r = 0; r < 3; ++r)
+                    if (std::abs(a[i].second[col][r] - b[i].second[col][r]) > (col == 3 ? 0.001f : 0.005f)) return false;
+        }
+        return true;
+    }
+}
+
+// holsterglove: this frame's recorded hands kept for later sessions (fc5vr_holsterhands.txt). The file is marked for writing only when a hand
+// is new or has moved (15 Nov: every recording marked it, so it was rewritten every 10 s while a weapon was held still).
 void FarCry5Stereo::holster_keep_hands(uint32_t sig)
 {
     auto& t = *m_hol;
     for (const auto& [mesh, v] : t.pend_glove)
         if (const auto k = t.pend_glove_key.find(mesh); k != t.pend_glove_key.end() && !v.empty()) {
-            t.saved_hands[{ sig, k->second }] = v;
-            t.hands_dirty                      = true;
+            auto& kept = t.saved_hands[{ sig, k->second }];
+            if (same_hand(kept, v)) continue;
+            kept          = v;
+            t.hands_dirty = true;
         }
 }
 
@@ -804,7 +830,25 @@ bool FarCry5Stereo::holster_glove(const void* mesh, UINT count, UINT start, INT 
     const glm::mat3 PR = rot * w->corr;
     glm::mat4       A{ rT * WT * PR };
     A[3]              = glm::vec4{ hm.cam + rT * (hm.grip + WT * (pos - hm.w_pos - PR * w->grip0)), 1.0f };
-    const glm::mat4 X = glm::inverse(Om) * A;
+    glm::mat4 X = glm::inverse(Om) * A;
+    {
+        // handfine: the same from small numbers in doubles (the copy's space -> this draw's model: Om.R^-1 (G q + s - u), u the draw from the game camera).
+        const glm::dmat3 R{ glm::mat3{ Om } }, Ri = glm::inverse(R);
+        const glm::dvec3 u = glm::dvec3{ glm::vec3{ Om[3] } } - glm::dvec3{ hm.cam };
+        const glm::vec3  sv = rT * (hm.grip + WT * (pos - hm.w_pos - PR * w->grip0));
+        glm::dmat4       Xd{ Ri * glm::dmat3{ rT * WT * PR } };
+        Xd[3] = glm::dvec4{ Ri * (glm::dvec3{ sv } - u), 1.0 };
+        const glm::mat4 xf{ Xd };
+        const float     mm = 1000.0f * glm::length(glm::mat3{ Om } * (glm::vec3{ xf[3] } - glm::vec3{ X[3] }));
+        if (mm < 20.0f) {
+            m_hf_hand_n++;
+            m_hf_hand2 += double(mm) * mm;
+            m_hf_hand_max = std::max(m_hf_hand_max, mm);
+            if (m_hand_fine.load()) X = xf;
+        } else {
+            m_hf_hand_refused++;
+        }
+    }
     for (const auto& [bi, B] : *hand)
         if ((bi + 1) * 12 <= (int)bones.size()) to_rows(X * B, bones.data() + bi * 12);
     if (m_hol->glove_said != sig) {
@@ -1241,16 +1285,31 @@ void FarCry5Stereo::holster_frame_end()
         }
         if (n) spdlog::info("[Holster] holsterglove: {} hands ({} bones) read from fc5vr_holsterhands.txt", t.saved_hands.size(), n);
     }
-    if (t.hands_dirty && now - t.hands_saved_t > std::chrono::seconds(10)) {
+    if (t.hands_dirty && now - t.hands_saved_t > std::chrono::seconds(10) && !g_hands_writing.load()) {
         t.hands_dirty   = false;
         t.hands_saved_t = now;
-        std::ofstream out{ fc5::mod_file("fc5vr_holsterhands.txt"), std::ios::trunc };
-        for (const auto& [k, v] : t.saved_hands)
-            for (const auto& [bi, m] : v) {
-                out << k.first << ' ' << std::get<0>(k.second) << ' ' << std::get<1>(k.second) << ' ' << std::get<2>(k.second) << ' ' << bi;
-                for (int col = 0; col < 4; ++col) for (int r = 0; r < 4; ++r) out << ' ' << m[col][r];
-                out << '\n';
+        // holsterhandsasync (15 Nov, the author's hiccups; research\2026-11-15_stutter): formatting and writing this file (600 KB, 4100 lines of
+        // 21 numbers) took 27-37 ms on the render thread, every 10 s while a weapon was held still (hitchlog 15 Nov 21:36-22:17: 141 of the
+        // 250 pairs over 50 ms had "post (mod)" 27-37 ms, 10.0 s apart). The same text, from a copy, on its own thread.
+        g_hands_writing = true;
+        std::thread([hands = t.saved_hands, path = fc5::mod_file("fc5vr_holsterhands.txt")] {
+            std::ostringstream out;
+            for (const auto& [k, v] : hands)
+                for (const auto& [bi, m] : v) {
+                    out << k.first << ' ' << std::get<0>(k.second) << ' ' << std::get<1>(k.second) << ' ' << std::get<2>(k.second) << ' ' << bi;
+                    for (int col = 0; col < 4; ++col) for (int r = 0; r < 4; ++r) out << ' ' << m[col][r];
+                    out << '\n';
+                }
+            const std::string tmp = path + ".tmp";
+            bool              ok  = false;
+            {
+                std::ofstream f{ tmp, std::ios::trunc };
+                f << out.str();
+                ok = static_cast<bool>(f);
             }
+            if (ok) MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+            g_hands_writing = false;
+        }).detach();
     }
     t.last      = std::move(t.cur);
     t.cur.clear();
@@ -1664,6 +1723,7 @@ void FarCry5Stereo::holster_model_draw(ID3D11DeviceContext* ctx, ID3D11Buffer* c
     float o[32];
     std::memcpy(o, r.obj, sizeof(o));
     to_rows(Ow, o);
+    near_place(o, glm::dvec3{ rT * (hm.grip + WT * (m_mo.hip_pos_world - hm.w_pos)) }, 0);   // nearfine
     call_orig<void>(m_update_sub_hook, 48, ctx, static_cast<ID3D11Resource*>(t.model_obj), 0u, static_cast<const D3D11_BOX*>(nullptr), static_cast<const void*>(o), 0u, 0u);
     ID3D11Buffer* const vcb0 = vcb[0], * const vcb4 = vcb[4];   // the gloves draw's camera and previous-transform buffers
     const UINT zero = 0;
@@ -1824,6 +1884,7 @@ void FarCry5Stereo::holster_show(ID3D11DeviceContext* ctx)
             float o[32];
             std::memcpy(o, r.obj, sizeof(o));
             to_rows(Ow, o);
+            near_place(o, glm::dvec3{ rT * (hm.grip + WT * (fine_from_grip(show[i].pos, hm.w_pos) + PR * (r.tq - g0))) }, 0);   // nearfine: the place and its own fraction
             call_orig<void>(m_update_sub_hook, 48, ctx, static_cast<ID3D11Resource*>(t.pool[k]), 0u, static_cast<const D3D11_BOX*>(nullptr), static_cast<const void*>(o), 0u, 0u);
 
             ctx->IASetInputLayout(r.il);
@@ -2212,37 +2273,65 @@ void FarCry5Stereo::holster_cache_save_step()
         j.at_frame = frame;
         return;
     }
-    for (auto& x : j.res)
-        if (!read_back(x)) return fail("a resource not read back");
-    // The file: header, resources, draws.
+    // Read back a few resources a frame (was all of them in one frame: 44-67 ms on the render thread for a 50-63 MB weapon, 16 Nov hitchlog).
+    // A staging copy is done on the GPU by now, so each Map is a plain copy; at least one resource a frame, then up to kReadBackPerFrame bytes.
+    {
+        constexpr uint64_t kReadBackPerFrame = 8ull << 20;
+        uint64_t           done              = 0;
+        for (auto& x : j.res) {
+            if (!x.staging) continue;
+            if (done >= kReadBackPerFrame) return;   // the rest next frame
+            if (!read_back(x)) return fail("a resource not read back");
+            done += x.data.size();
+        }
+    }
+    // The file: header, resources, draws. The header and the draws are small and put here; the resources' bytes (tens of MB) are moved
+    // to the writer thread and put there, so the render thread no longer copies them a second time.
     wc::Out o;
     o.put(wc::kMagic);
     o.put(wc::kVersion);
     o.put(j.h.sig); o.put(j.h.item); o.put(j.h.side); o.put(j.h.hand_ok); o.put(j.h.grip0); o.put(j.h.corr); o.put(j.h.hand);
     o.put(uint32_t(j.res.size()));
-    for (const auto& x : j.res) {
-        o.put(x.type);
-        if (x.type == 1) o.put(x.bd);
-        else o.put(x.td);
-        o.put(uint32_t(x.rowbytes.size()));
-        size_t at = 0;
-        for (size_t s = 0; s < x.rowbytes.size(); ++s) {
-            const size_t n = size_t(x.rowbytes[s]) * x.rows[s];
-            o.put(x.rowbytes[s]);
-            o.put(x.rows[s]);
-            o.bytes(x.data.data() + at, n);
-            at += n;
-        }
+    wc::Out tail;
+    tail.put(uint32_t(j.parts.size()));
+    for (const auto& c : j.parts) wc::put_part(tail, c);
+    std::vector<wc::Res> res;
+    res.reserve(j.res.size());
+    size_t file_bytes = o.b.size() + tail.b.size();
+    for (auto& x : j.res) {
+        wc::Res y{};
+        y.type     = x.type;
+        y.bd       = x.bd;
+        y.td       = x.td;
+        y.rowbytes = x.rowbytes;
+        y.rows     = x.rows;
+        y.data     = std::move(x.data);   // staging and src stay with the job (released below)
+        file_bytes += 1 + (y.type == 1 ? sizeof(y.bd) : sizeof(y.td)) + 4 + y.rowbytes.size() * (4 + 4 + 8) + y.data.size();
+        res.push_back(std::move(y));
     }
-    o.put(uint32_t(j.parts.size()));
-    for (const auto& c : j.parts) wc::put_part(o, c);
-    const double mb = double(o.b.size()) / 1048576.0;
-    std::thread([sig = j.h.sig, bytes = std::move(o.b)] {
+    const double mb = double(file_bytes) / 1048576.0;
+    std::thread([sig = j.h.sig, o = std::move(o), res = std::move(res), tail = std::move(tail), file_bytes]() mutable {
+        o.b.reserve(file_bytes);
+        for (const auto& x : res) {
+            o.put(x.type);
+            if (x.type == 1) o.put(x.bd);
+            else o.put(x.td);
+            o.put(uint32_t(x.rowbytes.size()));
+            size_t at = 0;
+            for (size_t s = 0; s < x.rowbytes.size(); ++s) {
+                const size_t n = size_t(x.rowbytes[s]) * x.rows[s];
+                o.put(x.rowbytes[s]);
+                o.put(x.rows[s]);
+                o.bytes(x.data.data() + at, n);
+                at += n;
+            }
+        }
+        o.b.insert(o.b.end(), tail.b.begin(), tail.b.end());
         wc::make_dir();
         const std::string p = wc::file_of(sig), tmp = p + ".tmp";
         {
             std::ofstream f{ tmp, std::ios::binary | std::ios::trunc };
-            f.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+            f.write(reinterpret_cast<const char*>(o.b.data()), std::streamsize(o.b.size()));
             if (!f) return;
         }
         MoveFileExA(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING);
@@ -2269,8 +2358,11 @@ void FarCry5Stereo::holster_cache_save_step()
     g.job.reset();
 }
 
-// weaponcache: a kept copy made from its file. The game's own shaders are found by their CRC (else made from the bytecode kept); the vertex layout
-// is the game's one with the same elements (else made); everything else is made from the file. 0: a shader not there yet (tried again later).
+// weaponcache: a kept copy made from its file. Its shaders are made from the bytecode kept on disk (fc5vr_weaponcopies\vs_/ps_<CRC>.cso) and its
+// vertex layout from its elements and that vertex shader; everything else is made from the file. 0: a shader not on disk yet (tried again later;
+// note_shader keeps it once the game makes it). The game's own shader and layout objects are never borrowed (newgamecrash, author 16 Nov 11:51: the
+// lists of them (m_vs_info, m_ps_names, m_layouts) never drop one the game released, so a new game, which frees the front end's, handed a freed
+// vertex layout to AddRef: access violation at the start of play). Made through the hooked device, ours are listed and recognised like the game's.
 int FarCry5Stereo::holster_cache_make(uint32_t sig, const std::vector<uint8_t>& file, std::string& why)
 {
     auto& t = *m_hol;
@@ -2325,30 +2417,14 @@ int FarCry5Stereo::holster_cache_make(uint32_t sig, const std::vector<uint8_t>& 
         for (auto* x : ps) if (x) x->Release();
         for (auto* x : il) if (x) x->Release();
     };
-    auto same_layout = [](const std::vector<LayoutElem>& a, const std::vector<wc::Elem>& b) {
+    auto same_elems = [](const std::vector<wc::Elem>& a, const std::vector<wc::Elem>& b) {
         if (a.size() != b.size()) return false;
         for (size_t i = 0; i < a.size(); ++i)
-            if (_stricmp(a[i].semantic.c_str(), b[i].sem.c_str()) != 0 || a[i].index != b[i].idx || UINT(a[i].format) != b[i].fmt || a[i].slot != b[i].slot ||
-                a[i].offset != b[i].off || a[i].inst != b[i].inst)
+            if (_stricmp(a[i].sem.c_str(), b[i].sem.c_str()) != 0 || a[i].idx != b[i].idx || a[i].fmt != b[i].fmt || a[i].slot != b[i].slot ||
+                a[i].off != b[i].off || a[i].inst != b[i].inst)
                 return false;
         return true;
     };
-    {
-        std::lock_guard _{ m_ps_mtx };
-        for (const auto& [x, info] : m_vs_info) {
-            const uint32_t c = wc::crc_of(info);
-            for (uint32_t i = 0; i < np; ++i)
-                if (!vs[i] && c == cp[i].vs_crc) { vs[i] = x; x->AddRef(); }
-        }
-        for (const auto& [x, names] : m_ps_names) {
-            const uint32_t c = wc::crc_of(names);
-            for (uint32_t i = 0; i < np; ++i)
-                if (!ps[i] && c == cp[i].ps_crc) { ps[i] = x; x->AddRef(); }
-        }
-        for (const auto& [x, elems] : m_layouts)
-            for (uint32_t i = 0; i < np; ++i)
-                if (!il[i] && same_layout(elems, cp[i].il)) { il[i] = x; x->AddRef(); }
-    }
     auto read_code = [](const std::string& p, std::vector<char>& out) {
         std::ifstream f{ p, std::ios::binary };
         if (!f) return false;
@@ -2356,6 +2432,12 @@ int FarCry5Stereo::holster_cache_make(uint32_t sig, const std::vector<uint8_t>& 
         return !out.empty();
     };
     for (uint32_t i = 0; i < np; ++i) {
+        // A shader or layout an earlier draw of this weapon already made is shared (one object per CRC, as the game's would be).
+        for (uint32_t j = 0; j < i; ++j) {
+            if (!vs[i] && vs[j] && cp[j].vs_crc == cp[i].vs_crc) { vs[i] = vs[j]; vs[i]->AddRef(); }
+            if (!ps[i] && ps[j] && cp[j].ps_crc == cp[i].ps_crc) { ps[i] = ps[j]; ps[i]->AddRef(); }
+            if (!il[i] && il[j] && cp[j].vs_crc == cp[i].vs_crc && same_elems(cp[j].il, cp[i].il)) { il[i] = il[j]; il[i]->AddRef(); }
+        }
         std::vector<char> code;
         if (!vs[i] && read_code(wc::shader_file(false, cp[i].vs_crc), code)) g.dev->CreateVertexShader(code.data(), code.size(), nullptr, &vs[i]);
         if (!ps[i]) {
@@ -2369,9 +2451,9 @@ int FarCry5Stereo::holster_cache_make(uint32_t sig, const std::vector<uint8_t>& 
             g.dev->CreateInputLayout(el.data(), UINT(el.size()), code.data(), code.size(), &il[i]);
         }
         if (!vs[i] || !ps[i] || !il[i]) {
-            why = !vs[i] ? fmt::format("the game has not made its vertex shader #{:08X} yet (none kept)", cp[i].vs_crc)
-                : !ps[i] ? fmt::format("the game has not made its pixel shader #{:08X} yet (none kept)", cp[i].ps_crc)
-                         : "no vertex layout like its own yet";
+            why = !vs[i] ? fmt::format("its vertex shader #{:08X} not kept on disk yet (kept once the game makes it)", cp[i].vs_crc)
+                : !ps[i] ? fmt::format("its pixel shader #{:08X} not kept on disk yet (kept once the game makes it)", cp[i].ps_crc)
+                         : "its vertex layout not made";
             release_all();
             return 0;
         }
@@ -2595,21 +2677,22 @@ void FarCry5Stereo::holster_cache_frame()
                          holster_game_side(s), l);
         }
     }
-    // The inventory asked (slotcarried's call, every 150 ms on the script thread) about the two waiting, and about the weapon in hand: its "carried"
-    // says the answers can be used, its "not carried" that they cannot (then both are shown as before).
-    const bool  in_play = m_player_views_last_frame != 0 && !m_menu_screen_on;
-    const float dt      = g.ask_last == clock::time_point{} ? 0.0f : std::min(0.25f, std::chrono::duration<float>(now - g.ask_last).count());
-    g.ask_last          = now;
-    const bool ask      = fc5::gesture::slot_carried_on() && !g.distrust;
-    uint64_t   held_it  = 0;
-    if (ask && (g.main_st == 1 || g.side_st == 1)) {
+    // The inventory asked (slotcarried's call, every 150 ms on the script thread) about the two waiting, about the weapons shown on the sling and the
+    // hip, and about the weapon in hand: its "carried" says the answers can be used, its "not carried" that they cannot.
+    const bool     in_play    = m_player_views_last_frame != 0 && !m_menu_screen_on;
+    const float    dt         = g.ask_last == clock::time_point{} ? 0.0f : std::min(0.25f, std::chrono::duration<float>(now - g.ask_last).count());
+    g.ask_last                = now;
+    const bool     ask        = fc5::gesture::slot_carried_on() && !g.distrust;
+    uint64_t       held_it    = 0;
+    const uint32_t shown_side = t.slot_sig.load() ? t.slot_sig.load() : t.side_sig;
+    if (ask) {
         uint64_t eq = 0;
         if (fc5::lua::equipped_item(eq)) held_it = eq;
-        uint64_t items[3]{};
+        uint64_t items[4]{};   // kCarryKept (FarCry5Lua.cpp)
         int      k = 0;
         if (held_it) items[k++] = held_it;
-        for (const uint32_t s : { g.main_st == 1 ? g.seed_main : 0u, g.side_st == 1 ? g.seed_side : 0u })
-            if (const uint64_t it = s ? fc5::gameweapon::item(s) : 0; it != 0 && std::find(items, items + k, it) == items + k) items[k++] = it;
+        for (const uint32_t s : { g.main_st == 1 ? g.seed_main : 0u, g.side_st == 1 ? g.seed_side : 0u, t.main_sig, shown_side })
+            if (const uint64_t it = s ? fc5::gameweapon::item(s) : 0; k < 4 && it != 0 && std::find(items, items + k, it) == items + k) items[k++] = it;
         fc5::lua::carried_watch_kept(items, k);
         g.watching = true;
     } else if (g.watching) {
@@ -2647,12 +2730,10 @@ void FarCry5Stereo::holster_cache_frame()
                          main ? "" : ", the sidearm slot looked at as before");
             return;
         }
-        const char* const why = !fc5::gesture::slot_carried_on() ? "slotcarried off, not asked"
-                                : g.distrust                     ? "the inventory's answers not used"
-                                : it == 0                        ? "its game item not known, not asked"
-                                : c == 1                         ? "the game says it is carried"
-                                : c < 0 && wait > 5.0f           ? "no answer from the game's inventory in 5 s of play"
-                                                                 : nullptr;
+        // Shown only once the game says it is carried (author 13 Nov 20:43Z: an ARC picked up, then death and the save before it loaded; the
+        // inventory had not answered in 5 s, so the kept ARC went on the sling anyway and stayed there). No answer, no item known or the
+        // answers not usable: the copy waits, and the weapon shows as soon as it is held, as without the kept copies.
+        const char* const why = !fc5::gesture::slot_carried_on() ? "slotcarried off, not asked" : c == 1 ? "the game says it is carried" : nullptr;
         if (!why) return;   // waits for the answer (the copy not drawn meanwhile)
         st = 2;
         if (!main && fc5::gesture::side_key() != 0 && t.slot_sig.load() == 0) t.slot_sig = s;
@@ -2666,6 +2747,27 @@ void FarCry5Stereo::holster_cache_frame()
     };
     decide(g.seed_main, g.main_st, g.main_wait, g.main_zero, true);
     decide(g.seed_side, g.side_st, g.side_wait, g.side_zero, false);
+    // weapongone in play (author 13 Nov 20:43Z): the weapon shown on the sling or the hip that the game says the player no longer carries (a save
+    // loaded from before it was picked up, a respawn, dropped or swapped) is taken off after 1.5 s of play of that answer (trusted answers only,
+    // never the weapon in hand), and not given at the next start. Held again, it is shown again.
+    auto gone = [&](uint32_t s, float& z, uint32_t& zs, bool main) {
+        if (zs != s) { zs = s; z = 0.0f; }
+        if (s == 0 || !ask || !trusted) { z = 0.0f; return; }
+        const uint64_t it = fc5::gameweapon::item(s);
+        const int      c  = it != 0 && it != held_it ? fc5::lua::item_carried(it) : -1;
+        if (c != 0) { z = 0.0f; return; }
+        if (in_play) z += dt;
+        if (z < 1.5f) return;
+        z = 0.0f;
+        t.held_at.erase(std::remove_if(t.held_at.begin(), t.held_at.end(), [&](const auto& h) { return h.first == s; }), t.held_at.end());
+        if (!main && t.slot_sig.load() == s) t.slot_sig = 0;
+        if (g.start_main == s) { g.start_main = 0; g.dirty = true; }
+        if (g.start_side == s) { g.start_side = 0; g.dirty = true; }
+        spdlog::info("[Holster] weapongone: the game says weapon {} (item {:x}, shown on the {}) is no longer carried: taken off until it is held again", s, it,
+                     main ? "sling" : "hip");
+    };
+    gone(t.main_sig, g.gone_main, g.gone_main_sig, true);
+    gone(shown_side, g.gone_side, g.gone_side_sig, false);
     // The scene's views kept for the copies made from disk: dropped once none is left.
     if (g.disk.empty() && !g.scene_ps.empty()) {
         for (auto& [k, s] : g.scene_ps) s.release();
@@ -2780,54 +2882,12 @@ void FarCry5Stereo::draw_holster_menu(const std::function<void(const char*, std:
 {
     if (!m_hol) m_hol = new HolsterState{};
     auto& t = *m_hol;
-    bool  c = t.copies.load();
-    if (ImGui::Checkbox("Show the weapon the game does not hold where it is carried##weaponcopies", &c)) {
-        t.copies = c;
-        keep("weaponcopies", c ? "weaponcopies on" : "weaponcopies off");
-    }
-    hint("On (default): the mod draws its own copy of your main weapon on the sling while you hold the sidearm, and of the sidearm on the hip "
-         "while you hold the main weapon. A weapon is copied once you have held it still in your hand for a second (the first time after each "
-         "start of the game, unless kept below): until then its place stays empty.");
-    bool kc = wc::g.on.load();
-    if (ImGui::Checkbox("Keep the weapon copies between game starts##weaponcache", &kc)) m_ui_cmds += kc ? "weaponcache on\n" : "weaponcache off\n";
-    hint("On (default; author 7 Nov): each weapon copied is also kept in bin\\fc5vr_weaponcopies (its mesh, textures and material, about 5-40 MB a weapon), "
-         "so at the next start your main weapon is on the sling and your sidearm on the hip at once, the sidearm slot is not looked at after a load and the "
-         "loading popup has nothing to wait for. A weapon the game says you no longer carry is left out. Off: copied again at each start.");
-    ImGui::TextDisabled("Kept on disk: %d weapons; made from disk this session (not held yet): %d", int(wc::g.entries.size()), int(wc::g.disk.size()));
-    int key = fc5::gesture::side_key();
-    int sel = key < 0 ? 0 : key == 0 ? 1 : key - 0x02 + 2;
-    const char* const items[]{ "The weapon wheel's rightmost slot", "The game's last weapon (pad Y)", "Keyboard key 1", "Keyboard key 2", "Keyboard key 3",
-                               "Keyboard key 4", "Keyboard key 5", "Keyboard key 6", "Keyboard key 7", "Keyboard key 8", "Keyboard key 9" };
-    ImGui::SetNextItemWidth(260.0f);
-    if (ImGui::Combo("The hip takes##sidearmpick", &sel, items, IM_ARRAYSIZE(items))) {
-        const std::string v = sel == 0 ? "wheel" : sel == 1 ? "pad" : std::to_string(sel - 1);
-        m_ui_cmds += "sidearmpick " + v + "\n";
-    }
-    hint("The weapon wheel's rightmost slot (default; author 27 Oct: the sidearm slot): the hip opens the wheel for half a second and picks that slot; "
-         "the game's HUD is hidden meanwhile. A keyboard key (key 4 is that slot) also works but turns the game's button prompts to the keyboard's. Only the weapon that slot gives is the sidearm: nothing else ever hangs on the hip. If you pick the sidearm in the wheel yourself, it goes "
-         "on the hip and the sling shows no weapon. The game's last weapon (pad Y) goes between the two weapons you last held instead (then a "
-         "measured handgun counts as a sidearm). The switch back to the main weapon always uses the last weapon.");
-    bool pk = fc5::gesture::side_peek_on();
-    if (ImGui::Checkbox("Look at the sidearm slot after loading##sidearmpeek", &pk)) m_ui_cmds += pk ? "sidearmpeek on\n" : "sidearmpeek off\n";
-    hint("On (default): the mod can only show a weapon it has seen the game draw. After a load, once your main weapon is out (no grab held), "
-         "it picks the sidearm slot, records the sidearm (about a second, on your hip) and switches back, so the hip shows it from then on.");
-    bool hm = m_hol->model_on.load();
-    if (ImGui::Checkbox("Holster on the hip##holstermodel", &hm)) m_ui_cmds += hm ? "holstermodel on\n" : "holstermodel off\n";
-    hint("On (default; author 30 Oct): a holster molded on your sidearm (from its own mesh), drawn with its material, "
-         "on your hip whether the gun is in it or in your hand. Fit: holstergap (default 0.004 m off the gun), holsterwall (0.003 m), holstermouth "
-         "(-0.025 m: where it ends along the barrel from your grip).");
-    bool sy = fc5::gesture::side_y_on();
-    bool gd = fc5::gesture::game_draw_grab();
-    if (ImGui::Checkbox("Grabs ask the game for the very weapon, no wheel or Y (test)##gamedrawgrab", &gd)) m_ui_cmds += gd ? "gamedrawgrab on\n" : "gamedrawgrab off\n";
-    hint("Hip, sling and shoulder grabs call the game's own weapon change with the weapon wanted, about 0.2 s in the simulator. It needs the mod to have seen the game hold that weapon once since the game started; until then, as without this.");
-    bool sc = fc5::gesture::slot_carried_on();
-    if (ImGui::Checkbox("Shoulders: ask the game which weapons you still carry##slotcarried", &sc)) m_ui_cmds += sc ? "slotcarried on\n" : "slotcarried off\n";
-    hint("On (default): a shoulder slot forgets a weapon you dropped or swapped at once (the game's inventory says so), and a weapon you pick up takes "
-         "its slot, so the right gun is in your hand at the next grab. Off: after a pickup every slot is learned again from its key.");
-    if (ImGui::Checkbox("Hip grab: the game's last weapon when that is the sidearm (faster)##sidearmy", &sy)) m_ui_cmds += sy ? "sidearmy on\n" : "sidearmy off\n";
-    hint("On (default; author 28 Oct): when the weapon you held before the one in hand was the sidearm (the usual hip, sling, hip), "
-         "the hip switches with pad Y like the sling does, the game's quicker switch, instead of opening the weapon wheel. If Y brings another weapon, the "
-         "wheel's sidearm slot is picked next. Off: always the wheel.");
+    // Holster, bow and throwables clean-up (author 13 Nov 19:27Z): always on, no longer
+    // settings: weaponcopies, weaponcache (kept between starts), holstermodel, gamedrawgrab (grabs ask the game for the very weapon, the
+    // reverse-engineered route; the wheel and Y below are only its fallback before the mod has seen the game hold that weapon), slotcarried,
+    // sidearmy, sidearmpeek; sidearmpick is the wheel's sidearm slot (the pad Y and key rows below stay reachable by command only).
+    ImGui::TextDisabled("Weapon copies kept on disk: %d weapons; made from disk this session (not held yet): %d", int(wc::g.entries.size()), int(wc::g.disk.size()));
+    const int key = fc5::gesture::side_key();
     const uint32_t sig = m_weapon_sig.load();
     if (key != 0) {
         ImGui::TextDisabled("Sidearm: weapon %u%s; weapon in the game's hands now: %u", t.slot_sig.load(), t.slot_sig.load() == 0 ? " (none yet)" : "", sig);
@@ -2843,16 +2903,13 @@ void FarCry5Stereo::draw_holster_menu(const std::function<void(const char*, std:
         t.autoside = a;
         keep("sidearmauto", a ? "sidearmauto on" : "sidearmauto off");
     }
-    hint("On (default): a gun the game holds with the left hand beside or behind the right one (a handgun) is a sidearm; one with the left hand "
-         "along the barrel is a main weapon. It is measured while you hold the gun still. The buttons below decide for the gun in your hand.");
+    hint("Decides whether a gun is a sidearm from how the game holds it.");
     bool g = t.gameside.load();
     if (ImGui::Checkbox("Ask the game which guns are sidearms##sidearmgame", &g)) {
         t.gameside = g;
         keep("sidearmgame", g ? "sidearmgame on" : "sidearmgame off");
     }
-    hint("On (default): the game's own weapon data decides first: a gun it carries on its pistol holster (handguns and SMGs such as the "
-         "A-99 or A2000) is a sidearm, any other is a main weapon, whatever your hands do. Guns the game's data does not list, and with "
-         "this off, are measured as above.");
+    hint("Uses the game's own weapon data to decide which guns are sidearms.");
     const int      meas = holster_handgun(sig);
     bool           f_on = false, f_off = false;
     std::string    list;

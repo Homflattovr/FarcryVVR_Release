@@ -45,6 +45,7 @@ namespace fc5::padglyph
         int         veh_type{ -1 };       // lua::vehicle_state's type (4 helicopter, 5 plane), -1 unknown
         bool        buttons{ false };     // drive::buttons(): drivebuttons on
         bool        swapped{ false };     // veh_triggers_swapped()
+        int         foot{ 0 };            // on foot (no seat, not flat): 1 footbuttons (left X = LB), 2 stickjump (right stick down = B)
         const char* profile{ "" };        // the OpenXR interaction profile
     };
     // Present thread: the icons follow the controllers and the vehicle layout; textures the game let go are released; probe lines.
@@ -57,10 +58,16 @@ namespace fc5::padglyph
     bool command(const std::string& cmd, const std::string& arg, std::istream& rest, bool& persist);
     // F11 HUD and menus > Button icons.
     void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint);
+    // F11 Debug > Diagnostics and captures: padglyphlog and padglyphprobe.
+    void draw_debug_menu(std::string& cmds, const std::function<void(const char*)>& hint);
 
     // promptdevice (wheelmouse auto, FarCry5Stereo::wheel_mouse_tick): the draw hook passes each texture a HUD draw reads; when it is one of
     // the game's button icons, its family is the device the game's prompts are for now. prompt_device(): 0 no icon drawn yet, 1 the
     // controller's (pad) icons, 2 keyboard or mouse icons. Any thread; never waits for the icon lock (a busy lock skips that texture).
     void note_hud_texture(ID3D11Resource* r);
     int  prompt_device();
+    // reloadbuttonprompt (FarCry5Reload.cpp reload_button_pass; author 16 Nov 14:39): the same HUD draws, when one reads the game's interact icon (the pad's X, which left Y sends, or the E key),
+    // note the time. True when such a draw was seen in the last ms milliseconds: the game shows a prompt for that button now (search a body,
+    // pick up, open). Any thread.
+    bool interact_prompt_within(uint64_t ms);
 }

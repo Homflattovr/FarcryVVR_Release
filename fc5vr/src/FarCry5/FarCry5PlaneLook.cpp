@@ -43,6 +43,27 @@ bool FarCry5Stereo::planelook_command(const std::string& cmd, const std::string&
         persist = true;
         return true;
     }
+    if (cmd == "vehnosebigown") {   // vehnosebigown on|off (saved): while driving, vehnosebig's model is this vehicle's (the seat's), not the largest
+        m_veh_nose_big_own = arg != "off" && arg != "0";
+        spdlog::info("[Vehicle] vehnosebigown {}", m_veh_nose_big_own.load() ? "on (the heading reads the vehicle the seat was learnt on, never another one nearby)"
+                                                                            : "off (as before 15 Nov: the largest vehicle model within 5 m, a truck alongside too)");
+        persist = true;
+        return true;
+    }
+    if (cmd == "bomberview") {   // bomberview on|off (saved): the eyes follow the game's bomber camera, head look off while it shows
+        m_bomb_view = arg != "off" && arg != "0";
+        spdlog::info("[Vehicle] bomberview {}", m_bomb_view.load() ? "on (the eyes look around the bomber camera's heading and pitch, head look off while it shows)"
+                                                                  : "off (as before 13 Nov: the eyes stay on the head, head look on)");
+        persist = true;
+        return true;
+    }
+    if (cmd == "bombhud") {   // bombhud on|off (saved): the bomber view's HUD laid on the world through the game camera
+        m_bomb_hud = arg != "off" && arg != "0";
+        spdlog::info("[Vehicle] bombhud {}", m_bomb_hud.load() ? "on (in the bomber view the game's HUD, its bomb sight, is laid on the world through the game camera, with hudmode 1)"
+                                                              : "off (the bomber view's HUD on the panel, as before 14 Nov)");
+        persist = true;
+        return true;
+    }
     if (cmd != "planelook") return false;
     m_plane_look = arg == "off" || arg == "0" ? 0 : arg == "all" || arg == "2" ? 2 : 1;   // planelook off|fly|all (saved)
     spdlog::info("[Vehicle] planelook {}", m_plane_look.load() == 0 ? "off" : m_plane_look.load() == 2 ? "all (every vehicle)" : "fly (flying vehicles)");
@@ -93,7 +114,36 @@ void FarCry5Stereo::plane_model_probe(int frame, const float* f, UINT count, flo
 
 // vehnosebig: the forward (y) axis, in the world, of the largest Vehicle_ draw within 5 m of the camera in the last 3 frames
 // (planelook's probe, which looks at every Vehicle_ draw within 8 m while in a vehicle, planelook not off).
-bool FarCry5Stereo::veh_big_model_y(int frame, glm::vec3& y) const
+// vehnosebigown (default on, saved; author 15 Nov 20:33; his 20:25-20:33 log, build 98802965): the car settled on vehnosebig (no model under the seat, its own 3.2 m away),
+// and while driving the heading followed "the largest Vehicle_ draw within 8 m" each frame. The truck that hit it at 20:33:18 was larger:
+// within 5 m its forward axis was read (-100 deg against the car's 54), 12 steady reads cut the heading onto it ("vehheadingkeep: the
+// heading back on the largest model nearby (-152 deg; it was 52, the model reads -100)"), vehheadingkeep then turned the game's aim
+// 164 deg round onto that front, and 0.8 s later the car's own read cut it back by -179 deg; between them, with the truck 5-8 m away
+// (largest, but past 5 m), nothing was read and the travel direction of a car sliding after the hit steered the view. The view turned
+// about 355 deg in 4 s and the eyes stood up to 69 cm aside on the turned game camera. Now, once vehseathold has learnt the seat at this
+// vehicle's settle, the model is the draw vehseathold keeps (the one that puts the camera nearest that seat, within 1.5 m of it): another
+// vehicle, however large, is never read; with this one not drawn the travel direction fills in as before. At the settle itself, and with
+// vehseathold off or no seat learnt, the largest as before. "[Vehicle] vehnosebigown" lines say when the largest was another vehicle.
+bool FarCry5Stereo::veh_big_model_y(int frame, glm::vec3& y, bool* own) const
+{
+    if (own) *own = false;
+    if (m_veh_nose_big_own.load() && m_veh_seat_hold.load() && m_veh_settle.load() == 0 && m_vsh_valid && m_vsh_learn_frame == m_veh_settled_frame) {
+        for (int k = 0; k <= 3; ++k) {
+            const int         g = frame - k;
+            const VehSeatRec& r = m_vsh_rec[g & 3];
+            if (r.frame != g) continue;
+            if (!(glm::length(r.cam - m_vsh_seat) < 1.5f)) return false;   // the nearest draw is not this vehicle: none of it drawn
+            y = glm::vec3{ r.rot[0][1], r.rot[1][1], r.rot[2][1] };      // rot is world -> the model's axes: its second row
+            if (!(std::isfinite(y.x + y.y + y.z) && (y.x * y.x + y.y * y.y) > 0.01f)) return false;
+            if (own) *own = true;
+            return true;
+        }
+        return false;
+    }
+    return veh_largest_model_y(frame, y);
+}
+
+bool FarCry5Stereo::veh_largest_model_y(int frame, glm::vec3& y) const
 {
     for (int k = 0; k <= 3; ++k) {
         const int       g  = frame - k;
@@ -109,6 +159,13 @@ bool FarCry5Stereo::veh_big_model_y(int frame, glm::vec3& y) const
 // Returns the attitude the eyes and the head look use.
 glm::mat3 FarCry5Stereo::plane_look_fix(int frame, const glm::mat3& a_cam)
 {
+    if (m_bomb_on) {
+        // bomberview: the bomber camera is no reading of the seat (2.3 m under the plane, 48 deg down): nothing learnt or corrected
+        // from it, and the correction starts over (faded in again) once the cockpit camera is back.
+        m_plane_blend     = 0.0f;
+        m_plane_fix_frame = -100;
+        return a_cam;
+    }
     const int  mode = m_plane_look.load();
     const bool want = mode == 2 || (mode == 1 && veh_flying());
     auto&      cr   = m_plane_cam[frame & 3];
@@ -209,26 +266,90 @@ glm::mat3 FarCry5Stereo::plane_look_fix(int frame, const glm::mat3& a_cam)
 void FarCry5Stereo::draw_planelook_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint)
 {
     int                pl = std::clamp(m_plane_look.load(), 0, 2);
-    static const char* kPlane[]{ "Off (as before 27 Oct)", "Flying vehicles (default)", "Every vehicle (test)" };
+    static const char* kPlane[]{ "Off", "Flying vehicles (default)", "Every vehicle (test)" };
     if (ImGui::Combo("Free head look from the vehicle's model", &pl, kPlane, 3)) {
         m_plane_look = pl;
         keep("planelook", pl == 0 ? "planelook off" : pl == 2 ? "planelook all" : "planelook fly");
     }
-    hint("The game does not turn its camera all the way where you look in a vehicle: in a plane looking down pushed the view back up, and with "
-         "the nose straight up or down you could barely look aside. Flying vehicles: the plane or helicopter's attitude is read from its own model, "
-         "so you look anywhere. Every vehicle: cars, quads and boats too (a test). Off: as before 27 Oct.");
+    hint("In vehicles, you can look anywhere freely. Flying vehicles only, or every vehicle.");
     bool vn = m_veh_nose.load();
     if (ImGui::Checkbox("Getting in: face the vehicle's nose", &vn)) {
         m_veh_nose = vn;
         keep("vehnose", vn ? "vehnose on" : "vehnose off");
     }
-    hint("After the get-in animation the view faces the vehicle's front, read from its own model, even when the game's camera still looks at "
-         "the door (planes). Off: the front is the side of the vehicle nearest where the game's camera looked (a plane's front was found only at take-off).");
+    hint("After getting in, your view faces the front of the vehicle.");
     bool vb = m_veh_nose_big.load();
     if (ImGui::Checkbox("Getting in: the nose from the largest vehicle model nearby", &vb)) {
         m_veh_nose_big = vb;
         keep("vehnosebig", vb ? "vehnosebig on" : "vehnosebig off");
     }
-    hint("Some planes sit too high above their model's centre for the front to be read under the seat: a plane at rest then looked over its wing. "
-         "On: the front is read from the largest vehicle model within 5 m. Off: as before (the camera's direction, then the travel direction).");
+    hint("Finds the vehicle's front from the largest vehicle nearby, for planes that sit high.");
+    bool vbo = m_veh_nose_big_own.load();
+    if (ImGui::Checkbox("Driving: that nose from your own vehicle only", &vbo)) {
+        m_veh_nose_big_own = vbo;
+        keep("vehnosebigown", vbo ? "vehnosebigown on" : "vehnosebigown off");
+    }
+    hint("Once seated, the front comes only from your own vehicle, so a truck that hits you doesn't turn your view.");
+    bool bv = m_bomb_view.load();
+    if (ImGui::Checkbox("Planes: the bomber view looks where the game's bomb camera looks", &bv)) {
+        m_bomb_view = bv;
+        keep("bomberview", bv ? "bomberview on" : "bomberview off");
+    }
+    hint("In a plane with bombs, your view follows the game's bomb camera while you hold the left grip.");
+    bool bh = m_bomb_hud.load();
+    if (ImGui::Checkbox("Planes: the bomb sight sits on the ground", &bh)) {
+        m_bomb_hud = bh;
+        keep("bombhud", bh ? "bombhud on" : "bombhud off");
+    }
+    hint("The bomb sight's scale is laid on the ground, as on a flat screen.");
+}
+
+// bomberview: from update_vehicle each update, once driving / riding is decided. On while the pad's LT is held driving a plane (the game's
+// type 5); off once let go and the camera is back in the seat (vehseathold), or 0.5 s after (the cockpit camera comes back a frame or two
+// after LT goes up).
+void FarCry5Stereo::bomb_view_update(int frame)
+{
+    using namespace std::chrono_literals;
+    const auto now = std::chrono::steady_clock::now();
+    const bool can = m_bomb_view.load() && m_motion.load() && m_in_vehicle.load() && m_veh_driving.load() && m_veh_game_type == 5 && !m_chute_vehicle &&
+                     m_veh_settle.load() == 0 && !m_menu_screen_on;
+    bool on = m_bomb_on;
+    if (!can) {
+        on = false;
+    } else if (m_lt_sent.load()) {
+        on          = true;
+        m_bomb_up_t = {};
+    } else if (on) {
+        if (m_bomb_up_t == std::chrono::steady_clock::time_point{}) m_bomb_up_t = now;
+        if ((m_vsh_valid && m_vsh_near) || now - m_bomb_up_t > 500ms) on = false;
+    }
+    if (on) {
+        m_bomb_frames++;
+        m_bomb_pitch_min = std::min(m_bomb_pitch_min, m_cine_pitch);
+        m_bomb_pitch_max = std::max(m_bomb_pitch_max, m_cine_pitch);
+        m_bomb_seat_max  = std::max(m_bomb_seat_max, m_vsh_off_max);
+    }
+    m_bomb_hud_now.store(on && m_bomb_hud.load() && m_hud_mode.load() == 1, std::memory_order_relaxed);   // bombhud (hud_begin, hud_world_draw)
+    if (on == m_bomb_on) return;
+    m_bomb_on = on;
+    request_jump_reset();   // the view cuts to or from the bomber camera: each eye's DLSS history starts over
+    if (on) {
+        m_bomb_t0        = now;
+        m_bomb_frames    = 0;
+        m_bomb_pitch_min = m_bomb_pitch_max = m_cine_pitch;
+        m_bomb_seat_max  = 0.0f;
+        m_bomb_hud_draws = 0; m_bomb_hud_mul = 0; m_bomb_hud_passes = 0; m_bomb_hud_nocam = 0;
+        spdlog::info("[Vehicle] bomberview: LT held in a plane (the game's bomber view) at frame {}: the eyes follow the bomber camera's heading and pitch "
+                     "from its place, head look off (its offset {:.0f} / {:.0f} deg back to 0), airfollow and planelook held",
+                     frame, glm::degrees(m_ev_yaw), glm::degrees(m_ev_pitch));
+    } else {
+        spdlog::info("[Vehicle] bomberview: over after {:.1f} s ({} updates; {}): the game camera's pitch {:.0f} to {:.0f} deg, the camera at most {:.1f} m off the seat",
+                     std::chrono::duration<float>(now - m_bomb_t0).count(), m_bomb_frames,
+                     !can ? "out of the plane's driver's seat, a menu or bomberview off" : m_vsh_near ? "LT let go, the camera back in the seat" : "LT let go 0.5 s ago",
+                     m_bomb_pitch_min, m_bomb_pitch_max, m_bomb_seat_max);
+        spdlog::info("[HUD] bombhud: {}", !m_bomb_hud.load() ? std::string{ "off (the HUD stayed on the panel)" }
+                                          : m_hud_mode.load() != 1 ? fmt::format("not used (hudmode {}, only with 1)", m_hud_mode.load())
+                                          : fmt::format("{} HUD draws laid through the game camera ({} darkening draws), {} eye pictures, {} without the game camera",
+                                                        m_bomb_hud_draws.load(), m_bomb_hud_mul.load(), m_bomb_hud_passes.load(), m_bomb_hud_nocam.load()));
+    }
 }

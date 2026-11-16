@@ -156,11 +156,13 @@ VRRuntime::Error OpenXR::synchronize_frame(int frame) {
         last_display = fs.predictedDisplayTime;
         if (std::chrono::steady_clock::now() - last_log > std::chrono::seconds(5)) {
             last_log = std::chrono::steady_clock::now();
-            spdlog::info("[VR] pacing: {} waits, display period {:.2f} ms, step min {:.2f} max {:.2f} ms, {} steps over 1.5 periods, {} repeated, {} backwards, {} shouldRender=false; CPU ms per XR frame: xrWaitFrame {:.2f}, xrEndFrame {:.2f}, eye copies {:.2f}; framelock {} ({} per picture, {}% over a refresh)",
+            spdlog::info("[VR] pacing: {} waits, display period {:.2f} ms, step min {:.2f} max {:.2f} ms, {} steps over 1.5 periods, {} repeated, {} backwards, {} shouldRender=false; CPU ms per XR frame: xrWaitFrame {:.2f}, xrEndFrame {:.2f}, eye copies {:.2f} (of which xrAcquireSwapchainImage {:.2f}, xrWaitSwapchainImage {:.2f}, xrReleaseSwapchainImage {:.2f}); framelock {} ({} per picture, {}% over a refresh)",
                          waits, double(fs.predictedDisplayPeriod) / 1e6, min_ms, max_ms, skipped_periods, repeats, backwards, no_render, s_fc5_wait_ms / std::max(1u, waits),
-                         s_fc5_end_ms / std::max(1u, waits), s_fc5_copy_ms / std::max(1u, waits), s_fc5_frame_lock.load() < 0 ? "auto" : s_fc5_frame_lock.load() == 0 ? "off" : "fixed",
+                         s_fc5_end_ms / std::max(1u, waits), s_fc5_copy_ms / std::max(1u, waits), s_fc5_copy_acquire_ms / std::max(1u, waits), s_fc5_copy_wait_ms / std::max(1u, waits),
+                         s_fc5_copy_release_ms / std::max(1u, waits),
+                         s_fc5_frame_lock.load() < 0 ? "auto" : s_fc5_frame_lock.load() == 0 ? "off" : "fixed",
                          s_fc5_lock_n.load(), s_fc5_lock_over_pct.load());
-            s_fc5_wait_ms = s_fc5_end_ms = s_fc5_copy_ms = 0.0;
+            s_fc5_wait_ms = s_fc5_end_ms = s_fc5_copy_ms = s_fc5_copy_acquire_ms = s_fc5_copy_wait_ms = s_fc5_copy_release_ms = 0.0;
             waits = repeats = backwards = no_render = skipped_periods = 0;
             min_ms = 1e9;
             max_ms = 0.0;
@@ -326,6 +328,116 @@ void fc5_reload_head_path() {
 }
 }
 
+// xrlocalfix: OpenXR's LOCAL space must be level (+Y up), but SteamVR's Oculus driver can hand out one turned upside
+// down (seen 16 Nov with a Quest through Virtual Desktop and SteamVR: every view pose about 180 deg about X, the head
+// 1.17 m below the origin), and the mod then draws the world and the menus upside down. Once the head is tracked (and
+// again after each LOCAL change the runtime announces) LOCAL is located in STAGE; if its up is over 30 deg off STAGE's,
+// stage_space becomes a STAGE space with its origin at the head, level, facing the head's way (what a sound LOCAL is
+// right after a recentre), and both recentres are asked for. Virtual Desktop's own runtime and the simulator give a
+// level LOCAL: nothing changes there. Spaces are never destroyed here (end_frame may be using one on another thread).
+void OpenXR::fc5_check_local_upright(XrTime display_time) {
+    if (this->fc5_local_raw == XR_NULL_HANDLE) {
+        this->fc5_local_raw = this->stage_space;   // still the LOCAL space VR.cpp made
+    }
+    if (!s_fc5_local_fix.load()) {
+        if (this->stage_space != this->fc5_local_raw) {
+            this->stage_space = this->fc5_local_raw;
+            this->wants_reset_origin = true;
+            s_fc5_local_space_change_time = (int64_t)display_time;
+            this->fc5_local_changes_checked = ++s_fc5_local_space_changes;
+            spdlog::info("[VR] xrlocalfix off: the runtime's LOCAL space used again");
+        }
+        this->fc5_local_state = 0;
+        return;
+    }
+    const uint32_t changes = s_fc5_local_space_changes.load();
+    if (this->fc5_local_state != 0 && changes == this->fc5_local_changes_checked) {
+        return;
+    }
+    if (this->fc5_local_state == -1) {
+        this->fc5_local_changes_checked = changes;
+        return;
+    }
+    if (this->fc5_stage_ref == XR_NULL_HANDLE) {
+        XrReferenceSpaceCreateInfo ci{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+        ci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+        ci.poseInReferenceSpace.orientation.w = 1.0f;
+        const auto r = xrCreateReferenceSpace(this->session, &ci, &this->fc5_stage_ref);
+        if (r != XR_SUCCESS) {
+            this->fc5_stage_ref = XR_NULL_HANDLE;
+            this->fc5_local_state = -1;
+            this->fc5_local_changes_checked = changes;
+            spdlog::info("[VR] xrlocalfix: no STAGE space ({}): LOCAL used as the runtime gives it", this->get_result_string(r));
+            return;
+        }
+    }
+    constexpr XrSpaceLocationFlags both = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    XrSpaceLocation local{XR_TYPE_SPACE_LOCATION};
+    XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
+    if (xrLocateSpace(this->fc5_local_raw, this->fc5_stage_ref, display_time, &local) != XR_SUCCESS || (local.locationFlags & both) != both ||
+        xrLocateSpace(this->view_space, this->fc5_stage_ref, display_time, &head) != XR_SUCCESS || (head.locationFlags & both) != both) {
+        if (++this->fc5_local_tries == 1 || this->fc5_local_tries % 500 == 0) {
+            spdlog::info("[VR] xrlocalfix: LOCAL or the head not located in STAGE yet (try {})", this->fc5_local_tries);
+        }
+        return;   // the next frame tries again
+    }
+    this->fc5_local_tries = 0;
+    this->fc5_local_changes_checked = changes;
+    const glm::quat lq   = glm::normalize(to_glm(local.pose.orientation));
+    const glm::vec3 up   = lq * glm::vec3{0.0f, 1.0f, 0.0f};
+    const float     tilt = glm::degrees(std::acos(std::clamp(up.y, -1.0f, 1.0f)));
+    const glm::quat hq   = glm::normalize(to_glm(head.pose.orientation));
+    const glm::vec3 hup  = hq * glm::vec3{0.0f, 1.0f, 0.0f};
+    if (tilt <= 30.0f) {
+        const bool was_replaced = this->stage_space != this->fc5_local_raw;
+        if (was_replaced) {
+            this->stage_space = this->fc5_local_raw;
+            this->wants_reset_origin = true;
+            s_fc5_local_space_change_time = (int64_t)display_time;
+            this->fc5_local_changes_checked = ++s_fc5_local_space_changes;
+        }
+        this->fc5_local_state = 1;
+        spdlog::info("[VR] xrlocalfix: the runtime's LOCAL space is level (up {:.1f} deg off STAGE's; head up {:.2f}){}", tilt, hup.y,
+                     was_replaced ? ": used again" : ": used as it is");
+        if (hup.y < 0.0f) {
+            spdlog::warn("[VR] xrlocalfix: the head is upside down in STAGE as well: the runtime's spaces may all be turned; left as they are");
+        }
+        return;
+    }
+    // A level space at the head, facing where the head faces (its up when looking straight up or down).
+    glm::vec3 fwd = hq * glm::vec3{0.0f, 0.0f, -1.0f};
+    fwd.y = 0.0f;
+    if (glm::length(fwd) < 0.2f) {
+        fwd = hq * glm::vec3{0.0f, 1.0f, 0.0f};   // looking down, the top of the head points ahead; looking up, behind
+        if ((hq * glm::vec3{0.0f, 0.0f, -1.0f}).y > 0.0f) {
+            fwd = -fwd;
+        }
+        fwd.y = 0.0f;
+    }
+    const float     yaw = glm::length(fwd) > 1e-4f ? std::atan2(-fwd.x, -fwd.z) : 0.0f;
+    const glm::quat level = glm::angleAxis(yaw, glm::vec3{0.0f, 1.0f, 0.0f});
+    XrReferenceSpaceCreateInfo ci{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    ci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+    ci.poseInReferenceSpace.position = head.pose.position;
+    ci.poseInReferenceSpace.orientation = to_openxr(level);
+    XrSpace fixed{XR_NULL_HANDLE};
+    const auto r = xrCreateReferenceSpace(this->session, &ci, &fixed);
+    if (r != XR_SUCCESS) {
+        this->fc5_local_state = -1;
+        spdlog::error("[VR] xrlocalfix: LOCAL is {:.0f} deg off level but the replacement STAGE space failed ({}): LOCAL kept", tilt, this->get_result_string(r));
+        return;
+    }
+    this->stage_space = fixed;
+    this->fc5_local_state = 2;
+    this->wants_reset_origin = true;
+    s_fc5_local_space_change_time = (int64_t)display_time;
+    this->fc5_local_changes_checked = ++s_fc5_local_space_changes;   // the mod's own recentre follows (headsetrecenter)
+    spdlog::warn("[VR] xrlocalfix: the runtime's LOCAL space is {:.0f} deg off level (its up ({:.2f},{:.2f},{:.2f}) in STAGE, origin ({:.2f},{:.2f},{:.2f})): "
+                 "a level STAGE space at the head ({:.2f},{:.2f},{:.2f}), heading {:.0f} deg, used instead",
+                 tilt, up.x, up.y, up.z, local.pose.position.x, local.pose.position.y, local.pose.position.z, head.pose.position.x, head.pose.position.y,
+                 head.pose.position.z, glm::degrees(yaw));
+}
+
 VRRuntime::Error OpenXR::update_poses(int frame) {
     SCOPE_PROFILER();
     std::scoped_lock _{ this->sync_mtx };
@@ -368,6 +480,8 @@ VRRuntime::Error OpenXR::update_poses(int frame) {
 
     auto ps = frame > m_last_synchronized_frame ? this->prediction_scale : 0.0;
     const auto display_time = current_pipeline_state.frame_state.predictedDisplayTime + (XrDuration)(current_pipeline_state.frame_state.predictedDisplayPeriod * ps);
+
+    fc5_check_local_upright(display_time);   // xrlocalfix: before any pose of this frame is located in stage_space
 
     XrViewLocateInfo view_locate_info{XR_TYPE_VIEW_LOCATE_INFO};
     view_locate_info.viewConfigurationType = this->view_config;
@@ -1782,7 +1896,8 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
     const bool flat            = ModSettings::showFlatScreenDisplay();
     const bool keep_projection = flat && fc5_simulator_runtime() && s_fc5_sim_projection.load();
     // menuproj: the flat screen already drawn into both eye images this frame (D3D11Component): a projection layer, no quad.
-    const bool menu_proj = flat && this->fc5_menu_proj_ready;
+    // Menus in VR also draw the frozen play image there while no player camera is drawn yet, before the flat screen starts.
+    const bool menu_proj = this->fc5_menu_proj_ready;
     this->fc5_menu_proj_ready = false;
     if (current_pipeline->frame_state.shouldRender == XR_TRUE) {
         projection_layer_views.resize(current_pipeline->stage_views.size(), {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
@@ -1898,6 +2013,24 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
                     projection_layer_views[i].fov                     = this->fc5_menu_proj_fov[i];
                     projection_layer_views[i].subImage.imageRect.offset = {0, 0};
                     projection_layer_views[i].subImage.imageRect.extent = {(int32_t)swapchain.width, (int32_t)swapchain.height};
+                }
+            }
+            // Menus in VR: the pose, field and rectangle each kept play image went to the headset with (D3D11Component fc5_backdrop_keep).
+            if (!menu_proj && !flat) {
+                for (size_t i = 0; i < projection_layer_views.size() && i < 2; ++i) {
+                    if (!this->fc5_backdrop_pending[i]) continue;
+                    const auto& v  = projection_layer_views[i];
+                    const auto& sc = this->swapchains[this->eye_swapchain((uint32_t)i)];
+                    if (sc.width > 0 && sc.height > 0 && v.fov.angleRight > v.fov.angleLeft && v.fov.angleUp > v.fov.angleDown) {
+                        this->fc5_backdrop_pose[i]    = v.pose;
+                        this->fc5_backdrop_fov[i]     = v.fov;
+                        this->fc5_backdrop_rect[i][0] = (float)v.subImage.imageRect.offset.x / (float)sc.width;
+                        this->fc5_backdrop_rect[i][1] = (float)v.subImage.imageRect.offset.y / (float)sc.height;
+                        this->fc5_backdrop_rect[i][2] = (float)v.subImage.imageRect.extent.width / (float)sc.width;
+                        this->fc5_backdrop_rect[i][3] = (float)v.subImage.imageRect.extent.height / (float)sc.height;
+                        this->fc5_backdrop_valid[i]   = true;
+                    }
+                    this->fc5_backdrop_pending[i] = false;
                 }
             }
             layer.space = this->stage_space;

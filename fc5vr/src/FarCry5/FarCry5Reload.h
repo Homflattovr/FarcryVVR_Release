@@ -89,6 +89,8 @@ namespace fc5::reload
     bool b_heal_only();                 // bheal (manualreload38, default on): right B held heals, never switches weapon
     bool b_heal_y(bool b_down);         // bheal: whether right B is the pad's Y now (held back for reloadtap ms, then held at least bhealms ms)
     void b_heal_throw();                // bheal: this right B press is the throw (left grip + B): no Y
+    bool b_quick_taken();               // bheal: a quick right B was let go since the last ask (cleared by asking)
+    bool veh_b_reload();                // vehbreload (saved, default on): in a vehicle a quick right B is the game's reload (ModConfig.cpp)
     bool log_on();                      // reloadlog
 
     // Per weapon (reloadgeom, saved): in the weapon hand's controller axes (x right, y up, z back, metres): the well point (the top of a
@@ -360,7 +362,9 @@ namespace fc5::reload
     // reloadsamegun (author 6 Nov 12:40): the weapon id the reload goes by (the arcade map's RAT4 69646 is 80077, the same draws).
     uint32_t    reload_sig(uint32_t sig);
     bool        grenade_seat();                                     // reloadgrenadeseat: the M79's grenade moved onto its bore (ReloadMag)
+    bool        held_follow();                                      // reloadheldfollow: a part drawn before the gun's main draw on this pass's carried body (ReloadMag)
     bool        shell_hip();                                        // reloadshellhip: a double barrel's hip shell centred on the pouch zone (ReloadMag)
+    bool        ball_follow();                                      // reloadballfollow: the well's ball and the drawn shells on the gun as drawn (GestureZones)
     bool        bolt_fed(uint32_t sig);                             // reloadboltpin: worked by hand after every shot
     // reloadmuzzlezone (author 5 Nov 15:51: the RPG's zone): a muzzle-loaded launcher's depth from its muzzle to
     // the seated round's tail, measured on the seated rocket (render thread): its tail goes in at the muzzle, so this is its travel. 0: not measured.
@@ -412,5 +416,8 @@ namespace fc5::reload
     // from that clip, at once when nothing can go in by hand (its well never measured), else after 6 s with nothing done towards the reload.
     bool command(const std::string& cmd, const std::string& arg, float fv, std::istream& rest, bool& persist);
     // F11 Weapon > Manual reload (experimental): its rows, in subsections; commands go into cmds. sig: the weapon in the game's hands now (0: none).
-    void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, uint32_t sig);
+    // debug: the menu is at the Debug level (F11 reorganisation, author 13 Nov 19:28Z): the Debug fold-out is drawn only then.
+    void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, uint32_t sig, bool debug = true);
+    // F11 Main and Gestures > Manual reload: the "Show hints" switch (reloadhighlight) alone (author 16 Nov 09:56Z).
+    void draw_hint_choice(std::string& cmds, const std::function<void(const char*)>& hint);
 }

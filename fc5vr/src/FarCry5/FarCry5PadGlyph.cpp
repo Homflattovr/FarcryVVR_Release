@@ -45,7 +45,8 @@ namespace fc5::padglyph
             bool    keys{ true };
             Veh     veh{ Veh::Foot };
             bool    swapped{ false };
-            bool operator==(const Layout& o) const { return mode == o.mode && letters == o.letters && keys == o.keys && veh == o.veh && swapped == o.swapped; }
+            int     foot{ 0 };   // FrameIn::foot: 1 footbuttons (left X = LB), 2 stickjump (right stick down = B)
+            bool operator==(const Layout& o) const { return mode == o.mode && letters == o.letters && keys == o.keys && veh == o.veh && swapped == o.swapped && foot == o.foot; }
         };
 
         struct Kept
@@ -62,6 +63,7 @@ namespace fc5::padglyph
         std::atomic<int>  g_letters_now{ int(Letters::Touch) };
         std::atomic<int>  g_veh_now{ int(Veh::Foot) };
         std::atomic<bool> g_swapped_now{ false };
+        std::atomic<int>  g_foot_now{ 0 };
 
         std::mutex                                          g_mtx;   // everything below
         std::vector<Kept>                                   g_kept;
@@ -78,8 +80,13 @@ namespace fc5::padglyph
         thread_local bool t_self_write = false;
 
         // promptdevice: the kept icons by texture (rebuilt by frame() under g_mtx) and the family the HUD drew last.
-        std::unordered_map<const void*, Kind> g_kind_of;
+        std::unordered_map<const void*, const Known*> g_kind_of;
         std::atomic<int>                      g_dev{ 0 };
+        // reloadbuttonprompt: the last HUD draw of the interact icon (GetTickCount64, 0 never), and its shown / gone lines.
+        std::atomic<uint64_t>                 g_x_ms{ 0 };
+        std::atomic<bool>                     g_x_shown{ false };
+        std::atomic<int>                      g_x_lines{ 0 };
+        constexpr uint64_t                    kXGoneMs = 1000;   // the log's "gone": no draw of it for this long
         uint64_t                              g_dev_flips{ 0 };   // under g_mtx
         ULONGLONG                             g_dev_logged{ 0 };
 
@@ -108,15 +115,19 @@ namespace fc5::padglyph
         uint32_t block_rows(UINT h) { return (h + 3) / 4; }
 
         // What the mod sends a pad button from, in each layout (ModConfig.cpp's on_xinput_get_state).
-        Icon pad_icon(Pad p, Veh v, bool sw)
+        // foot (FrameIn::foot, only on foot): 1 footbuttons, left X held is LB (the weapon wheel) and no longer B; 2 stickjump, the right stick down is B.
+        Icon pad_icon(Pad p, Veh v, bool sw, int foot)
         {
             const bool trig_layout = v == Veh::LandTriggers || v == Veh::Air;
             switch (p) {
             case Pad::A: return Icon::FaceA;
-            case Pad::B: return v == Veh::CarButtons ? Icon::FaceX2 : Icon::FaceX;   // drivebuttons: left X twice is the handbrake
+            case Pad::B:
+                if (foot & 1) return (foot & 2) ? Icon::StickRDown : Icon::None;   // footbuttons: crouch is the right stick down (stickjump)
+                return v == Veh::CarButtons ? Icon::FaceX2 : Icon::FaceX;   // drivebuttons: left X twice is the handbrake
             case Pad::X: return Icon::FaceY;
             case Pad::Y: return Icon::FaceB;
             case Pad::LB:
+                if (foot & 1) return Icon::FaceX;                // footbuttons: left X held is the weapon wheel
                 if (v == Veh::CarButtons) return Icon::TrigR;    // drivebuttons: the right trigger shoots
                 return trig_layout && sw ? Icon::TrigR : Icon::TrigL;
             case Pad::RB: return v == Veh::Menu ? Icon::TrigR : Icon::LGripB;   // menutabs: the right trigger is the tab to the right
@@ -145,9 +156,9 @@ namespace fc5::padglyph
         }
 
         // A key's action under the game's default keys, as the pad button that does it (or a stick direction). DirectInput scan codes.
-        Icon key_icon(uint8_t dik, Veh v, bool sw)
+        Icon key_icon(uint8_t dik, Veh v, bool sw, int foot)
         {
-            auto pad = [&](Pad p) { return pad_icon(p, v, sw); };
+            auto pad = [&](Pad p) { return pad_icon(p, v, sw, foot); };
             if (v == Veh::Air) {
                 switch (dik) {
                 case 57: return pad(Pad::RT);   // Space: up / faster
@@ -193,13 +204,13 @@ namespace fc5::padglyph
             }
         }
 
-        Icon mouse_icon(Mouse m, Veh v, bool sw)
+        Icon mouse_icon(Mouse m, Veh v, bool sw, int foot)
         {
             if (v == Veh::Menu) v = Veh::Foot;   // menutabs: the mouse's prompts as before
             switch (m) {
-            case Mouse::Left: return pad_icon(v == Veh::Foot ? Pad::RT : Pad::LB, v, sw);   // shoot (in a vehicle the pad's LB)
-            case Mouse::Right: return v == Veh::Foot ? pad_icon(Pad::LT, v, sw) : Icon::None;   // aim
-            case Mouse::Middle: return v == Veh::Foot ? pad_icon(Pad::RB, v, sw) : Icon::None;  // throw
+            case Mouse::Left: return pad_icon(v == Veh::Foot ? Pad::RT : Pad::LB, v, sw, foot);   // shoot (in a vehicle the pad's LB)
+            case Mouse::Right: return v == Veh::Foot ? pad_icon(Pad::LT, v, sw, foot) : Icon::None;   // aim
+            case Mouse::Middle: return v == Veh::Foot ? pad_icon(Pad::RB, v, sw, foot) : Icon::None;  // throw
             default: return Icon::None;
             }
         }
@@ -211,6 +222,7 @@ namespace fc5::padglyph
             l.keys    = g_keys.load();
             l.veh     = Veh(g_veh_now.load());
             l.swapped = g_swapped_now.load();
+            l.foot    = l.veh == Veh::Foot ? g_foot_now.load() : 0;
             l.letters = l.mode == Mode::Index ? Letters::Index : l.mode == Mode::Touch ? Letters::Touch : Letters(g_letters_now.load());
             return l;
         }
@@ -219,9 +231,9 @@ namespace fc5::padglyph
         {
             if (l.mode == Mode::Off) return Icon::None;
             switch (k.kind) {
-            case Kind::Pad: return pad_icon(Pad(k.code), l.veh, l.swapped);
-            case Kind::Key: return l.keys ? key_icon(k.code, l.veh, l.swapped) : Icon::None;
-            case Kind::Mouse: return l.keys ? mouse_icon(Mouse(k.code), l.veh, l.swapped) : Icon::None;
+            case Kind::Pad: return pad_icon(Pad(k.code), l.veh, l.swapped, l.foot);
+            case Kind::Key: return l.keys ? key_icon(k.code, l.veh, l.swapped, l.foot) : Icon::None;
+            case Kind::Mouse: return l.keys ? mouse_icon(Mouse(k.code), l.veh, l.swapped, l.foot) : Icon::None;
             }
             return Icon::None;
         }
@@ -463,6 +475,7 @@ namespace fc5::padglyph
         }
         g_veh_now     = int(v);
         g_swapped_now = in.swapped && v != Veh::Foot;
+        g_foot_now    = !in.flat && v == Veh::Foot ? in.foot : 0;   // footbuttons, stickjump: on foot only
         const std::string prof = in.profile ? in.profile : "";
         g_letters_now = int(prof.find("index_controller") != std::string::npos ? Letters::Index : Letters::Touch);
 
@@ -492,7 +505,7 @@ namespace fc5::padglyph
             }
             // promptdevice: the icon textures by pointer, for note_hud_texture (the kept list changes at creation, an update or the prune).
             g_kind_of.clear();
-            for (const auto& k : g_kept) g_kind_of.emplace(static_cast<const void*>(k.tex), k.known->kind);
+            for (const auto& k : g_kept) g_kind_of.emplace(static_cast<const void*>(k.tex), k.known);
             if (now >= next_prune) {
                 next_prune = now + 5000;
                 for (size_t i = 0; i < g_kept.size();) {
@@ -516,6 +529,12 @@ namespace fc5::padglyph
             first = false;
             last = l;
             log_status("layout");
+        }
+        {
+            // reloadbuttonprompt: one line when the interact icon stops being drawn (the prompt gone), up to 60 a session with the shown lines.
+            const uint64_t xs = g_x_ms.load();
+            if (xs != 0 && now - xs >= kXGoneMs && g_x_shown.exchange(false) && g_x_lines.fetch_add(1) < 60)
+                spdlog::info("[PadGlyph] interactprompt: the game's interact prompt (pad X / E) gone");
         }
         pad_install();
         {
@@ -556,7 +575,14 @@ namespace fc5::padglyph
         if (!lk.owns_lock()) return;
         const auto it = g_kind_of.find(static_cast<const void*>(r));   // a texture's ID3D11Resource is the same pointer (single inheritance)
         if (it == g_kind_of.end()) return;
-        const int dev = it->second == Kind::Pad ? 1 : 2;
+        const Known* kn = it->second;
+        // reloadbuttonprompt: the game's interact button, the pad's X (left Y; ps4 square too) or the keyboard's E (scan code 18).
+        if ((kn->kind == Kind::Pad && kn->code == uint8_t(Pad::X)) || (kn->kind == Kind::Key && kn->code == 18)) {
+            g_x_ms = GetTickCount64();
+            if (!g_x_shown.exchange(true) && g_x_lines.fetch_add(1) < 60)
+                spdlog::info("[PadGlyph] interactprompt: the game shows a prompt on its interact button ({}): left Y goes to it as held", kn->name);
+        }
+        const int dev = kn->kind == Kind::Pad ? 1 : 2;
         const int was = g_dev.exchange(dev);
         if (was == dev) return;
         g_dev_flips++;
@@ -569,6 +595,12 @@ namespace fc5::padglyph
     }
 
     int prompt_device() { return g_dev.load(std::memory_order_relaxed); }
+
+    bool interact_prompt_within(uint64_t ms)
+    {
+        const uint64_t t = g_x_ms.load(std::memory_order_relaxed);
+        return t != 0 && GetTickCount64() - t <= ms;
+    }
 
     bool command(const std::string& cmd, const std::string& arg, std::istream&, bool& persist)
     {
@@ -617,21 +649,14 @@ namespace fc5::padglyph
     {
         bool po = g_pad_on.load();
         if (ImGui::Checkbox("Keep the game on the controller##padonly", &po)) cmds += po ? "padonly on\n" : "padonly off\n";
-        hint("On (default): the game never switches to keyboard mode, so its prompts and its weapon wheel stay the controller's even when the "
-             "mod's aiming moves the mouse or it presses a key. Off: the game's own switching. Command padonly on/off.");
+        hint("Keeps the game's prompts and weapon wheel in controller mode, never keyboard.");
         if (!g_pad_hook) ImGui::TextDisabled("(the game's device pick was not found yet)");
         int m = g_mode.load();
         static const char* kItems[]{ "Auto (from the controllers)", "Meta Touch letters", "Index letters", "Off (the game's icons)" };
         static const char* kCmd[]{ "auto", "touch", "index", "off" };
         if (ImGui::Combo("Button icons##padglyphs", &m, kItems, 4)) cmds += fmt::format("padglyphs {}\n", kCmd[m]);
-        hint("The game's button prompts show the VR controller's button that does it: X for the pad's B, B for its Y, the trigger or grip for "
-             "the shoulder buttons, in vehicles too. Auto picks Index letters on Index controllers, Touch letters (right A B, left X Y) otherwise. "
-             "Icons already on screen change at once; a few only after the next load. Command padglyphs auto/touch/index/off.");
+        hint("Button prompts show your VR controller's buttons. Auto picks Index or Touch letters.");
         if (m == int(Mode::Off)) return;
-        bool k = g_keys.load();
-        if (ImGui::Checkbox("Keyboard and mouse prompts too##padglyphkeys", &k)) cmds += k ? "padglyphkeys on\n" : "padglyphkeys off\n";
-        hint("The game switches to keyboard prompts when the mod's aiming moves the mouse. On: those show the controller too (E shows Y, W the "
-             "left stick up). Command padglyphkeys on/off.");
         int kept = 0, shown = 0;
         {
             std::lock_guard _{ g_mtx };
@@ -639,9 +664,16 @@ namespace fc5::padglyph
             for (const auto& t : g_kept) shown += t.shown != Icon::None;
         }
         ImGui::Text("%d of the game's icons found, %d showing the controller", kept, shown);
-        if (ImGui::Button("Log status##padglyphlog")) cmds += "padglyphlog\n";
+        // The keyboard and mouse prompts are always shown as the controller's (padglyphkeys, F11 reorganisation 13 Nov); the log tools
+        // are in Debug > Diagnostics and captures (draw_debug_menu).
+    }
+
+    // F11 Debug > Diagnostics and captures (F11 reorganisation, author 13 Nov 19:24Z: out of HUD and menus > Button icons).
+    void draw_debug_menu(std::string& cmds, const std::function<void(const char*)>& hint)
+    {
+        if (ImGui::Button("Log the button icons' status##padglyphlog")) cmds += "padglyphlog\n";
         bool pr = g_probe_on.load();
         if (ImGui::Checkbox("Log the game's prompt device (research)##padglyphprobe", &pr)) cmds += pr ? "padglyphprobe on\n" : "padglyphprobe off\n";
-        hint("Research: logs the value the game's prompt code compares when it picks pad or keyboard icons. Command padglyphprobe on/off.");
+        hint("For testing: logs how the game picks its button icons.");
     }
 }

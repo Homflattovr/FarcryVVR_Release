@@ -58,7 +58,10 @@ void FarCry5Stereo::draw_throw_arc(ID3D11DeviceContext* ctx, ID3D11Texture2D* bb
 {
     // throwv2: its own trajectory (both grips held), along where the left controller points, from the holding hand; measured at the throw.
     const bool v2 = fc5::gesture::throw_v2();
-    if ((!m_throw_arc.load() && !v2) || !m_motion.load() || !m_mo.valid || m_menu_screen_on || m_player_views_this_frame == 0 || m_hist[0].cur_frame != m_frame.load()) return;
+    // throwarc off (author 13 Nov 19:35Z): with throwv2 everything below still runs
+    // (the launch measured at the throw, the trajectory's depth march), only its dots are not drawn (put).
+    const bool show = m_throw_arc.load();
+    if ((!show && !v2) || !m_motion.load() || !m_mo.valid || m_menu_screen_on || m_player_views_this_frame == 0 || m_hist[0].cur_frame != m_frame.load()) return;
     const auto ph   = fc5::gesture::throw_phase();
     const bool held = v2 ? fc5::gesture::throw_arc_shown() : ph == fc5::gesture::ThrowPhase::Held || m_rb_down.load();
     glm::vec3  o    = m_mo.other_valid ? m_mo.other_pos_world : m_mo.aim_origin;
@@ -132,6 +135,7 @@ void FarCry5Stereo::draw_throw_arc(ID3D11DeviceContext* ctx, ID3D11Texture2D* bb
     int             drawn = 0;
     // One dot (a dark rim, then the colour) at a world point in this eye's image; false off the image.
     auto put = [&](const glm::vec3& p, float scale, const float col[4]) {
+        if (!show) return false;
         const glm::vec4 cl = m_hist[0].cur_vrp * glm::vec4{ p - m_hist[0].cur_cam, 1.0f };
         if (cl.w <= 0.05f) return false;
         const float x = (cl.x / cl.w * 0.5f + 0.5f) * d.Width, y = (0.5f - cl.y / cl.w * 0.5f) * d.Height;
@@ -195,6 +199,7 @@ void FarCry5Stereo::draw_throw_arc(ID3D11DeviceContext* ctx, ID3D11Texture2D* bb
 void FarCry5Stereo::melee_frame()
 {
     melee_hit_frame();   // meleehit (FarCry5Melee.cpp)
+    weapon_collide_frame();   // weaponcollide (FarCry5Melee.cpp)
     // One eye's presents only: from one eye's present to the other's the hand moved 4-8 cm with the controller still (7-16 m/s,
     // simulator 25 Oct), so the speeds of 24 Oct's swings were partly that.
     if (m_frame.load() & 1) return;

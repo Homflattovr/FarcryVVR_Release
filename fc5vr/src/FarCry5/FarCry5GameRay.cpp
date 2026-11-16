@@ -9,12 +9,16 @@
 // 0xE, 0x11 seen). meleerayfine (default on): once an entity has shown parts, a ray through its capsule that meets no part is a miss. The player has the capsule alone.
 // All on the script thread, from the game tick (FarCry5Lua.cpp). The checks below refuse anything but these exact bytes, and a fault turns it off.
 #include "FarCry5GameRay.h"
+#include "FarCry5MeleeDmgWatch.h"
+#include "FarCry5Lua.h"   // melee fix 14b: entity_at_root
 #include "FarCry5ReloadParts.h"
 
 #include <windows.h>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <unordered_set>
@@ -54,6 +58,10 @@ namespace fc5::gameray
         std::unordered_set<uint64_t> g_has_parts;   // script thread only
         std::atomic<int>      g_flags{ 6 };         // 6: every hit; 5: the nearest only, so a ray from inside the player's own shape sees nothing else
         std::atomic<bool>     g_seg_pending{ false }, g_res_ready{ false }, g_test_pending{ false };
+        std::atomic<bool>     g_wall_blocks{ false };                           // meleereact
+        std::atomic<bool>     g_probe_pending{ false }, g_probe_ready{ false };   // weaponcollide
+        Seg                   g_probe_seg{};
+        Hit                   g_probe_hit{};
         std::atomic<uint64_t> g_casts{ 0 }, g_hits{ 0 };
         std::mutex            g_mx;
         Seg                   g_segs[8]{};
@@ -159,6 +167,128 @@ namespace fc5::gameray
             g_failed = true;
             spdlog::error("[GameRay] a fault in the game's ray cast: turned off");
         }
+
+        // melee fix 13: the damage watch (watch_damage). One at a time; a new press replaces it (the old one's line first).
+        // melee fix 14b: root_ok/rx-rz: the bones hit's body root (world) for the entity search (searched: done once); src: where the entity came from.
+        struct DamageWatch { bool on; uint64_t entity; float start; bool started; int64_t press_ms, contact_to_press; bool root_ok, searched; float rx, ry, rz; std::string src; };
+        std::mutex        g_dw_mx;
+        DamageWatch       g_dw{};
+        std::atomic<bool> g_dw_on{ false };
+
+        int64_t mono_ms() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+        bool health_raw(uint64_t entity, float& out)
+        {
+            __try {
+                uint64_t e = entity;
+                out        = g_health(&e);
+                return true;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return false;
+            }
+        }
+
+        // Script thread (tick): read, compare, log once.
+        void damage_tick()
+        {
+            DamageWatch w;
+            {
+                std::lock_guard _{ g_dw_mx };
+                if (!g_dw.on) return;
+                w = g_dw;
+            }
+            const int64_t t = mono_ms() - w.press_ms;
+            auto end = [&](const std::string& line) {
+                spdlog::info("{}", line);
+                std::lock_guard _{ g_dw_mx };
+                if (g_dw.press_ms == w.press_ms) { g_dw.on = false; g_dw_on = false; }
+            };
+            if (w.entity == 0) {
+                // melee fix 14b: the bones hit's entity from the recorded entities at the body's root (once, at the first tick after the press)
+                if (w.root_ok && !w.searched) {
+                    float       eh = -1.0f, ed = 0.0f;
+                    std::string why;
+                    const uint64_t id = fc5::lua::entity_at_root(w.rx, w.ry, w.rz, eh, ed, why);
+                    {
+                        std::lock_guard _{ g_dw_mx };
+                        if (g_dw.press_ms != w.press_ms) return;
+                        g_dw.searched = true;
+                        if (id != 0) {
+                            g_dw.entity  = id;
+                            g_dw.start   = eh;
+                            g_dw.started = eh >= 0.0f;
+                            g_dw.src     = fmt::format("the recorded entity at the body's root ({:.2f} m off), found {} ms after the press", ed, t);
+                        }
+                        w = g_dw;
+                    }
+                    if (id == 0) spdlog::info("[Melee] damage watch: no entity at the bones hit's body root ({:.2f}, {:.2f}, {:.2f}): {}; waiting up to 1 s for the game's ray on it", w.rx, w.ry, w.rz, why);
+                    else spdlog::info("[Melee] damage watch: entity {:x} (health {:.1f}) from {}", id, eh, w.src);
+                }
+                if (w.entity == 0) {
+                    if (t > 1000) end(fmt::format("[Melee] damage not watched (no watch armed on entity 0): the bones hit had no entity: none from the game's ray within 1 s of the press, {} ({} ms after the contact)",
+                                                  w.root_ok ? "none recorded at its body's root" : "no body root to look at", w.contact_to_press));
+                    return;
+                }
+            }
+            float h = 0.0f;
+            if (!health_raw(w.entity, h)) {
+                end(fmt::format("[Melee] damage watch of entity {:x}: a fault reading its health, stopped", w.entity));
+                return;
+            }
+            if (!w.started) {
+                std::lock_guard _{ g_dw_mx };
+                if (g_dw.press_ms == w.press_ms) { g_dw.start = h; g_dw.started = true; }
+                w.start = h;
+            }
+            const bool changed = std::abs(h - w.start) > 0.01f;
+            if (!changed) fc5::meleedmgwatch::arm(w.entity, h, w.press_ms, w.press_ms - w.contact_to_press);   // melee fix 14 probe: once per press, when on
+            if (changed) {
+                fc5::meleedmgwatch::landed(w.entity, w.start, h, true);
+                end(fmt::format("[Melee] damage landed: entity {:x} health {:.1f} -> {:.1f}, {} ms after the press ({} ms after the contact){}", w.entity, w.start, h, t, t + w.contact_to_press,
+                                h <= 0.0f ? ": a kill" : ""));
+            } else if (t > 1500) {
+                fc5::meleedmgwatch::landed(w.entity, w.start, h, false);
+                end(fmt::format("[Melee] damage landed: none, entity {:x} health {:.1f} unchanged 1500 ms after the press (the game's blow did no damage)", w.entity, h));
+            }
+        }
+    }
+
+    void watch_damage(uint64_t entity, float health_at_contact, int64_t contact_to_press_ms, bool root_ok, float rx, float ry, float rz, const std::string& src)
+    {
+        DamageWatch   old{};
+        const int64_t now = mono_ms();
+        bool          kept = false, waiting = false;
+        {
+            std::lock_guard _{ g_dw_mx };
+            old = g_dw;
+            // melee fix 14b (probe 2: the watch of contact 1 replaced 806 ms later by a second press): a watch on an entity is not replaced within
+            // its 3 s, nor while meleedmgwatch's write watch still waits for its write; only one still looking for its entity (0) is.
+            waiting = fc5::meleedmgwatch::waiting();
+            kept    = (old.on && old.entity != 0 && now - old.press_ms < 3000) || waiting;
+            if (!kept) {
+                g_dw = DamageWatch{ true, entity, health_at_contact, entity != 0 && health_at_contact >= 0.0f, now, contact_to_press_ms, root_ok && entity == 0, false, rx, ry, rz,
+                                    entity != 0 ? (src.empty() ? std::string{ "the press" } : src) : std::string{} };
+                g_dw_on = true;
+            }
+        }
+        if (kept) {
+            spdlog::info("[Melee] damage watch{} kept: this press {} ms after its own is not watched (a watch is not replaced within its 3 s unless it caught its write){}",
+                         old.on && old.entity != 0 ? fmt::format(" of entity {:x}", old.entity) : std::string{}, now - old.press_ms, waiting ? "; meleedmgwatch's write watch still waiting" : "");
+            return;
+        }
+        if (old.on) spdlog::info("[Melee] damage watch {}replaced by the next press {} ms after its own (it had found no entity yet)", old.entity ? fmt::format("of entity {:x} ", old.entity) : std::string{},
+                                 now - old.press_ms);
+        if (entity != 0) spdlog::info("[Melee] damage watch: entity {:x} from {}", entity, src.empty() ? std::string{ "the press" } : src);
+        else if (!root_ok) spdlog::info("[Melee] damage watch: no entity and no body root for this press (a test body or the ray's press without an entity): looking only for the game's ray on it");
+    }
+
+    void watch_entity(uint64_t entity, float health)
+    {
+        std::lock_guard _{ g_dw_mx };
+        if (!g_dw.on || g_dw.entity != 0 || entity == 0 || mono_ms() - g_dw.press_ms > 1000) return;
+        g_dw.entity  = entity;
+        g_dw.start   = health;   // read at this ray answer: damage already landed before it is not seen (the line then says no change)
+        g_dw.started = health >= 0.0f;
     }
 
     void submit(const Seg* segs, int n)
@@ -178,7 +308,23 @@ namespace fc5::gameray
         return true;
     }
 
-    bool due() { return g_seg_pending.load() || g_test_pending.load(); }
+    bool due() { return g_seg_pending.load() || g_test_pending.load() || g_probe_pending.load() || g_dw_on.load(); }
+
+    void submit_probe(const Seg& seg)
+    {
+        if (g_failed.load()) return;
+        std::lock_guard _{ g_mx };
+        g_probe_seg     = seg;
+        g_probe_pending = true;
+    }
+
+    bool take_probe(Hit& out)
+    {
+        if (!g_probe_ready.exchange(false)) return false;
+        std::lock_guard _{ g_mx };
+        out = g_probe_hit;
+        return true;
+    }
 
     bool ground_z(float x, float y, float z, float& out)
     {
@@ -204,10 +350,41 @@ namespace fc5::gameray
         if (g_failed.load() || !ready()) {
             g_seg_pending = false;
             g_test_pending = false;
+            g_probe_pending = false;
+            g_dw_on = false;
             return;
         }
+        struct DmgWatchTick   // meleedmgwatch (melee fix 14 probe): marks this tick as the frame point for its log
+        {
+            DmgWatchTick() { fc5::meleedmgwatch::tick_begin(); }
+            ~DmgWatchTick() { fc5::meleedmgwatch::tick_end(); }
+        } dmg_watch_tick;
+        damage_tick();   // melee fix 13
         static Out out[kMaxHits];
         const uint64_t me = player_id();
+        // weaponcollide: its one segment, every hit asked for (flags 6) so the player's own shape and a character in the way do not hide the wall behind.
+        if (g_probe_pending.exchange(false)) {
+            Seg sg;
+            {
+                std::lock_guard _{ g_mx };
+                sg = g_probe_seg;
+            }
+            const float s[3]{ sg.x0, sg.y0, sg.z0 }, d[3]{ sg.x1 - sg.x0, sg.y1 - sg.y0, sg.z1 - sg.z0 };
+            const int   n = cast_raw(s, d, g_mask.load(), 6, out);
+            if (n < 0) { fail(); return; }
+            g_casts.fetch_add(1, std::memory_order_relaxed);
+            Hit   wall{};
+            float bw = 1e30f;
+            for (int i = 0; i < n; ++i) {
+                if (out[i].entity != 0 && out[i].entity == me) continue;
+                if (out[i].health > 0.0f) continue;        // a character or an animal: melee's business, not the wall's
+                if (out[i].hit.along < 0.03f) continue;     // the start is inside it
+                keep(wall, bw, out[i]);
+            }
+            std::lock_guard _{ g_mx };
+            g_probe_hit   = wall;
+            g_probe_ready = true;
+        }
         if (g_test_pending.exchange(false)) {
             float s[3], d[3];
             int64_t mk;
@@ -267,6 +444,9 @@ namespace fc5::gameray
                 if (part.any) body = part;
                 else if (body.any && g_has_parts.contains(body.entity)) body = Hit{};
             }
+            // meleereact: behind a wall on this segment. The world's own shapes (no entity) always hide; an object with an entity (a prop, a vehicle, what the
+            // character carries) only when it is clearly nearer than the body (40 cm), so a rifle held before a chest does not shield it.
+            if (g_wall_blocks.load() && body.any && wall.any && wall.along < body.along && (wall.entity == 0 || wall.along < body.along - 0.40f)) body = Hit{};
             if (k == 0) res.blade = wall;
             if (segs[k].ahead) {
                 if (body.any && !res.body_ahead.any) res.body_ahead = body;
@@ -293,6 +473,7 @@ namespace fc5::gameray
     void set_mask(uint32_t mask) { g_mask = mask; }
     void set_flags(int flags) { g_flags = flags; }
     void set_fine(bool on) { g_fine = on; }
+    void set_wall_blocks(bool on) { g_wall_blocks = on; }
 
     std::string status()
     {

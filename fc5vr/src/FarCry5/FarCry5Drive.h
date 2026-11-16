@@ -77,7 +77,9 @@
 //    the game's "change weapon" in a vehicle, which draws the sidearm without a shot (the author's 29 Oct 10:12 log); while the grip stays held
 //    and no weapon is in the hands (the game puts it away about 3 s after the last shot), Y is tapped again at most every 1.5 s. The right
 //    trigger shoots (LB) as before, at once with the weapon out. lb taps LB instead (test: the game's shoot, which draws first; it may fire
-//    once). A grip at the wheel still holds the wheel. off: the right grip does nothing there, as before.
+//    once). A grip at the wheel still holds the wheel. off: the right grip does nothing there, as before. drivereadyaway M (default 0.18 m since
+//    14 Nov): only a press that starts this far from the wheel or bars draws. drivereadykeep on|off (default on, 14 Nov; author 07:41): the drawn sidearm stays out after the grip is let go, drawn again whenever the game puts it
+//    away, until the right hand takes the wheel or bars (FarCry5Drive.cpp, "carshoot").
 //  - drivemenu all|vehicle|off and drivemenuhold MS (saved; defaults all, 500; F11 Layout > Vehicles; author 7 Nov 12:02). Everywhere (vehicle: only in a vehicle, any seat), the menu button alone opens the map with a short press (the pad's Back, tapped 120 ms when it is let go before MS)
 //    and the pause menu with a long one (the pad's Start from MS on, while held). While the pause menu a long press opened is up, a short
 //    press closes it (Start). Left grip + menu stays the map at once (Back while held). The map or a menu opened from a vehicle keeps the
@@ -180,6 +182,8 @@ namespace fc5::drive
         bool      ontop{ false };      // drivehandsontop: the bare arms drawn over everything (depth test always passes, depth still written; test)
         int       space{ -1 };         // drivehandsspace: -1 auto, 0 object (VS b1), 1 the arm hair's b1, 2 world, 3 camera-relative, 4 view
         bool      model{ true };       // drivehandsmodel: a held hand rides the game's own hand on the vehicle's wheel, bars or stick
+        bool      fist{ true };        // drivegripfist: a hand that holds the wheel, bars or stick closes all its fingers round it, index and thumb too, by
+                                       // the grip alone (author 15 Nov)
     };
     HandOpts hand_opts();
     // drivehandsmodel (FarCry5VehHands.cpp -> here): the vehicle's own control, found from the game's hands on it, in the recentred reference
@@ -192,8 +196,30 @@ namespace fc5::drive
         glm::vec3 n{ 0.0f, 0.0f, 1.0f };
         float     radius{ 0.0f };
         bool      axis_learnt{ false };        // wheel: its axis from the game hand's own turn (always, since round 2)
+        // vehcontrol: read from the vehicle's own bone each frame (exact, not from the game's hands). The drive's control is then on it at
+        // once and stays on it while a hand holds it (author 12 Nov 17:05).
+        bool      bone{ false };
+        // vehcontrol (FarCry5VehHands.cpp): the vehicle's own wheel's or bars' turn about its axis, read from its bone each frame (rad,
+        // summed; an arbitrary zero; positive: to the left), for drivemodelsteer.
+        float     turn{ 0.0f };
+        bool      turn_ok{ false };
     };
     void set_model(const Model& m);
+    // vehcontrol: the control the vehicle's own model shows for sure (kWheel or kBars), used while the game has not yet said the vehicle's
+    // type (the drive would wait up to 8 s, or 3 s for a quad's seat).
+    void set_shape_hint(int style);
+    // drivemodelsteer on|off (saved, default on; F11 Layout > Vehicles; author 11 Nov 09:09): with the
+    // vehicle's own wheel or bars followed (vehcontrol, Model.turn), the steering sent is what makes the vehicle's own wheel turn as far as the
+    // hand has turned: full steering at the model's own full lock (learnt from what it shows: 143 deg on the cars read on 9 Nov) instead of
+    // drivewheellock / drivereactgain, and the lag correction (drivereactboost) from the model's measured turn instead of a modelled one.
+    // drivewheelratio R (saved, default 1.0, 0.5-4): the model's wheel turns R times the hand's turn (1: together; 2: half the hand turn).
+    // The model's turn not moving with the steering sent (three times): off for that drive, the usual steering instead.
+    // A hand that takes the wheel alone takes it where the vehicle's own wheel is now (no jump back to straight).
+    // drivemodelshow on|off (saved, default on; author 11 Nov 10:00): the game
+    // eases its own wheel behind the stick, so while a hand holds the wheel or bars the vehicle's own is drawn at the hand's angle
+    // (FarCry5VehHands.cpp, veh_control_show), and the held hand rides it there; let go, it eases back onto the game's own in 0.1 s.
+    // model_show: true while it is to be drawn so, with its turn in Model.turn's units.
+    bool model_show(float& turn);
     // drivemodelctrl (test): the point on the drive's control (the vehicle's own once found) a testctrl hand of that side takes it at (ref, m).
     bool model_point(int side, glm::vec3& p);
     // drivewheelscan S (test, not saved): for S seconds, the vehicle's draws near the driver logged with their turn in the vehicle's axes
@@ -203,8 +229,13 @@ namespace fc5::drive
     // 2 it taps LB instead (test: the game's shoot, which draws first). ModConfig.cpp sends it.
     int      ready_mode();
     // drivereadyaway (patch 15): m from the wheel or bars a right grip's press must start for driveready to draw (and over 1 s after that hand
-    // let go of them). drivegunthrottle: 0 off (right A sends no RT while the sidearm is out), 1 stick (test: it pushes the left stick instead).
+    // let go of them). drivegunthrottle: 0 off (right A sends no RT while the sidearm is out), 1 stick (test: it pushes the left stick instead),
+    // 2 rt (default since 16 Nov, gunthrottle2): right A is RT while the sidearm is out, with a guard (ModConfig.cpp).
     float    ready_away();
+    // drivereadykeep (14 Nov, default on): a sidearm the right grip drew stays out until the right hand takes the wheel or bars (ModConfig.cpp).
+    bool     ready_keep();
+    // drivetrigtest MS (test, not saved): the right trigger held MS ms as if pressed (the simulator's controllers have none). ModConfig.cpp.
+    bool     trig_test();
     int      gun_throttle();
     // drivemenu (author 7 Nov 12:02, 12:15): 0 off, 1 in vehicles, 2 everywhere (default); drivemenuhold: ms that make a press long. ModConfig.cpp sends it.
     int      menu_mode();

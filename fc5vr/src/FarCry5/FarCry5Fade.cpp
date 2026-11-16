@@ -43,13 +43,22 @@ void main(uint2 p : SV_DispatchThreadID)
     ID3D11ComputeShader*       g_cs     = nullptr;
     ID3D11Buffer*              g_cb     = nullptr;
     bool                       g_failed = false;
-    ID3D11Texture2D*           g_for    = nullptr;   // the eye texture the copies below were made for (not held)
-    D3D11_TEXTURE2D_DESC       g_desc{};
-    ID3D11Texture2D*           g_stash  = nullptr;
-    ID3D11ShaderResourceView*  g_srv    = nullptr;
-    ID3D11Texture2D*           g_mid    = nullptr;
-    ID3D11UnorderedAccessView* g_uav    = nullptr;
-    bool                       g_tex_failed = false;
+    // The copies are kept for two eye textures (afwpereye: in AFW the eye drawn this frame and the rebuilt one are both darkened, every
+    // present; with one set the copies were made again at each call).
+    struct Slot
+    {
+        ID3D11Texture2D*           g_for    = nullptr;   // the eye texture the copies below were made for (not held)
+        D3D11_TEXTURE2D_DESC       g_desc{};
+        ID3D11Texture2D*           g_stash  = nullptr;
+        ID3D11ShaderResourceView*  g_srv    = nullptr;
+        ID3D11Texture2D*           g_mid    = nullptr;
+        ID3D11UnorderedAccessView* g_uav    = nullptr;
+        bool                       g_tex_failed = false;
+        uint64_t                   used     = 0;
+    };
+    Slot                       g_slots[2]{};
+    Slot*                      g_cur    = &g_slots[0];
+    uint64_t                   g_use    = 0;
     uint64_t                   g_drawn  = 0;
 
     DXGI_FORMAT typeless_of(DXGI_FORMAT f)
@@ -73,13 +82,13 @@ void main(uint2 p : SV_DispatchThreadID)
         }
     }
 
-    void release_textures()
+    void release_textures(Slot& t)
     {
-        if (g_srv) g_srv->Release();
-        if (g_stash) g_stash->Release();
-        if (g_uav) g_uav->Release();
-        if (g_mid) g_mid->Release();
-        g_srv = nullptr; g_stash = nullptr; g_uav = nullptr; g_mid = nullptr;
+        if (t.g_srv) t.g_srv->Release();
+        if (t.g_stash) t.g_stash->Release();
+        if (t.g_uav) t.g_uav->Release();
+        if (t.g_mid) t.g_mid->Release();
+        t.g_srv = nullptr; t.g_stash = nullptr; t.g_uav = nullptr; t.g_mid = nullptr;
     }
 
     bool ready(ID3D11Device* dev, ID3D11Texture2D* eye)
@@ -105,8 +114,13 @@ void main(uint2 p : SV_DispatchThreadID)
         }
         D3D11_TEXTURE2D_DESC d{};
         eye->GetDesc(&d);
-        if (eye != g_for || d.Width != g_desc.Width || d.Height != g_desc.Height || d.Format != g_desc.Format) {
-            release_textures();
+        auto same = [&](const Slot& t) { return eye == t.g_for && d.Width == t.g_desc.Width && d.Height == t.g_desc.Height && d.Format == t.g_desc.Format; };
+        g_cur = same(g_slots[0]) ? &g_slots[0] : same(g_slots[1]) ? &g_slots[1] : g_slots[0].used <= g_slots[1].used ? &g_slots[0] : &g_slots[1];
+        g_cur->used = ++g_use;
+        auto& g_for = g_cur->g_for; auto& g_desc = g_cur->g_desc; auto& g_stash = g_cur->g_stash; auto& g_srv = g_cur->g_srv;
+        auto& g_mid = g_cur->g_mid; auto& g_uav = g_cur->g_uav; auto& g_tex_failed = g_cur->g_tex_failed;
+        if (!same(*g_cur)) {
+            release_textures(*g_cur);
             g_for = eye; g_desc = d; g_tex_failed = false;
             D3D11_TEXTURE2D_DESC nd = d;
             nd.MipLevels = 1; nd.ArraySize = 1; nd.SampleDesc = { 1, 0 }; nd.Usage = D3D11_USAGE_DEFAULT; nd.CPUAccessFlags = 0; nd.MiscFlags = 0;
@@ -126,32 +140,57 @@ void main(uint2 p : SV_DispatchThreadID)
     }
 }
 
-// Once per present (on_post_present): the vignette's level.
+// Once per present (on_post_present): the vignette's level, and menufade's levels (update_menu_screen sets the states).
 void FarCry5Stereo::fade_tick(float dt)
 {
     // vehvignette: in a vehicle, in in 0.15 s, out in 0.6 s.
     const bool  vig_on = m_veh_vignette.load() > 0.001f && m_motion.load() && m_in_vehicle.load() && m_veh_settle.load() == 0 && !m_menu_screen_on;
     const float vig_t  = vig_on ? m_vig_target : 0.0f;
     m_vig_level        = vig_t > m_vig_level ? std::min(vig_t, m_vig_level + dt / 0.15f) : std::max(vig_t, m_vig_level - dt / 0.6f);
+
+    // menufade: in over the fade time, out in half of it; 0 = levels set at once (cuts).
+    const float T       = m_menu_fade_time.load();
+    const bool  menu_vr = !m_menu_screen.load();
+    auto        step    = [&](float& v, float target, float t_up, float t_down) {
+        if (T <= 0.0f) {
+            v = target;
+            return;
+        }
+        v = target > v ? std::min(target, v + dt / std::max(1e-3f, t_up)) : std::max(target, v - dt / std::max(1e-3f, t_down));
+    };
+    float k_target = 1.0f;
+    if (m_menu_screen_on) {
+        k_target = m_menu_returning && (!menu_vr || m_menu_moved) ? 0.0f : 1.0f;   // the flat screen out before the 3D view (VR menus: only through black)
+    } else if (!menu_vr && m_no_player_frames >= 2 && !m_cine_on) {
+        k_target = 0.0f;   // flat screen: a menu is coming; dark rather than the game's menu picture over the whole view, following the head
+    }
+    step(m_menu_fade_k, k_target, T, m_menu_screen_on ? 0.5f * T : 0.06f);
+    const float panel_t = m_menu_screen_on && !m_menu_returning ? 1.0f : 0.0f;
+    const float world_t = !m_menu_screen_on ? 1.0f : !m_menu_returning ? kMenuWorldDim : m_menu_moved ? 0.0f : 1.0f;
+    step(m_menu_vr_panel, panel_t, T, 0.5f * T);
+    step(m_menu_vr_world, world_t, T, T);
 }
 
 // After the aim marker, before the F11 menu: the eye picture times (1 - level).
-void FarCry5Stereo::fade_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* eye)
+void FarCry5Stereo::fade_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* eye, int view)
 {
     const float vig = std::clamp(m_veh_vignette.load(), 0.0f, 1.0f) * m_vig_level;   // vehvignette
-    if (!ctx || !eye || vig <= 0.01f) return;
+    // menufade: the whole picture; in VR menus only the live 3D view (the menu and the frozen image fade in the panel's own pass).
+    const float k   = (m_menu_screen.load() || (!m_menu_screen_on && !m_menu_hold)) ? std::clamp(m_menu_fade_k, 0.0f, 1.0f) : 1.0f;
+    if (!ctx || !eye || (vig <= 0.01f && k > 0.995f)) return;
     ID3D11Device* dev = nullptr;
     ctx->GetDevice(&dev);
     if (!dev) return;
     const bool ok = ready(dev, eye);
     dev->Release();
     if (!ok) return;
-    Cb cb{ 1.0f, g_desc.Width, g_desc.Height, 0.0f, { -1.0f, 1.0f, 1.0f, -1.0f }, 0.0f, 0.0f, { 0.0f, 0.0f } };
-    {
+    const auto& g_desc = g_cur->g_desc;
+    Cb cb{ k, g_desc.Width, g_desc.Height, 0.0f, { -1.0f, 1.0f, 1.0f, -1.0f }, 0.0f, 0.0f, { 0.0f, 0.0f } };
+    if (vig > 0.01f) {
         // The clear area's half-angle from 60 deg (a touch of shade at the far edges) down to 25 deg, its edge 12 deg wide.
         const int   fr = m_frame.load();
         const auto& v  = m_xr_views[fr & 7];
-        const int   e  = fr & 1;
+        const int   e  = view >= 0 ? (view & 1) : (fr & 1);   // afwpereye: the rebuilt eye's own field
         if (v.frame == fr)
             for (int i = 0; i < 4; ++i) cb.tn[i] = std::tan(v.fov[e][i]);
         cb.vig = 1.0f;
@@ -159,7 +198,7 @@ void FarCry5Stereo::fade_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* eye)
         cb.r1  = cb.r0 + glm::radians(12.0f);
     }
     ctx->UpdateSubresource(g_cb, 0, nullptr, &cb, 0, 0);
-    ctx->CopyResource(g_stash, eye);
+    ctx->CopyResource(g_cur->g_stash, eye);
     ID3D11ComputeShader*       prev_cs  = nullptr;
     ID3D11ShaderResourceView*  prev_srv = nullptr;
     ID3D11UnorderedAccessView* prev_uav = nullptr;
@@ -169,8 +208,8 @@ void FarCry5Stereo::fade_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* eye)
     ctx->CSGetUnorderedAccessViews(0, 1, &prev_uav);
     ctx->CSGetConstantBuffers(0, 1, &prev_cb);
     ctx->CSSetShader(g_cs, nullptr, 0);
-    ctx->CSSetShaderResources(0, 1, &g_srv);
-    ctx->CSSetUnorderedAccessViews(0, 1, &g_uav, nullptr);
+    ctx->CSSetShaderResources(0, 1, &g_cur->g_srv);
+    ctx->CSSetUnorderedAccessViews(0, 1, &g_cur->g_uav, nullptr);
     ctx->CSSetConstantBuffers(0, 1, &g_cb);
     ctx->Dispatch((g_desc.Width + 7) / 8, (g_desc.Height + 7) / 8, 1);
     ID3D11ShaderResourceView*  null_srv = nullptr;
@@ -185,6 +224,6 @@ void FarCry5Stereo::fade_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* eye)
     if (prev_srv) prev_srv->Release();
     if (prev_uav) prev_uav->Release();
     if (prev_cb) prev_cb->Release();
-    ctx->CopyResource(eye, g_mid);
-    if ((++g_drawn % 90) == 1) spdlog::info("[Fade] {} eye pictures darkened (vignette {:.2f})", g_drawn, vig);
+    ctx->CopyResource(eye, g_cur->g_mid);
+    if ((++g_drawn % 90) == 1) spdlog::info("[Fade] {} eye pictures darkened (vignette {:.2f}, menufade {:.2f})", g_drawn, vig, k);
 }

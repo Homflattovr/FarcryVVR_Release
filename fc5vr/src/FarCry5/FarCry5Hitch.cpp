@@ -124,7 +124,7 @@ namespace fc5::hitch
             const Counters co  = p.c_total - cg - ce;
             std::string g;
             if (gpu) {
-                const char* kNames[gputime::kCount]{ "pair", "L", "R", "DLSS inputs", "DLSS eval", "compose", "aim", "scope" };
+                const char* kNames[gputime::kCount]{ "pair", "L", "R", "DLSS inputs", "DLSS eval", "compose", "aim", "scope", "DLSS periphery" };
                 for (int s = 0; s < gputime::kCount; ++s)
                     if (seen[s]) g += fmt::format("{}{} {:.2f}", g.empty() ? "" : ", ", kNames[s], gpu[s]);
             } else {

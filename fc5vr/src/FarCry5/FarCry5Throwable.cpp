@@ -55,6 +55,35 @@ namespace
 
     constexpr int kSrv = 16, kSmp = 16, kPsCb = 8, kVb = 4, kMaxRec = 6;   // a throwable of up to 6 parts (headset 25 Oct: 4)
 
+    // throwstrap on|off (saved, default on; author 15 Nov 13:53Z). Their models (read from the game files, tools\bodyworn):
+    //  - WPN_Throwing_Knife: 36 cm along -y from its origin, which is the blade's tip; the handle from y -0.34 to -0.24, the blade flat in y-z.
+    //    The chest's usual turn (the model's z up) laid it level, pointing into the chest; in the hand the tip was held, the handle forward.
+    //  - WPN_C4: a block 28 x 16 x 8 cm (y, x, z) round its origin, the detonator on its top (+z), an aerial along +y to 37 cm. It lay level.
+    // Strapped: on the chest, upright and flat against it (the knife's handle up, the C4's aerial up and its top facing out), its middle on the
+    // chest point; in the hand, the knife by its handle with the blade forward and upright, the C4 held at its lower end, upright, facing
+    // forward. Each turn takes the model's own axes to the chest's (x right, y up, z back) or the controller's (x right, y up, -z forward).
+    struct Strap
+    {
+        uint64_t    item;
+        const char* name;
+        glm::mat3   chest;      // model axes -> chest axes (its columns: where the model's x, y, z go)
+        glm::vec3   chest_at;   // the model point put on the chest point
+        glm::mat3   hand;       // model axes -> controller axes
+        glm::vec3   grip;       // the model point put on the controller (+ throwhandpos)
+    };
+    const Strap kStraps[]{
+        { 0x0020073973355f29ull, "WPN_Throwing_Knife", glm::mat3{ glm::vec3{ 0, 0, 1 }, glm::vec3{ 0, -1, 0 }, glm::vec3{ 1, 0, 0 } }, glm::vec3{ 0.0f, -0.18f, 0.0f },
+          glm::mat3{ glm::vec3{ 1, 0, 0 }, glm::vec3{ 0, 0, -1 }, glm::vec3{ 0, 1, 0 } }, glm::vec3{ 0.0f, -0.29f, 0.0f } },
+        { 0x002007583c1932e0ull, "WPN_C4", glm::mat3{ glm::vec3{ -1, 0, 0 }, glm::vec3{ 0, 1, 0 }, glm::vec3{ 0, 0, -1 } }, glm::vec3{ 0.0f, 0.0f, 0.0f },
+          glm::mat3{ glm::vec3{ -1, 0, 0 }, glm::vec3{ 0, 1, 0 }, glm::vec3{ 0, 0, -1 } }, glm::vec3{ 0.0f, -0.10f, 0.0f } },
+    };
+    const Strap* strap_of(uint64_t item)
+    {
+        for (const auto& s : kStraps)
+            if (s.item == item) return &s;
+        return nullptr;
+    }
+
     // One recorded draw of the throwable.
     struct Rec
     {
@@ -174,10 +203,12 @@ struct FarCry5Stereo::ThrowableState
     std::vector<Rec> recs;
     uint64_t         recs_key{ 0 };     // throwlibrary: whose copy recs is (the game's selected throwable then)
     std::map<uint64_t, std::vector<Rec>> lib;   // throwlibrary: the others
-    std::atomic<bool> library{ false };
+    std::atomic<bool> library{ true };   // throwlibrary: always on since the F11 reorganisation (13 Nov), not saved
     std::atomic<float> lib_flip{ 180.0f };   // throwlibflip
+    std::atomic<bool>  strap{ true };        // throwstrap (kStraps)
+    uint64_t           strap_said{ 0 };      // the item throwstrap's log line was written for
     // throwfile: the shaders and states of a weapon-pass draw, per vertex size; the read in progress; the items that cannot be read.
-    std::atomic<bool>  file{ false };
+    std::atomic<bool>  file{ true };   // throwfile: always on since the F11 reorganisation (13 Nov), not saved
     std::atomic<uint64_t> file_force{ 0 };   // throwfileitem <hex> (test): that item taken as selected
     std::map<UINT, Rec> tmpl;
     struct FileJob { uint64_t item{ 0 }; std::atomic<bool> done{ false }; bool ok{ false }; fc5::throwfile::Model m; };
@@ -513,6 +544,8 @@ bool FarCry5Stereo::throwable_draw(ID3D11DeviceContext* ctx, UINT count, UINT st
         float o1[32], o3[32];
         std::memcpy(o1, obj, sizeof(o1));
         to_rows(A * from_rows(obj), o1);
+        // nearfine: the game's throwable moved to the hand: the game camera + G (its place from the camera) + the hand's offset.
+        if (!hide) near_place(o1, glm::dmat3{ G } * near_u(obj, obj + 16) + glm::dvec3{ rT * (hm.grip + WT * fine_from_grip(hp, hm.w_pos)) - rT * WT * LR * t.F }, 1);
         if (peek || fc5::gesture::throw_v2()) {
             // throwpeek: the game's throwable is only looked at (recorded), not shown: collapsed to a point in front of the camera. throwv2: the
             // mod's copy is in the hand instead (the game's raise and throw animation do not move it).
@@ -654,10 +687,20 @@ void FarCry5Stereo::throwable_chest(ID3D11DeviceContext* ctx)
     ctx->OMGetDepthStencilState(&dss, &ds_ref);
     ctx->OMGetBlendState(&bs, bf, &mask);
 
-    // The chest's frame: the body's heading (throw_pose), turned by throwrot.
-    const glm::mat3 Rc = m_mo.chest_rot_world * glm::mat3{ glm::rotate(glm::mat4{ 1.0f }, glm::radians(t.rot[0].load()), glm::vec3{ 0, 1, 0 }) *
-                                                           glm::rotate(glm::mat4{ 1.0f }, glm::radians(t.rot[1].load() + (lib_chest ? t.lib_flip.load() : 0.0f)), glm::vec3{ 1, 0, 0 }) *
-                                                           glm::rotate(glm::mat4{ 1.0f }, glm::radians(t.rot[2].load()), glm::vec3{ 0, 0, -1 }) };
+    // throwstrap: the selected throwable's own turns (kStraps), for a model of the library (its own axes).
+    const Strap* sp = t.strap.load() && lib_chest ? strap_of(t.recs_key) : nullptr;
+    if (sp && t.strap_said != t.recs_key) {
+        t.strap_said = t.recs_key;
+        spdlog::info("[Throwable] throwstrap: {} upright on the chest, held by its {} (item {:x})", sp->name, sp->grip.y < -0.2f ? "handle, the blade forward" : "lower end, upright", t.recs_key);
+    }
+    // The chest's frame: the body's heading (throw_pose), turned by throwrot. throwstrap: the model's own turn onto the chest, then throwrot
+    // about it (its default 0 90 0 adds nothing; throwlibflip is for the models standing on their z, not these).
+    const glm::mat3 Rc = sp ? m_mo.chest_rot_world * glm::mat3{ glm::rotate(glm::mat4{ 1.0f }, glm::radians(t.rot[0].load()), glm::vec3{ 0, 1, 0 }) *
+                                                                glm::rotate(glm::mat4{ 1.0f }, glm::radians(t.rot[1].load() - 90.0f), glm::vec3{ 1, 0, 0 }) *
+                                                                glm::rotate(glm::mat4{ 1.0f }, glm::radians(t.rot[2].load()), glm::vec3{ 0, 0, -1 }) } * sp->chest
+                            : m_mo.chest_rot_world * glm::mat3{ glm::rotate(glm::mat4{ 1.0f }, glm::radians(t.rot[0].load()), glm::vec3{ 0, 1, 0 }) *
+                                                                glm::rotate(glm::mat4{ 1.0f }, glm::radians(t.rot[1].load() + (lib_chest ? t.lib_flip.load() : 0.0f)), glm::vec3{ 1, 0, 0 }) *
+                                                                glm::rotate(glm::mat4{ 1.0f }, glm::radians(t.rot[2].load()), glm::vec3{ 0, 0, -1 }) };
     const glm::mat3 rT = glm::transpose(hm.rot);
     const glm::mat3 WT = glm::transpose(hm.w_rot);
     const float     size = fc5::gesture::throw_v2() ? t.hand_scale.load() : 1.0f;   // throwhandscale: the move below keeps F0 at place, so it grows about the point held
@@ -665,7 +708,8 @@ void FarCry5Stereo::throwable_chest(ID3D11DeviceContext* ctx)
     // throwfile: the grab zone on the model shown (its axes on the chest are Rc): the middle of its box, as big as it needs (FarCry5Gesture.cpp).
     if (const auto it = t.file_box.find(t.recs_key); lib_chest && !in_hand && it != t.file_box.end()) {
         const auto&     b = it->second;
-        const glm::vec3 mid = size * glm::vec3{ 0.5f * (b[0] + b[3]), 0.5f * (b[1] + b[4]), 0.5f * (b[2] + b[5]) };
+        // (throwstrap: the zone on the model's middle, put on the chest point; the C4's box reaches up its aerial.)
+        const glm::vec3 mid = sp ? glm::vec3{ 0.0f } : size * glm::vec3{ 0.5f * (b[0] + b[3]), 0.5f * (b[1] + b[4]), 0.5f * (b[2] + b[5]) };
         const float     half = size * 0.5f * std::max({ b[3] - b[0], b[4] - b[1], b[5] - b[2] });
         const glm::vec3 off  = glm::transpose(m_mo.chest_rot_world) * Rc * mid + (t.pouch.load() ? glm::vec3{ 0.0f, t.pouch_up.load(), 0.0f } : glm::vec3{ 0.0f });
         const float     r    = std::clamp(0.7f * half, 0.12f, 0.18f);
@@ -689,10 +733,14 @@ void FarCry5Stereo::throwable_chest(ID3D11DeviceContext* ctx)
     glm::mat3 hr = m_mo.other_rot_world;
     throwable_hold_pose(hp, hr);
     const auto&     hrot = t.recs.front().count == 2502 ? t.hand_rot : t.hand_rot2;   // the knife, or any other throwable
-    const glm::mat3 Rh = hr * glm::mat3{ glm::rotate(glm::mat4{ 1.0f }, glm::radians(hrot[0].load()), glm::vec3{ 0, 1, 0 }) *
-                                         glm::rotate(glm::mat4{ 1.0f }, glm::radians(hrot[1].load()), glm::vec3{ 1, 0, 0 }) *
-                                         glm::rotate(glm::mat4{ 1.0f }, glm::radians(hrot[2].load()), glm::vec3{ 0, 0, -1 }) };
-    const glm::vec3 place = in_hand ? hp + hr * glm::vec3{ t.hand_off[0].load(), t.hand_off[1].load(), t.hand_off[2].load() } : chest_at;
+    // throwstrap: the model's own turn in the hand instead of throwhandrot / throwhandrot2.
+    const glm::mat3 Rh = sp ? hr * sp->hand
+                            : hr * glm::mat3{ glm::rotate(glm::mat4{ 1.0f }, glm::radians(hrot[0].load()), glm::vec3{ 0, 1, 0 }) *
+                                              glm::rotate(glm::mat4{ 1.0f }, glm::radians(hrot[1].load()), glm::vec3{ 1, 0, 0 }) *
+                                              glm::rotate(glm::mat4{ 1.0f }, glm::radians(hrot[2].load()), glm::vec3{ 0, 0, -1 }) };
+    glm::vec3 place = in_hand ? hp + hr * glm::vec3{ t.hand_off[0].load(), t.hand_off[1].load(), t.hand_off[2].load() } : chest_at;
+    // throwstrap: the model's own point there (its grip in the hand, its middle on the chest) instead of its origin.
+    if (sp) place -= (in_hand ? Rh : Rc) * (size * (in_hand ? sp->grip : sp->chest_at));
     for (auto& r : t.recs) {
         if (!t.chest_cb[k]) break;
         // q -> world now (this frame's game camera), then the move that puts q point F0 with axes R0 at the chest with Rc.
@@ -1510,7 +1558,8 @@ void FarCry5Stereo::throwable_pouch(ID3D11DeviceContext* ctx, int host, UINT cou
     A[3] = glm::vec4{ c - G * hm.cam, 1.0f };
     glm::mat4 Oq{ rT };
     Oq[3]             = glm::vec4{ hm.cam, 1.0f };
-    const glm::mat4 B = glm::inverse(from_rows(obj)) * A * Oq;
+    glm::mat4 B = glm::inverse(from_rows(obj)) * A * Oq;
+    B           = near_bone(G * rT, glm::dvec3{ rT * (hm.grip + WT * (at - hm.w_pos)) }, obj, nullptr, B, 1);   // nearfine: the same from small numbers
     std::vector<float> bones(3072);
     for (int i = 0; i < 256; ++i) to_rows(B, bones.data() + i * 12);
     call_orig<void>(m_update_sub_hook, 48, ctx, static_cast<ID3D11Resource*>(t.pouch_bones), 0u, static_cast<const D3D11_BOX*>(nullptr), static_cast<const void*>(bones.data()), 0u, 0u);
@@ -1898,67 +1947,37 @@ void FarCry5Stereo::draw_throw_size_menu(const std::function<void(const char*)>&
     float hs = m_th->hand_scale.load() * 100.0f;
     if (ImGui::SliderFloat("Throwable size##throwhandscale", &hs, 30.0f, 200.0f, "%.0f %%")) m_th->hand_scale = hs / 100.0f;
     if (ImGui::IsItemDeactivatedAfterEdit()) m_ui_cmds += fmt::format("throwhandscale {:.2f}\n", m_th->hand_scale.load());
-    hint("How big a throwable looks, in your hand and on the chest (default 100%). It grows or shrinks around the point you hold. The pouch and the throw "
-         "stay the same, and once thrown it flies at the game's own size (saved; throwhandscale).");
+    hint("How big a throwable looks in your hand and on your chest.");
 }
 
 void FarCry5Stereo::draw_throw_v2_menu(const std::function<void(const char*, std::string)>&, const std::function<void(const char*)>& hint,
                                        const std::function<void(const char*)>& section)
 {
     section("Take, aim with the trajectory, let go to throw");
-    bool v = fc5::gesture::throw_v2();
-    if (ImGui::Checkbox("Throwables: take, aim with the trajectory, throw by letting go of the right grip##throwv2", &v)) m_ui_cmds += v ? "throwv2 on\n" : "throwv2 off\n";
-    // The pouch (author 27 Oct): four switches set together, each saved as itself.
-    bool pz = m_th && m_th->pouch.load() && !m_th->chest.load() && fc5::gesture::throw_v2_rb_grab();
-    if (ImGui::Checkbox("Pouch on the chest, the throwable only in the hand##throwpouchmode", &pz))
-        m_ui_cmds += pz ? "throwpouch on\nthrowchest off\nthrowv2rb grab\nthrowpeek off\n" : "throwpouch off\nthrowchest on\nthrowv2rb arm\n";
-    bool lb = m_th && m_th->library.load();
-    if (ImGui::Checkbox("The selected throwable's own model on the chest (test)##throwlibrary", &lb)) m_ui_cmds += lb ? "throwlibrary on\n" : "throwlibrary off\n";
-    hint("The chest shows the throwable the game has selected instead of the pouch, changing with the selection. One you have not yet held since the game started shows the pouch until you hold it once.");
-    bool ff = m_th && m_th->file.load();
-    if (ImGui::Checkbox("Show it as soon as it is selected, from the game's files (test)##throwfile", &ff)) m_ui_cmds += ff ? "throwfile on\n" : "throwfile off\n";
-    hint("Reads the selected throwable's model and textures from your game files, so it is on the chest before you ever hold it. It needs a weapon to have been drawn once since the game started.");
-    if (lb) {
-        float fl = m_th->lib_flip.load();
-        if (ImGui::SliderFloat("Turn it on the chest##throwlibflip", &fl, -180.0f, 180.0f, "%.0f deg")) m_ui_cmds += fmt::format("throwlibflip {:.0f}\n", fl);
-        hint("180 turns it end over end.");
+    // Take, aim with the trajectory, let go (throwv2) is the only throw since the 13 Nov clean-up (the swing-to-throw was the old system);
+    // its trajectory stopping where it lands (throwarcstop), aiming while it shows (throwpreaim), the culling kept on the head
+    // (throwsplit) and the wind-up of the pouch grab (throwv2rb grab) are fixed too. Their commands still act for a session, never saved.
+    const bool v = fc5::gesture::throw_v2();
+    // F11 reorganisation (author 13 Nov 19:26Z): the chest always shows the selected throwable's own model (throwlibrary), read from the game's files before
+    // the first grab (throwfile), turned 180 deg (throwlibflip); the pouch is the 29 Oct model (throwpouchv2) in the clothes' material
+    // (throwpouchmat cloth) with 4 cm of texture (throwpouchuv). Those are no longer settings. One switch is left: throwpouch.
+    {
+        bool pz = m_th && m_th->pouch.load();
+        if (ImGui::Checkbox("When the mod finds no throwable model, it shows a pouch##throwpouch", &pz)) m_ui_cmds += pz ? "throwpouch on\n" : "throwpouch off\n";
+        hint("Shows a pouch on your chest while the throwable's model isn't found yet.");
     }
-    hint("On (default): the left chest shows a pouch instead of a throwable. Taking from it holds the game's throw button at once, so the game draws "
-         "whichever throwable is selected and that one appears in your hand (a moment after the grab). Putting it back cancels the game's "
-         "throw (its X with the throw button held). No automatic peek. Off: the chest shows the last throwable seen (throwpouch, throwchest, "
-         "throwv2rb arm, throwpeek).");
+    {
+        bool st = m_th && m_th->strap.load();
+        if (ImGui::Checkbox("C4 and knife strapped upright on the chest##throwstrap", &st)) m_ui_cmds += st ? "throwstrap on\n" : "throwstrap off\n";
+        hint("The C4 and throwing knife are strapped upright on your chest. Command throwstrap.");
+    }
     if (m_th && ImGui::Button("Turn the throwable in the hand upside down (all but the knife)##throwhandrot2")) {
         float p = m_th->hand_rot2[1].load() + 180.0f;
         if (p > 180.0f) p -= 360.0f;
         m_ui_cmds += fmt::format("throwhandrot2 {:.0f} {:.0f} {:.0f}\n", m_th->hand_rot2[0].load(), p, m_th->hand_rot2[2].load());
     }
-    hint("If a grenade, a molotov or another throwable stands the wrong way up in your hand, this flips it (saved; throwhandrot2, default 0 -90 0). "
-         "The knife has its own turn (throwhandrot).");
+    hint("Flips the throwable in your hand if it's upside down.");
     // (throwhandscale "Throwable size": on the throwable section itself, draw_throw_size_menu above; F11 release clean-up, author 6 Nov.)
-    if (m_th && m_th->pouch.load()) {
-        bool p2 = m_th->pouch_v2.load();
-        if (ImGui::Checkbox("New pouch model (soft bag, lid and flap, strap, press stud)##throwpouchv2", &p2)) m_ui_cmds += p2 ? "throwpouchv2 on\n" : "throwpouchv2 off\n";
-        hint("On (default): a rounded fabric pouch with a domed lid, a flap down its front with a press stud and a pull tab, and a strap round its "
-             "lower part, smooth-shaded. Off: the 27 Oct pouch (an eight-sided box with a lid and a tab). Same size and place either way.");
-        if (p2) {
-            float uvcm = m_th->pouch_uv.load() * 100.0f;
-            if (ImGui::SliderFloat("Pouch texture detail##throwpouchuv", &uvcm, 0.0f, 10.0f, "%.1f cm of glove")) m_th->pouch_uv = uvcm / 100.0f;   // (as throwhandscale above)
-            if (ImGui::IsItemDeactivatedAfterEdit()) m_ui_cmds += fmt::format("throwpouchuv {:.3f}\n", m_th->pouch_uv.load());
-            hint("How much of your gloves' (or hands') texture each side of the pouch shows (default 4 cm): their weave and seams then show on the "
-                 "pouch. 0: one plain colour per part, as before. Lower it if the pouch shows odd patches (a seam, a logo, skin).");
-        }
-        int mat = m_th->pouch_mat.load();
-        ImGui::TextUnformatted("Pouch material");
-        bool mc = ImGui::RadioButton("Your clothes (cloth)##throwpouchmat", &mat, 1);
-        ImGui::SameLine();
-        mc |= ImGui::RadioButton("Your hands (gloves or skin)##throwpouchmat", &mat, 0);
-        if (mc) m_ui_cmds += mat ? "throwpouchmat cloth\n" : "throwpouchmat hands\n";
-        hint("Clothes (default): the pouch is drawn with your shirt and sleeves' cloth material, so with bare arms it is fabric, not skin; if your "
-             "outfit has none, it takes your hands' as before. Hands: your gloves' or your skin's. The game lights it either way, like your hands.");
-    }
-    hint("Taking the throwable at the left chest only puts it in your hand (the game's raise animation does not play). Hold both grips: a "
-         "dotted trajectory shows where it will go, following where your left controller points. Let go of the right grip: it is thrown along "
-         "the trajectory. Letting go of the left grip first puts it back on the chest. Off: the swing-to-throw gesture as before.");
     if (!v) return;
     int hand = fc5::gesture::throw_v2_right() ? 1 : 0;
     ImGui::TextUnformatted("Hand that takes it");
@@ -1966,30 +1985,10 @@ void FarCry5Stereo::draw_throw_v2_menu(const std::function<void(const char*, std
     ImGui::SameLine();
     ch |= ImGui::RadioButton("Right##throwv2hand", &hand, 1);
     if (ch) m_ui_cmds += hand ? "throwv2hand right\n" : "throwv2hand left\n";
-    hint("Left (default): the left hand holds it and aims; the right grip shows the trajectory and letting it go throws. Right: the right hand "
-         "takes it from the left chest; hold the left grip too (the trajectory) and let go of the right grip to throw; let go without the "
-         "trajectory and it goes back on the chest. The zone is smaller with this switch (throwv2zone, 12 cm).");
-    bool arm = fc5::gesture::throw_v2_rb_arm();
-    if (ImGui::Checkbox("Wind up while the trajectory shows##throwv2rb", &arm)) m_ui_cmds += arm ? "throwv2rb arm\n" : "throwv2rb tap\n";
-    hint("On (default): the game's throw button is held from the moment the trajectory shows, so the throw leaves sooner when you let go. Off: "
-         "it is only pressed when you let go (the game's whole throw plays then).");
-    bool as = m_arc_stop.load();
-    if (ImGui::Checkbox("Trajectory stops where it lands##throwarcstop", &as)) m_ui_cmds += as ? "throwarcstop on\n" : "throwarcstop off\n";
-    hint("On (default): the dotted trajectory ends where it meets the ground or a wall, with an orange ring there. Off: it goes on through "
-         "the ground.");
-    bool pa = fc5::gesture::throw_preaim();
-    if (ImGui::Checkbox("Aim while the trajectory shows##throwpreaim", &pa)) m_ui_cmds += pa ? "throwpreaim on\n" : "throwpreaim off\n";
-    hint("On (default): while the trajectory shows, the game already aims along it, so letting go throws at once. Off: the game turns to it "
-         "after you let go (up to 0.7 s later).");
-    bool ts = m_throw_split.load();
-    if (ImGui::Checkbox("Keep the view's culling on the head while aiming a throw##throwsplit", &ts)) m_ui_cmds += ts ? "throwsplit on\n" : "throwsplit off\n";
-    hint("On (default): the game's aim turns to the trajectory the way it turns to the barrel when you fire, and the picture the game draws stays "
-         "where you look (nothing vanishes at the edges). Off: the game's whole camera turns to the throw.");
+    hint("Which hand takes the throwable from your chest and throws it.");
     bool rk = fc5::gesture::throw_rock();
     if (ImGui::Checkbox("A rock when there is no throwable##throwrock", &rk)) m_ui_cmds += rk ? "throwrock on\n" : "throwrock off\n";
-    hint("Off by default: some throwables are only drawn once thrown, so they look like none left. On: when the game has no throwable to show "
-         "(none selected or none left), the chest gesture throws a rock (the game's own "
-         "rock throw, endless) and the chest shows the rock once one has been thrown.");
+    hint("When you have no throwable, the chest gesture throws a rock.");
 }
 
 // throwallprobe S (test): which draw, in any pass, shows the selected throwable while RB is held. For S seconds every indexed draw's
@@ -2094,6 +2093,13 @@ bool FarCry5Stereo::throwable_command(const std::string& cmd, const std::string&
     if (!m_th) m_th = new ThrowableState{};
     const bool on = arg == "on" || arg == "1" || arg == "true";
     if (cmd == "throwlibflip") { m_th->lib_flip = std::clamp(fv, -360.0f, 360.0f); persist = true; return true; }
+    if (cmd == "throwstrap") {
+        m_th->strap = arg.empty() || on;
+        persist     = true;
+        spdlog::info("[Throwable] throwstrap {}", m_th->strap.load() ? "on: the C4 and the throwing knife upright on the chest as if strapped, held by the knife's handle (blade forward) or the C4's lower end"
+                                                                     : "off: they lie as the other throwables do (the model's z up), held by their origin (the knife's tip)");
+        return true;
+    }
     if (cmd == "throwhandscale") { m_th->hand_scale = std::clamp(fv, 0.1f, 3.0f); persist = true; return true; }
     if (cmd == "gamedraw") { fc5::lua::game_draw(std::strtoull(arg.c_str(), nullptr, 16), false); return true; }
     if (cmd == "gameholster") { fc5::lua::game_draw(0, true); return true; }

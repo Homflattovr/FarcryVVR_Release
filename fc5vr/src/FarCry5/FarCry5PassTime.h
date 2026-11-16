@@ -35,6 +35,10 @@ namespace fc5::passtime
     // A draw: when the last segment was compute, the draws after it start a new segment under the current targets.
     bool in_compute();
     void resume_draws(ID3D11DeviceContext* ctx);
+    // The mod's own GPU work that runs between two of the game's target changes (DLSS evaluation, the work after it): from here a segment
+    // of its own under this name, so it is not added to the segment before it (performance pass, 13 Nov: the 6 Nov list put the DLSS
+    // evaluation into the mod's DLSS input compute, 2.46 ms per eye for 0.37 ms of compute).
+    void mark(ID3D11DeviceContext* ctx, const char* label);
 
     // Collects finished pairs (never waits); logs the report once N pairs are read.
     void poll(ID3D11DeviceContext* ctx);

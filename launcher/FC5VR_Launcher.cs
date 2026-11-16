@@ -9,6 +9,8 @@
 // details; nothing is uploaded). "Make a report" makes the same zip at any time.
 // Upscaler "Add FSR..." installs OptiScaler (FSR in place of DLSS) from the player's own download, "Remove FSR" removes it
 // (FC5VR_OptiScaler.cs).
+// "Install checks" (right column): the mod's files, the OpenXR runtime and layers, ViGEmBus, the VC++ runtime, other mods in
+// bin, game overlays and the game's options, each PASS / WARN / FAIL from the tester reports where the install stopped VR.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -87,7 +89,12 @@ static class Launcher
         Dir = AppDomain.CurrentDomain.BaseDirectory;
         if (args.Length > 0 && args[0].EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && File.Exists(args[0])) GameCommand = args;
         if (!File.Exists(Path.Combine(Dir, "FarCry5.exe"))) {
-            MessageBox.Show("Put FC5VR_Launcher.exe in Far Cry 5's bin folder, next to FarCry5.exe and the mod's dxgi.dll.",
+            // The zip extracted into bin (its own bin folder inside the game's): bin\bin\FC5VR_Launcher.exe.
+            var up = Path.GetDirectoryName(Dir.TrimEnd('\\', '/'));
+            bool nested = up != null && File.Exists(Path.Combine(up, "FarCry5.exe"));
+            MessageBox.Show(nested ? "The mod's files are in a bin folder inside the game's bin folder (" + Dir.TrimEnd('\\') + "). Move every file of this folder up one " +
+                                     "level, next to FarCry5.exe in " + up + ", then start FC5VR_Launcher.exe from there."
+                                   : "Put FC5VR_Launcher.exe in Far Cry 5's bin folder, next to FarCry5.exe and the mod's dxgi.dll.",
                             "Far Cry 5 VR", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
@@ -138,8 +145,12 @@ static class Launcher
             return;
         }
         var lines = File.ReadAllLines(ini);
-        for (int i = 0; i < lines.Length; ++i)
+        for (int i = 0; i < lines.Length; ++i) {
             if (lines[i].TrimStart().StartsWith("Dx11Upscaler=")) lines[i] = "Dx11Upscaler=" + UpscalerValues[choice];
+            // Game overlays off with FSR (FC5VR_OptiScaler.cs WriteModSettings): installs made before 13 Nov had them on, and the
+            // Ubisoft overlay crashes on OptiScaler's wrapped swap chain on AMD / Intel cards.
+            else if (lines[i].TrimStart().StartsWith("DisableOverlays=")) lines[i] = "DisableOverlays=true";
+        }
         File.WriteAllLines(ini, lines, new UTF8Encoding(false));
         if (!File.Exists(on) && File.Exists(off)) File.Move(off, on);
     }
@@ -189,7 +200,7 @@ static class Launcher
 
     // Cutscenes: fc5vr_settings.txt "cinematics flat|3d|off" (F11 Comfort > Cinematics and vehicles, read as the mod reads it).
     // 0 flat screen, 1 3D, 2 unchanged ("off", only F11 sets it: kept unless another choice is picked). No line: 3D, the mod's default.
-    public static readonly string[] CutsceneModes = { "Flat screen in VR", "Full stereo VR (Expect visual bugs)", "Unchanged (set in F11)" };
+    public static readonly string[] CutsceneModes = { "Flat screen in VR", "Full stereo VR", "Unchanged (set in F11)" };
     public static int ReadCutscenes()
     {
         int mode = 1;
@@ -412,8 +423,9 @@ static class Launcher
         return l;
     }
 
-    // Sets the required options in the game's file (the game must be closed). The first time, the file as it was is kept
-    // beside it as gamerprofile.xml.fc5vr_backup. Missing attributes are left alone (the game writes them itself).
+    // Sets the required options in the game's file (the game must be closed). Backups first: the file as it was the first
+    // time is kept as gamerprofile.xml.fc5vr_backup (never overwritten), and the file as it was just before this change as
+    // gamerprofile.xml.fc5vr_last. Missing attributes are left alone (the game writes them itself).
     public static void FixGameOptions()
     {
         var p = GameProfilePath;
@@ -424,6 +436,7 @@ static class Launcher
         }
         var bak = p + ".fc5vr_backup";
         if (!File.Exists(bak)) File.Copy(p, bak);
+        File.Copy(p, p + ".fc5vr_last", true);
         var attrs = File.GetAttributes(p);
         if ((attrs & FileAttributes.ReadOnly) != 0) File.SetAttributes(p, attrs & ~FileAttributes.ReadOnly);
         File.WriteAllText(p, t, new UTF8Encoding(false));
@@ -515,23 +528,294 @@ static class Launcher
         } catch { return false; }
     }
 
-    // What would stop VR from starting, as warnings for the headset text.
-    public static List<string> StartChecks()
+    // ---- install checks (the launcher's "Install checks" panel, the report's system.txt) ----
+    // Each one comes from a tester report where the install, not the mod, stopped VR:
+    //   10 Nov  dxgi.dll gone from bin (antivirus quarantine): the game started flat, no mod log.
+    //   9 Nov, 13 Nov  third-party OpenXR implicit layers (Cheeky foveated DLSS, VectorXR, and four more) made
+    //           xrCreateInstance fault / xrCreateSession fail: VR did not start.
+    //   13 Nov  ViGEmBus missing: the motion controllers cannot drive the game.
+    //   9 Nov, 12 Nov  the Ubisoft Connect overlay: froze the game after a GPU error; crashed it at start with FSR on AMD.
+    public enum CheckState { Pass, Warn, Fail }
+
+    public class InstallCheck
     {
-        var w = new List<string>();
-        var json = ActiveRuntimeJson();
-        string name, lib;
-        if (!string.IsNullOrEmpty(json) && !RuntimeManifest(json, out name, out lib))
-            w.Add("the system's OpenXR runtime (" + json + ") is missing or its DLL is: reinstall the headset's app or set its OpenXR runtime again.");
-        var proxies = ProxyDlls();
-        if (proxies.Count > 0)
-            w.Add("bin has " + string.Join(", ", proxies) + ": other mods or overlays load into the game through these and can stop the VR mod (openvr_api.dll makes it try SteamVR's old API first). Move them out if VR does not start.");
-        var vc = VcRuntime();
-        if (vc == null) w.Add("the Microsoft Visual C++ 2015-2022 x64 runtime is not installed: install vc_redist.x64.exe from Microsoft, or the game may close at start.");
-        else if (vc < new Version(14, 40)) w.Add("the Microsoft Visual C++ x64 runtime is old (" + vc + "): install the latest vc_redist.x64.exe from Microsoft.");
-        if (!ViGEmBusInstalled()) w.Add("the ViGEmBus driver is not installed: the motion controllers drive the game through it (install it from its GitHub releases).");
-        return w;
+        public readonly string Name;
+        public CheckState State;
+        public string Summary;   // one short line beside the badge
+        public string Detail;    // what is wrong and how to fix it (the line's dialog)
+        public string Url;       // a download or help page the dialog offers to open, or null
+        public bool Blocks;      // Play in VR is refused: the mod cannot load at all
+        public string FixLabel;  // a button under the line that fixes it in place (Game options), or null
+        public InstallCheck(string name) { Name = name; }
+        public InstallCheck Set(CheckState s, string summary, string detail) { State = s; Summary = summary; Detail = detail; return this; }
     }
+
+    // The mod itself: dxgi.dll next to FarCry5.exe. Antivirus programs sometimes quarantine it (an unsigned dll that hooks
+    // the game); then the game starts flat and the mod writes no log.
+    public static bool ModDllPresent() { return File.Exists(Path.Combine(Dir, "dxgi.dll")); }
+
+    public const string ModDllMissing = "the mod's dxgi.dll is not in bin, so the game starts without the mod (flat, no VR). Copy dxgi.dll again from " +
+                                        "the release zip into bin. If it disappears again, your antivirus removed it: restore it from the antivirus's " +
+                                        "quarantine and add the bin folder as an exclusion.";
+
+    // Whether a dxgi.dll is the VR mod's (it names its settings file; ReShade, Special K, DXVK or OptiScaler saved as dxgi.dll
+    // do not). other: the dll's product name when it has one.
+    public static bool IsModDll(string path, out string other)
+    {
+        other = null;
+        try {
+            var vi = FileVersionInfo.GetVersionInfo(path);
+            var p = ((vi.ProductName ?? "") + " " + (vi.FileDescription ?? "")).Trim();
+            if (p.Length > 0) other = p;
+            var data = File.ReadAllBytes(path);
+            var mark = Encoding.ASCII.GetBytes("fc5vr_settings.txt");
+            for (int i = 0, n = data.Length - mark.Length; i <= n; ++i) {
+                if (data[i] != mark[0]) continue;
+                int j = 1;
+                while (j < mark.Length && data[i + j] == mark[j]) ++j;
+                if (j == mark.Length) return true;
+            }
+            return false;
+        } catch { return true; }   // unreadable (locked by the running game): not reported as foreign
+    }
+
+    // An enabled OpenXR implicit API layer: the loader puts it between the mod and the runtime in every call.
+    public class XrLayer
+    {
+        public string Name, Manifest, Hive;
+        public bool Bad;      // stopped VR on testers' PCs
+        public bool Tested;   // runs with the mod on the author's or testers' PCs
+    }
+
+    // Layers that ran with the mod in VR (the author's PC: OFXR Bridge and VD's; the Pimax tester's working runs: VD's and OBS Mirror).
+    static readonly string[] TestedLayers = { "OFXRBridge", "VIRTUALDESKTOP_oculus_compatibility", "OBSMirror" };
+    // Layers in the two "VR did not start" reports (9 Nov xrCreateInstance fault, 13 Nov xrCreateSession failure).
+    static readonly string[] BadLayers = { "CHEEKY", "VECTORXR" };
+
+    // HKLM and HKCU Khronos\OpenXR\1\ApiLayers\Implicit, value 0 = enabled. Entries whose manifest is missing are skipped (the
+    // loader skips them too), and so are layers whose manifest's enable_environment is unset or disable_environment is set.
+    public static List<XrLayer> EnabledLayers()
+    {
+        var list = new List<XrLayer>();
+        foreach (var hive in new[] { Registry.LocalMachine, Registry.CurrentUser }) {
+            try {
+                using (var k = hive.OpenSubKey(@"SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit")) {
+                    if (k == null) continue;
+                    foreach (var path in k.GetValueNames()) {
+                        var v = k.GetValue(path);
+                        if (!(v is int) || (int)v != 0 || !File.Exists(path)) continue;
+                        string name = Path.GetFileNameWithoutExtension(path);
+                        try {
+                            var t = File.ReadAllText(path);
+                            var m = Regex.Match(t, "\"name\"\\s*:\\s*\"([^\"]*)\"");
+                            if (m.Success) name = m.Groups[1].Value;
+                            var en = Regex.Match(t, "\"enable_environment\"\\s*:\\s*\"([^\"]*)\"");
+                            if (en.Success && string.IsNullOrEmpty(Environment.GetEnvironmentVariable(en.Groups[1].Value))) continue;
+                            var dis = Regex.Match(t, "\"disable_environment\"\\s*:\\s*\"([^\"]*)\"");
+                            if (dis.Success && !string.IsNullOrEmpty(Environment.GetEnvironmentVariable(dis.Groups[1].Value))) continue;
+                        } catch { }
+                        var l = new XrLayer { Name = name, Manifest = path, Hive = hive == Registry.LocalMachine ? "HKLM" : "HKCU" };
+                        foreach (var b in BadLayers) if (name.IndexOf(b, StringComparison.OrdinalIgnoreCase) >= 0) l.Bad = true;
+                        foreach (var g in TestedLayers) if (name.IndexOf(g, StringComparison.OrdinalIgnoreCase) >= 0) l.Tested = true;
+                        list.Add(l);
+                    }
+                }
+            } catch { }
+        }
+        return list;
+    }
+
+    // Ubisoft Connect's "Enable in-game overlay for supported games" (Settings > General): settings.yaml "overlay:" block,
+    // "enabled: true|false". Null when Ubisoft Connect's settings are not found or say nothing about it.
+    public static bool? UbisoftOverlayOn()
+    {
+        try {
+            var p = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Ubisoft Game Launcher\settings.yaml");
+            if (!File.Exists(p)) return null;
+            bool inOverlay = false;
+            foreach (var raw in File.ReadAllLines(p)) {
+                if (raw.Trim().Length == 0) continue;
+                bool top = !char.IsWhiteSpace(raw[0]);
+                if (top) { inOverlay = raw.Trim() == "overlay:"; continue; }
+                if (!inOverlay) continue;
+                var m = Regex.Match(raw.Trim(), @"^enabled:\s*(\w+)");
+                if (m.Success) return m.Groups[1].Value.Equals("true", StringComparison.OrdinalIgnoreCase);
+            }
+        } catch { }
+        return null;
+    }
+
+    // OptiScaler.ini [Hotfix] DisableOverlays=true (Add FSR writes it; Play writes it again with an FSR choice).
+    static bool OptiScalerBlocksOverlays()
+    {
+        try {
+            foreach (var raw in File.ReadAllLines(Path.Combine(Dir, "OptiScaler.ini")))
+                if (raw.Trim().Replace(" ", "") == "DisableOverlays=true") return true;
+        } catch { }
+        return false;
+    }
+
+    const string LayersGui = "https://github.com/fredemmott/OpenXR-API-Layers-GUI/releases";
+    const string ViGEmBusUrl = "https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe";
+    const string VcRedistUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
+
+    public static List<InstallCheck> InstallChecks()
+    {
+        var all = new List<InstallCheck>();
+
+        // 1. The mod's files next to FarCry5.exe.
+        var files = new InstallCheck("Mod files in bin");
+        all.Add(files);
+        var dxgi = Path.Combine(Dir, "dxgi.dll");
+        string other;
+        var missing = new List<string>();
+        foreach (var f in new[] { "dxgi.dll", "openxr_loader.dll", "nvngx_dlss.dll" }) if (!File.Exists(Path.Combine(Dir, f))) missing.Add(f);
+        string nested = File.Exists(Path.Combine(Dir, @"bin\dxgi.dll")) ? " A copy is in " + Path.Combine(Dir, "bin") + ": the zip was extracted into bin instead of " +
+                                                                        "the game folder. Move the files of that inner bin folder up one level, next to FarCry5.exe." : "";
+        if (!File.Exists(dxgi)) {
+            files.Set(CheckState.Fail, "dxgi.dll (the mod) is missing", "T" + ModDllMissing.Substring(1) + nested);
+            files.Blocks = true;
+        } else if (!IsModDll(dxgi, out other)) {
+            files.Set(CheckState.Fail, "dxgi.dll is not the VR mod's",
+                      "bin has a dxgi.dll that is not the VR mod's" + (other != null ? " (" + other + ")" : "") + ": another mod (ReShade, Special K, DXVK, OptiScaler...) " +
+                      "saved under the same name replaced it. Move that dxgi.dll out of bin and copy the mod's dxgi.dll from the release zip again." + nested);
+            files.Blocks = true;
+        } else if (missing.Contains("openxr_loader.dll")) {
+            files.Set(CheckState.Fail, "openxr_loader.dll is missing",
+                      "openxr_loader.dll is not in bin: the mod needs it to talk to the headset, so the game starts without VR (or does not start). " +
+                      "Copy it again from the release zip into bin, next to FarCry5.exe." + nested);
+            files.Blocks = true;
+        } else if (missing.Contains("nvngx_dlss.dll")) {
+            files.Set(CheckState.Warn, "nvngx_dlss.dll is missing",
+                      "nvngx_dlss.dll (the DLSS runtime) is not in bin: VR starts, but DLSS cannot run. Copy it again from the release zip into bin, next to FarCry5.exe." + nested);
+        } else files.Set(CheckState.Pass, "dxgi.dll, openxr_loader.dll and nvngx_dlss.dll next to FarCry5.exe",
+                         "The mod (dxgi.dll), the OpenXR loader and the DLSS runtime are in " + Dir + ", next to FarCry5.exe." + nested);
+
+        // 2. The system's OpenXR runtime.
+        var rt = new InstallCheck("OpenXR runtime");
+        all.Add(rt);
+        var env = Environment.GetEnvironmentVariable("XR_RUNTIME_JSON");
+        var json = !string.IsNullOrEmpty(env) ? env : ActiveRuntimeJson();
+        string rname, rlib;
+        if (string.IsNullOrEmpty(json))
+            rt.Set(CheckState.Fail, "none set as the system default",
+                   "No OpenXR runtime is set as the system default, so the mod has no headset to start. Open your headset's PC app and make it the OpenXR runtime: " +
+                   "Virtual Desktop Streamer: OpenXR Runtime VDXR; SteamVR: Settings > OpenXR > Set SteamVR as OpenXR runtime; Meta Quest Link: Settings > General > " +
+                   "OpenXR Runtime; Pimax Play: Settings > OpenXR.");
+        else if (!RuntimeManifest(json, out rname, out rlib))
+            rt.Set(CheckState.Fail, "the default runtime's files are missing",
+                   "The system's OpenXR runtime (" + json + (rlib != null ? ", library " + rlib : "") + ") is missing: its app was uninstalled or moved. " +
+                   "Reinstall the headset's PC app, or set another one as the OpenXR runtime.");
+        else rt.Set(CheckState.Pass, (ActiveRuntime() ?? rname ?? Path.GetFileNameWithoutExtension(json)) + (string.IsNullOrEmpty(env) ? "" : " (XR_RUNTIME_JSON)"),
+                    "OpenXR runtime: " + (rname ?? "?") + "\n" + json + "\nlibrary " + rlib);
+
+        // 3. Third-party OpenXR layers.
+        var lc = new InstallCheck("OpenXR layers");
+        all.Add(lc);
+        var layers = EnabledLayers();
+        var odd = layers.FindAll(l => !l.Tested);
+        if (odd.Count == 0)
+            lc.Set(CheckState.Pass, layers.Count == 0 ? "none enabled" : "only ones tested with the mod",
+                   layers.Count == 0 ? "No OpenXR API layer is enabled." : "Enabled, and known to run with the mod: " + string.Join(", ", layers.ConvertAll(l => l.Name)) + ".");
+        else {
+            var bad = odd.FindAll(l => l.Bad);
+            var untested = odd.FindAll(l => !l.Bad);
+            var sb = new StringBuilder();
+            if (bad.Count > 0) {
+                sb.Append("These OpenXR API layers stopped VR from starting on testers' PCs (VR did not start, the game stayed flat):\n");
+                foreach (var l in bad) sb.Append("- " + l.Name + "\n");
+            }
+            if (untested.Count > 0) {
+                sb.Append(bad.Count > 0 ? "\nThese were never tested with the mod:\n"
+                                        : "These OpenXR API layers sit between the mod and the headset and were never tested with it. Two testers' VR did not start until they turned theirs off:\n");
+                foreach (var l in untested) sb.Append("- " + l.Name + "\n");
+            }
+            sb.Append("\nIf VR does not start, turn them off: untick them in the OpenXR API Layers GUI tool (Yes opens its download page), or in an " +
+                      "administrator Command Prompt (Ctrl+C copies this text):\n");
+            foreach (var l in odd)
+                sb.Append("reg add \"" + l.Hive + @"\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit"" /v """ + l.Manifest + "\" /t REG_DWORD /d 1 /f\n");
+            sb.Append("(/d 0 turns one back on.)");
+            string summary = bad.Count > 0 ? string.Join(", ", bad.ConvertAll(l => ShortLayer(l.Name))) + ": stopped VR before" +
+                                             (untested.Count > 0 ? "; " + untested.Count + " more untested" : "")
+                                           : string.Join(", ", untested.ConvertAll(l => ShortLayer(l.Name))) + ": untested with the mod";
+            lc.Set(bad.Count > 0 ? CheckState.Fail : CheckState.Warn, summary, sb.ToString());
+            lc.Url = LayersGui;
+        }
+
+        // 4. ViGEmBus.
+        var vg = new InstallCheck("ViGEmBus driver");
+        all.Add(vg);
+        if (ViGEmBusInstalled()) vg.Set(CheckState.Pass, "installed", "ViGEmBus is installed: the motion controllers reach the game as a virtual Xbox pad.");
+        else {
+            vg.Set(CheckState.Fail, "not installed: the controllers will not work",
+                   "The ViGEmBus driver is not installed. The motion controllers drive the game through it (a virtual Xbox pad), so without it VR starts but the " +
+                   "controllers do nothing. Install ViGEmBus 1.22.0 (Yes downloads the installer), then restart Windows.");
+            vg.Url = ViGEmBusUrl;
+        }
+
+        // 5. Visual C++ runtime.
+        var vcc = new InstallCheck("Visual C++ runtime");
+        all.Add(vcc);
+        var vc = VcRuntime();
+        if (vc == null) {
+            vcc.Set(CheckState.Fail, "not installed", "The Microsoft Visual C++ 2015-2022 x64 runtime is not installed: the mod needs it, or the game may close at start. " +
+                                                      "Install vc_redist.x64.exe from Microsoft (Yes downloads it).");
+            vcc.Url = VcRedistUrl;
+        } else if (vc < new Version(14, 40)) {
+            vcc.Set(CheckState.Warn, "old (" + vc + ")", "The Microsoft Visual C++ x64 runtime is old (" + vc + "): install the latest vc_redist.x64.exe from Microsoft (Yes downloads it).");
+            vcc.Url = VcRedistUrl;
+        } else vcc.Set(CheckState.Pass, vc.ToString(), "Microsoft Visual C++ 2015-2022 x64 runtime " + vc + ".");
+
+        // 6. Other mods' DLLs in bin.
+        var om = new InstallCheck("Other mods in bin");
+        all.Add(om);
+        var proxies = ProxyDlls();
+        if (!UpscalerInstalled() && (File.Exists(Path.Combine(Dir, "OptiScaler.dll")) || File.Exists(Path.Combine(Dir, "OptiScaler.ini"))))
+            proxies.Add("OptiScaler (not installed by Add FSR)");
+        if (File.Exists(Path.Combine(Dir, "dlssg_to_fsr3_amd_is_better.dll"))) proxies.Add("dlssg_to_fsr3_amd_is_better.dll");
+        if (proxies.Count == 0) om.Set(CheckState.Pass, "none found", "No other mod, overlay or ReShade loads into the game from bin.");
+        else om.Set(CheckState.Warn, string.Join(", ", proxies),
+                    "bin has " + string.Join(", ", proxies) + ": other mods or overlays load into the game through these and can stop the VR mod " +
+                    "(openvr_api.dll makes it try SteamVR's old API first). Move them out of bin if VR does not start. For FSR use the launcher's Add FSR, " +
+                    "which installs OptiScaler the way the mod expects.");
+
+        // 7. Game overlays (Ubisoft Connect's): the FSR crash and the silent freeze.
+        var ov = new InstallCheck("Game overlays");
+        all.Add(ov);
+        bool fsr = ReadUpscaler() > 0;
+        var ubi = UbisoftOverlayOn();
+        const string ubiOff = "Turn it off: Ubisoft Connect > Settings > General > untick \"Enable in-game overlay for supported games\" (it cannot be seen in the headset anyway).";
+        if (fsr && OptiScalerBlocksOverlays())
+            ov.Set(CheckState.Pass, "blocked by OptiScaler (FSR)", "FSR is on and OptiScaler keeps the game overlays (Ubisoft Connect, Steam, Discord) out of the game.");
+        else if (fsr)
+            ov.Set(CheckState.Warn, "FSR on, overlays not blocked: Play blocks them",
+                   "FSR is on and OptiScaler.ini lets the game overlays load. The Ubisoft Connect overlay crashed the game at start with FSR on AMD and Intel " +
+                   "cards. Play sets OptiScaler's DisableOverlays=true before the game starts.");
+        else if (ubi == true)
+            ov.Set(CheckState.Warn, "Ubisoft Connect overlay on",
+                   "Ubisoft Connect's in-game overlay is on. On a tester's PC it turned a graphics error into a frozen game with no crash report, and with FSR " +
+                   "on AMD it crashed the game at start. " + ubiOff);
+        else ov.Set(CheckState.Pass, ubi == false ? "Ubisoft Connect overlay off" : "no Ubisoft Connect overlay setting found",
+                    ubi == false ? "Ubisoft Connect's in-game overlay is off." : "Ubisoft Connect's settings were not found (or do not say), so its overlay was not checked. " + ubiOff);
+
+        // 8. The game's own options.
+        var go = new InstallCheck("Game options");
+        all.Add(go);
+        var wrong = WrongGameOptions();
+        if (wrong == null) go.Set(CheckState.Warn, "not checked: the game has not saved its options yet",
+                                  "The game's options file (" + GameProfilePath + ") is not there yet: start the game once (Flatscreen is fine), then Play in VR offers to set the options the mod needs.");
+        else if (wrong.Count == 0) go.Set(CheckState.Pass, "set as the mod needs", "Every game option the mod needs is set (" + GameProfilePath + ").");
+        else {
+            go.Set(CheckState.Warn, WrongLabels(wrong).Count + " not set as the mod needs",
+                   "Game options the VR mod needs, not set yet:\n- " + string.Join("\n- ", WrongLabels(wrong)) + "\n\n\"Change to correct settings\" under this line " +
+                   "(or Play in VR) sets them in " + GameProfilePath + ". Your file is backed up first, beside it.");
+            go.FixLabel = "Change to correct settings";
+        }
+        return all;
+    }
+
+    // XR_APILAYER_CHEEKY_foveated_dlss -> CHEEKY_foveated_dlss
+    public static string ShortLayer(string name) { return name.StartsWith("XR_APILAYER_") ? name.Substring(12) : name; }
 
     public static bool GameRunning() { return Process.GetProcessesByName("FarCry5").Length > 0; }
 
@@ -583,6 +867,10 @@ class LauncherForm : Form
     readonly Label popupInfo = new Label();
     bool dlssKeepFile;   // fc5vr_resolution.txt is not "auto" (a test setup): kept unless the mode is changed
     readonly Button play = new Button();
+    // Install checks: one line per Launcher.InstallChecks() entry, a PASS / WARN / FAIL badge each; a line's click shows how to fix it.
+    readonly TableLayoutPanel checkList = new TableLayoutPanel();
+    readonly ToolTip checkTips = new ToolTip { AutoPopDelay = 20000, InitialDelay = 300 };
+    DateTime checkedAt = DateTime.MinValue;
 
     public LauncherForm()
     {
@@ -595,9 +883,10 @@ class LauncherForm : Form
         Font = new Font("Segoe UI", 9.5f);
         try { Icon = Icon.ExtractAssociatedIcon(Path.Combine(Launcher.GameDir, "FarCry5.exe")); } catch { }
 
-        var table = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(14), Dock = DockStyle.Fill };
+        var table = new TableLayoutPanel { ColumnCount = 3, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(14), Dock = DockStyle.Fill };
         table.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 300));
+        table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 350));
 
         // Mode
         var modes = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0), WrapContents = false };
@@ -672,6 +961,27 @@ class LauncherForm : Form
         AddRow(table, "Headset", headset);
         AddInfo(table, headsetInfo);
 
+        // Install checks: a third column beside every row above.
+        var checksBox = new GroupBox { Text = "Install checks", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+                                       Margin = new Padding(18, 3, 0, 0), Padding = new Padding(8, 6, 8, 8) };
+        var checksPanel = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, Dock = DockStyle.Fill, Margin = new Padding(0) };
+        checkList.ColumnCount = 2;
+        checkList.AutoSize = true;
+        checkList.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        checkList.Margin = new Padding(0);
+        checkList.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 52));
+        checkList.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 250));
+        var checkHint = new Label { Text = "Click a line for what it means and how to fix it.", AutoSize = true, MaximumSize = new Size(300, 0), ForeColor = SystemColors.GrayText,
+                                    Margin = new Padding(0, 6, 0, 0) };
+        var recheck = new Button { Text = "Check again", AutoSize = true, Margin = new Padding(0, 6, 0, 0) };
+        recheck.Click += delegate { FillChecks(); };
+        checksPanel.Controls.Add(checkList);
+        checksPanel.Controls.Add(checkHint);
+        checksPanel.Controls.Add(recheck);
+        checksBox.Controls.Add(checksPanel);
+        table.Controls.Add(checksBox, 2, 0);
+        table.SetRowSpan(checksBox, table.RowCount);
+
         // Buttons
         var buttons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Fill, Margin = new Padding(0, 12, 0, 0) };
         var close = new Button { Text = "Close", AutoSize = true, DialogResult = DialogResult.Cancel };
@@ -682,7 +992,7 @@ class LauncherForm : Form
         buttons.Controls.Add(play);
         buttons.Controls.Add(report);
         table.Controls.Add(buttons, 0, table.RowCount);
-        table.SetColumnSpan(buttons, 2);
+        table.SetColumnSpan(buttons, 3);
         table.RowCount++;
 
         Controls.Add(table);
@@ -715,7 +1025,114 @@ class LauncherForm : Form
         dlssMode.SelectedIndexChanged += delegate { dlssKeepFile = false; UpdateInfo(); };
         headset.SelectedIndexChanged += delegate { UpdateInfo(); };
         play.Click += delegate { Play(); };
+        // Back in the launcher (after installing a driver, moving files): checked again, at most every 3 s.
+        Activated += delegate { if ((DateTime.Now - checkedAt).TotalSeconds > 3) FillChecks(); };
+        FillChecks();
         UpdateInfo();
+    }
+
+    static readonly Color PassColor = Color.FromArgb(46, 125, 50), WarnColor = Color.FromArgb(249, 168, 37), FailColor = Color.FromArgb(198, 40, 40);
+
+    // The install checks panel, run again (or shown from checks just run): badge, name and one-line result for each check.
+    void FillChecks(List<Launcher.InstallCheck> checks = null)
+    {
+        checkedAt = DateTime.Now;
+        try { if (checks == null) checks = Launcher.InstallChecks(); }
+        catch (Exception e) { checks = new List<Launcher.InstallCheck> { new Launcher.InstallCheck("Install checks").Set(Launcher.CheckState.Warn, "could not run", e.Message) }; }
+        checkList.SuspendLayout();
+        checkTips.RemoveAll();
+        while (checkList.Controls.Count > 0) checkList.Controls[0].Dispose();
+        checkList.RowStyles.Clear();
+        checkList.RowCount = 0;
+        foreach (var check in checks) {
+            var c = check;
+            var badge = new Label {
+                Text = c.State == Launcher.CheckState.Pass ? "PASS" : c.State == Launcher.CheckState.Warn ? "WARN" : "FAIL",
+                AutoSize = false, Size = new Size(44, 18), TextAlign = ContentAlignment.MiddleCenter, Margin = new Padding(0, 3, 8, 0),
+                Font = new Font(Font.FontFamily, 7.5f, FontStyle.Bold),
+                BackColor = c.State == Launcher.CheckState.Pass ? PassColor : c.State == Launcher.CheckState.Warn ? WarnColor : FailColor,
+                ForeColor = c.State == Launcher.CheckState.Warn ? Color.Black : Color.White,
+            };
+            var text = new Label { Text = c.Name, AutoSize = true, MaximumSize = new Size(250, 0), Margin = new Padding(0, 2, 0, 0), Font = new Font(Font, FontStyle.Bold) };
+            var summary = new Label { Text = c.Summary, AutoSize = true, MaximumSize = new Size(250, 0), Margin = new Padding(0, 0, 0, 5),
+                                      ForeColor = c.State == Launcher.CheckState.Fail ? FailColor : SystemColors.GrayText };
+            var lines = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, Margin = new Padding(0) };
+            lines.Controls.Add(text);
+            lines.Controls.Add(summary);
+            foreach (Control ctl in new Control[] { badge, text, summary, lines }) {
+                ctl.Cursor = Cursors.Hand;
+                ctl.Click += delegate { ShowCheck(c); };
+                checkTips.SetToolTip(ctl, c.Detail);
+            }
+            if (c.FixLabel != null) {
+                var fix = new Button { Text = c.FixLabel, AutoSize = true, Margin = new Padding(0, 0, 0, 6) };
+                fix.Click += delegate { FixGameOptionsNow(); };
+                lines.Controls.Add(fix);
+            }
+            checkList.Controls.Add(badge, 0, checkList.RowCount);
+            checkList.Controls.Add(lines, 1, checkList.RowCount);
+            checkList.RowCount++;
+        }
+        checkList.ResumeLayout();
+    }
+
+    // Game options "Change to correct settings": the game's file set to the values the mod needs, backed up first.
+    void FixGameOptionsNow()
+    {
+        const string title = "Far Cry 5 VR: game options";
+        if (Launcher.GameRunning()) {
+            MessageBox.Show(this, "Far Cry 5 is running: it would write its own options back when it closes. Close it first, then press the button again.",
+                            title, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        var before = Launcher.WrongLabels(Launcher.WrongGameOptions());
+        try {
+            Launcher.FixGameOptions();
+        } catch (Exception e) {
+            MessageBox.Show(this, "Could not change the game's options file:\n" + e.Message + "\nSet them in the game's Options instead.", title, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+        var left = Launcher.WrongLabels(Launcher.WrongGameOptions());
+        var changed = before.FindAll(l => !left.Contains(l));
+        var msg = new StringBuilder();
+        if (changed.Count > 0) msg.Append("Set:\n- " + string.Join("\n- ", changed) + "\n\n");
+        if (left.Count > 0) msg.Append("Not in the file yet, so set them in the game's Options:\n- " + string.Join("\n- ", left) + "\n\n");
+        msg.Append("Your file as it was is kept beside it: " + Path.GetFileName(Launcher.GameProfilePath) + ".fc5vr_last (just before this change) and " +
+                   Path.GetFileName(Launcher.GameProfilePath) + ".fc5vr_backup (the first time the launcher changed it). To undo, copy one over gamerprofile.xml.");
+        FillChecks();
+        UpdateInfo();
+        MessageBox.Show(this, msg.ToString(), title, MessageBoxButtons.OK, left.Count > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+    }
+
+    void ShowCheck(Launcher.InstallCheck c)
+    {
+        var icon = c.State == Launcher.CheckState.Pass ? MessageBoxIcon.Information : c.State == Launcher.CheckState.Warn ? MessageBoxIcon.Warning : MessageBoxIcon.Error;
+        var title = "Far Cry 5 VR: " + c.Name + " " + (c.State == Launcher.CheckState.Pass ? "(pass)" : c.State == Launcher.CheckState.Warn ? "(warning)" : "(failed)");
+        if (c.Url == null || c.State == Launcher.CheckState.Pass) {
+            MessageBox.Show(this, c.Detail, title, MessageBoxButtons.OK, icon);
+            return;
+        }
+        if (MessageBox.Show(this, c.Detail + "\n\nOpen " + c.Url + "?", title, MessageBoxButtons.YesNo, icon) != DialogResult.Yes) return;
+        try { Process.Start(c.Url); }
+        catch (Exception e) { MessageBox.Show(this, "Could not open " + c.Url + ":\n" + e.Message, "Far Cry 5 VR", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+    }
+
+    // Play in VR: a check that stops the mod loading refuses to start; other failed checks ask first. False: back to the launcher.
+    bool CheckInstall()
+    {
+        var checks = Launcher.InstallChecks();
+        FillChecks(checks);
+        var failed = checks.FindAll(c => c.State == Launcher.CheckState.Fail);
+        var block = failed.Find(c => c.Blocks);
+        if (block != null) {
+            MessageBox.Show(this, "VR cannot start: " + block.Detail, "Far Cry 5 VR: " + block.Name, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
+        }
+        if (failed.Count == 0) return true;
+        var list = new StringBuilder();
+        foreach (var c in failed) list.AppendLine("- " + c.Name + ": " + c.Summary);
+        return MessageBox.Show(this, "These install checks failed:\n\n" + list + "\nVR may not start, or the controllers may not work. Click the line in Install checks " +
+                                     "for how to fix it.\n\nStart the game anyway?", "Far Cry 5 VR: install checks", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes;
     }
 
     // The upscaler list and the FSR button for what is installed; select: the entry to pick, -1 the one the files say.
@@ -762,6 +1179,7 @@ class LauncherForm : Form
             catch (Exception e) { MessageBox.Show(this, "Could not remove every file:\n" + e.Message, title, MessageBoxButtons.OK, MessageBoxIcon.Error); }
             FillUpscaler(-1);
             UpdateInfo();
+            FillChecks();
             return;
         }
         string picked = OptiScalerSetup.FindDownloaded();
@@ -815,6 +1233,7 @@ class LauncherForm : Form
             fsrButton.Enabled = true;
             if (!Launcher.UpscalerInstalled()) fsrButton.Text = "Add FSR...";
             if (temp != null) try { Directory.Delete(temp, true); } catch (Exception) { }
+            FillChecks();
         }
     }
 
@@ -864,9 +1283,7 @@ class LauncherForm : Form
                 if (sh > 116) sb.Append("That is wider than the game's own view (120 deg at most): objects at the far sides can pop in. ");
             }
         }
-        var wrong = Launcher.WrongLabels(Launcher.WrongGameOptions());
-        if (wrong.Count > 0) sb.Append("Game options the VR mod needs, not set yet: " + string.Join("; ", wrong) + ". Play offers to set them. ");
-        foreach (var w in Launcher.StartChecks()) sb.Append("Warning: " + w + " ");
+        // Missing files, drivers, layers, overlays and game options: the Install checks panel.
         sb.Append("Connect the headset before pressing Play.");
         return sb.ToString();
     }
@@ -924,6 +1341,7 @@ class LauncherForm : Form
             MessageBox.Show(this, "Far Cry 5 is already running. Close it first: the choice applies when the game starts.", "Far Cry 5 VR", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
+        if (vr.Checked && !CheckInstall()) return;
         if (vr.Checked && !CheckGameOptions()) return;
         try {
             if (upscaler.SelectedIndex > 0) dlss.Checked = true;   // with DLSS off the mod never calls the upscaler
@@ -968,7 +1386,7 @@ class LauncherForm : Form
             list.AppendLine("- " + o.Label + "   (" + o.Attr + " is " + (o.Have == null ? "missing" : "\"" + o.Have + "\"") + ")");
         var answer = MessageBox.Show(this, "These Far Cry 5 options are not the ones the VR mod needs:\n\n" + list +
                                      "\nSet them now? Yes changes them in the game's options file (" + Launcher.GameProfilePath + "); " +
-                                     "the first time, a copy of the file as it was is kept as gamerprofile.xml.fc5vr_backup.\n" +
+                                     "a copy of the file as it was is kept as gamerprofile.xml.fc5vr_last (and the first time as .fc5vr_backup).\n" +
                                      "No starts the game with your options unchanged. Cancel goes back to the launcher.",
                                      "Far Cry 5 VR: game options", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning);
         if (answer == DialogResult.Cancel) return false;
@@ -981,6 +1399,7 @@ class LauncherForm : Form
                 return false;
             }
             UpdateInfo();
+            FillChecks();
         }
         return true;
     }
@@ -1002,8 +1421,17 @@ class LauncherForm : Form
         else why.AppendLine(string.Format(CultureInfo.InvariantCulture, "Exit code 0x{0:X8}{1}.", code, badCode ? " (a crash)" : ""));
         if (newCrash) why.AppendLine("The mod wrote a crash report: " + Path.GetFileName(crash) + ".");
         if (!vrRan) {
-            var step = Report.LastBootStep(log);
-            why.AppendLine("VR did not start" + (step != null ? ": the last start step in the log was " + step : " (no start steps in the log).") );
+            // A log older than this run is the last run's: its steps say nothing about this one.
+            bool logNew = File.Exists(log) && File.GetLastWriteTime(log) >= started;
+            var step = logNew ? Report.LastBootStep(log) : null;
+            if (!Launcher.ModDllPresent()) why.AppendLine("VR did not start: " + Launcher.ModDllMissing);
+            else if (!logNew) why.AppendLine("VR did not start: the mod wrote no log in this run, so it did not load (dxgi.dll is in bin: another program may have kept it out).");
+            else why.AppendLine("VR did not start" + (step != null ? ": the last start step in the log was " + step : " (no start steps in the log).") );
+            // Third-party OpenXR layers stopped VR on two testers' PCs (9 and 13 Nov).
+            var odd = Launcher.EnabledLayers().FindAll(l => !l.Tested);
+            if (logNew && odd.Count > 0)
+                why.AppendLine("OpenXR layers enabled on this PC: " + string.Join(", ", odd.ConvertAll(l => Launcher.ShortLayer(l.Name))) + ". Layers like these stopped VR on " +
+                               "testers' PCs: turn them off and try again (Install checks > OpenXR layers shows how).");
         }
         var exitInfo = "Last game run: " + (found ? string.Format(CultureInfo.InvariantCulture, "exit code 0x{0:X8}", code) : "the game was not seen running") +
                        ", Play at " + started.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + (vrRan ? ", VR ran" : ", VR did not start");

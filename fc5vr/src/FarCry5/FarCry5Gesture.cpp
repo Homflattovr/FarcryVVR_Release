@@ -54,28 +54,19 @@ namespace
     // FC5 default pad layout: Y tapped = switch to the previous weapon (held = heal), as right B sends it.
     const Def kDefs[]{
         { "shoulderswitch", "Right shoulder: weapon slot (right hand + grip)",
-          "Reach to your right shoulder (as if taking a gun from your back) and press the grip: the weapon of the slot chosen below (default slot 2: the game's weapon slot key 2) is in your hand (pad Y, the last weapon, with shoulderwheel off). "
-          "That grip press does not aim or hold the gun. Left-handed: the left hand at the left shoulder.",
+          "Reach to your right shoulder and press the grip to take the weapon of the slot chosen below.",
           Kind::Tap, kWeaponHand, Anchor::WeaponShoulder, XINPUT_GAMEPAD_Y, 120, 0.24f, true, false },   // 0.20 until 27 Oct (4 of his presses missed by 0.21-0.23 m)
         { "sling", "Sling: the weapon hangs in front of you until you grab it",
-          "The current weapon hangs across your chest. Put your right hand on its grip and hold the grip button: the weapon is in your hand while you hold it, "
-          "and goes back on the sling when you let go. On the sling it does not fire. Off: the weapon is always in your hand (as before).",
+          "Your weapon hangs across your chest. Hold the grip on it to take it; let go to put it back. Off: the weapon is always in your hand.",
           Kind::Hold, kWeaponHand, Anchor::Sling, 0, 0, 0.18f, true, true },
-        { "throwable", "Throwable on the left chest: take it with the left grip, let go while swinging to throw",
-          "The selected grenade (or other throwable) sits on the left of your chest. Put your left hand there and hold the grip: it is in your hand. "
-          "Swing and let go of the grip: the game throws it the way your hand was moving (let go without a swing: where you look). "
-          "That grip press is not the left grip's usual modifier or two-handed hold. On by default (author 2 Nov). Off: nothing on the chest; throw with the "
-          "game's own button (left grip + right B).",
+        { "throwable", "Throwable on the left chest: take it, aim with the trajectory, let go to throw",
+          "Your throwable sits on the left of your chest. Hold the grip there to take it, then swing and let go to throw.",
           Kind::Hold, kOtherHand, Anchor::Chest, 0, 0, 0.22f, true, false },   // off from release 0.12.1 (author 25 Oct 12:40); on again 2 Nov 12:54 (throwable and holster on by default)
         { "sidearm", "Sidearm on the right hip: grab it with the right grip (needs the sling)",
-          "Your sidearm (a handgun) hangs on your right hip and your main weapon on the sling, both always shown. Hold the right grip on the hip: "
-          "the sidearm is in your hand (the game switches to it if needed, the sling keeps showing your main weapon); let go: back on the hip. "
-          "Grab the sling: the main weapon is in your hand and the sidearm stays on the hip. The hip takes the weapon wheel's rightmost slot (the sidearm), "
-          "the sling the game's last weapon (pad Y): the main weapon you held before. On by default (author 2 Nov). Off: the sling as before.",
-          Kind::Hold, kWeaponHand, Anchor::Hip, 0, 0,  0.16f, true, true },   // on by default since 2 Nov 12:54 (author)
+          "Your sidearm hangs on your right hip. Hold the right grip there to take it; let go to put it back.",
+          Kind::Hold, kWeaponHand, Anchor::Hip, 0, 0,  0.30f, true, true },    // on by default since 2 Nov 12:54 (author); radius 0.30 since 15 Nov (author 21:20Z: his sidearmsize 0.30; was 0.176 from 14 Nov, 0.16 before)
         { "shoulderleft", "Left shoulder: weapon slot (right hand + grip)",
-          "Reach across to your left shoulder with the right hand and press the grip: the weapon of the slot chosen below (default slot 1: the game's weapon slot key 1) is in your hand. "
-          "That grip press does not aim or hold the gun. Left-handed: the left hand at the right shoulder.",
+          "Reach across to your left shoulder with your right hand and press the grip to take the weapon of the slot chosen below.",
           Kind::Tap, kWeaponHand, Anchor::OtherShoulder, XINPUT_GAMEPAD_Y, 120, 0.24f, true, false },   // Author 30 Oct
     };
     constexpr int kCount = int(sizeof(kDefs) / sizeof(kDefs[0]));
@@ -135,7 +126,10 @@ namespace
     std::atomic<bool>  g_slung{ false };
     // bowsling (FarCry5Bow.h): where the manual bow is. 0 on the sling, 1 held by the left grip (back on the sling when it is let go), 2 in the left
     // hand after a right grip took it at the sling (or a shoulder switch to it with the grip held), until a left grip press is let go.
+    // bowrighthand (FarCry5Bow.h; author 11 Nov): 3 in the right (weapon) hand while the right grip that took it is held (back on the sling when it
+    // is let go), placed upright on that controller as the left hand holds it; 2 is then never set.
     int                g_bow_hold = 0;
+    std::atomic<bool>  g_bow_wh{ false };   // bowrighthand: g_bow_hold 3 at the last poll (read by update_motion)
     // twohandkeep (Gesture.h): the weapon left in the other hand when the weapon hand lets go during the two-handed hold.
     std::atomic<bool>  g_keep_on{ true };          // twohandkeep on|off (saved)
     std::atomic<float> g_keep_zone{ 0.15f };       // twohandkeepzone m (saved): the right grip takes it back this close to its grip
@@ -229,7 +223,7 @@ namespace
     std::atomic<bool>                   g_sh_keys{ true };   // shoulderkeys on|off (saved)
     // gamedrawgrab on|off (saved, default off; 3 Nov, research\2026-11-02_throwables.md; author 30 Oct): a hip, sling or shoulder grab asks the game for the very
     // weapon (FarCry5Lua game_draw, the inventory's own change, 64-250 ms in the simulator), once the mod has seen the game hold it and knows its item; otherwise, and if nothing has come in 1.3 s at the hip, as before.
-    std::atomic<bool>                   g_game_draw{ false };
+    std::atomic<bool>                   g_game_draw{ true };   // on since the 13 Nov clean-up (always; was on in every release through FarCry5Defaults.h)
     std::atomic<bool>                   g_ls_on{ true };       // loadslot on|off (saved)
     bool                                g_ls_pending = true;   // a load (or the start) not yet followed by loadslot's check
     clock::time_point                   g_ls_on_t{}, g_ls_since{};   // last poll on foot with motion controls; playable since
@@ -280,7 +274,7 @@ namespace
     std::atomic<int>   g_padfire_pulse{ 0 };
     clock::time_point  g_padfire_t0{}, g_padfire_until{};
     std::atomic<uint32_t> g_switch_count{ 0 };   // weapon_switch_count(): weapon-switch gestures fired, plus note_weapon_switch() calls
-    std::atomic<bool>     g_switch_grab{ false };   // set_switch_grab(): a switch gesture's grip press holds the weapon (sling on)
+    std::atomic<bool>     g_switch_grab{ true };   // set_switch_grab(): a switch gesture's grip press holds the weapon (sling on); on with shoulderdraw, always on since 13 Nov
     std::atomic<bool>  g_tt_req{ false };
     std::atomic<float> g_tt_v[3]{};
     std::atomic<int>   g_tt_ms{ 150 }, g_tt_hold{ 600 };
@@ -355,7 +349,7 @@ namespace
     // The neck's pivot from the eyes (head frame: down, back; m): the shoulders hang from it in the body's frame, so turning or
     // tilting the head does not move them (author 24 Oct 13:29). Body frame: x right, y up, +z back at body yaw 0; with the head level and facing the body's heading this is
     // the old point (side / below the eyes / behind the eyes), so gestureshoulder keeps its meaning. side = +1 the right shoulder, -1 the left.
-    constexpr float kNeckDown = kNeckPivotDown, kNeckBack = kNeckPivotBack;   // FarCry5Gesture.h (armik hangs its shoulders there too)
+    constexpr float kNeckDown = kNeckPivotDown, kNeckBack = kNeckPivotBack;   // FarCry5Gesture.h (bodyik hangs its body there too)
     glm::vec3 shoulder(const glm::mat4& head, float side)
     {
         const glm::vec3 neck = glm::vec3{ head[3] } + glm::mat3{ head } * glm::vec3{ 0.0f, -kNeckDown, kNeckBack };
@@ -491,6 +485,41 @@ namespace
     }
 }
 
+namespace
+{
+    // bodyikworn (set_carry_anchor): each carried thing's place on the drawn body, as a move from the eyes on the body's heading, and when it
+    // was last given.
+    std::mutex                            g_carry_mtx;
+    glm::mat4                             g_carry[kCarryParts]{ glm::mat4{ 1.0f }, glm::mat4{ 1.0f }, glm::mat4{ 1.0f }, glm::mat4{ 1.0f } };
+    bool                                  g_carry_on{ false };
+    std::chrono::steady_clock::time_point g_carry_t{};
+
+    // Where a carried thing is placed from (tracking space): the eyes on the body's heading. Worn (bodyikworn given within 0.25 s): its whole
+    // place on the body instead, and true (the caller adds no offset from the eyes, only its angles).
+    bool carry_base(const glm::mat4& head, int part, glm::mat4& b)
+    {
+        b = glm::translate(glm::mat4{ 1.0f }, glm::vec3{ head[3] }) * glm::rotate(glm::mat4{ 1.0f }, g_body_yaw.load(), glm::vec3{ 0.0f, 1.0f, 0.0f });
+        std::lock_guard _{ g_carry_mtx };
+        if (!g_carry_on || std::chrono::steady_clock::now() - g_carry_t >= std::chrono::milliseconds(250)) return false;
+        b = b * g_carry[std::clamp(part, 0, int(kCarryParts) - 1)];
+        return true;
+    }
+}
+
+void set_carry_anchor(bool on, const glm::mat4 (&rel)[kCarryParts])
+{
+    std::lock_guard _{ g_carry_mtx };
+    g_carry_on = on;
+    for (int i = 0; i < kCarryParts; ++i) g_carry[i] = rel[i];
+    g_carry_t = std::chrono::steady_clock::now();
+}
+
+bool carry_anchored()
+{
+    std::lock_guard _{ g_carry_mtx };
+    return g_carry_on && std::chrono::steady_clock::now() - g_carry_t < std::chrono::milliseconds(250);
+}
+
 void throw_zone_set(float x, float y, float z, float r)
 {
     g_tz[0] = x;
@@ -501,18 +530,25 @@ void throw_zone_set(float x, float y, float z, float r)
 
 glm::mat4 throw_pose(const glm::mat4& head, bool mirror)
 {
-    const float     m    = mirror ? 1.0f : -1.0f;   // the other hand's side: the left (the right when left-handed)
-    const glm::mat4 body = glm::rotate(glm::mat4{ 1.0f }, g_body_yaw.load(), glm::vec3{ 0.0f, 1.0f, 0.0f });
-    return glm::translate(glm::mat4{ 1.0f }, glm::vec3{ head[3] }) * body *
-           glm::translate(glm::mat4{ 1.0f }, glm::vec3{ m * g_th_pos[0].load(), -g_th_pos[1].load(), -g_th_pos[2].load() });
+    const float m = mirror ? 1.0f : -1.0f;   // the other hand's side: the left (the right when left-handed)
+    glm::mat4   b;
+    if (carry_base(head, kCarryPouch, b)) return b;   // bodyikworn: on the drawn chest
+    return b * glm::translate(glm::mat4{ 1.0f }, glm::vec3{ m * g_th_pos[0].load(), -g_th_pos[1].load(), -g_th_pos[2].load() });
+}
+
+glm::mat3 sling_rot_turn(bool mirror)
+{
+    const float m = mirror ? -1.0f : 1.0f;
+    return glm::mat3{ glm::rotate(glm::mat4{ 1.0f }, glm::radians(m * g_sl_rot[0].load()), glm::vec3{ 0, 1, 0 }) *
+                      glm::rotate(glm::mat4{ 1.0f }, glm::radians(g_sl_rot[1].load()), glm::vec3{ 1, 0, 0 }) *
+                      glm::rotate(glm::mat4{ 1.0f }, glm::radians(m * g_sl_rot[2].load()), glm::vec3{ 0, 0, -1 }) };
 }
 
 glm::mat4 sling_pose(const glm::mat4& head, bool mirror)
 {
-    const float     m    = mirror ? -1.0f : 1.0f;
-    const glm::mat4 body = glm::rotate(glm::mat4{ 1.0f }, g_body_yaw.load(), glm::vec3{ 0.0f, 1.0f, 0.0f });
-    glm::mat4       p    = glm::translate(glm::mat4{ 1.0f }, glm::vec3{ head[3] }) * body *
-                    glm::translate(glm::mat4{ 1.0f }, glm::vec3{ m * g_sl_pos[0].load(), -g_sl_pos[1].load(), -g_sl_pos[2].load() });
+    const float m = mirror ? -1.0f : 1.0f;
+    glm::mat4   p;
+    if (!carry_base(head, kCarrySling, p)) p = p * glm::translate(glm::mat4{ 1.0f }, glm::vec3{ m * g_sl_pos[0].load(), -g_sl_pos[1].load(), -g_sl_pos[2].load() });
     p = p * glm::rotate(glm::mat4{ 1.0f }, glm::radians(m * g_sl_rot[0].load()), glm::vec3{ 0, 1, 0 }) *
         glm::rotate(glm::mat4{ 1.0f }, glm::radians(g_sl_rot[1].load()), glm::vec3{ 1, 0, 0 }) *
         glm::rotate(glm::mat4{ 1.0f }, glm::radians(m * g_sl_rot[2].load()), glm::vec3{ 0, 0, -1 });
@@ -521,10 +557,9 @@ glm::mat4 sling_pose(const glm::mat4& head, bool mirror)
 
 glm::mat4 hip_pose(const glm::mat4& head, bool mirror)
 {
-    const float     m    = mirror ? -1.0f : 1.0f;
-    const glm::mat4 body = glm::rotate(glm::mat4{ 1.0f }, g_body_yaw.load(), glm::vec3{ 0.0f, 1.0f, 0.0f });
-    glm::mat4       p    = glm::translate(glm::mat4{ 1.0f }, glm::vec3{ head[3] }) * body *
-                    glm::translate(glm::mat4{ 1.0f }, glm::vec3{ m * g_hp_pos[0].load(), -g_hp_pos[1].load(), -g_hp_pos[2].load() });
+    const float m = mirror ? -1.0f : 1.0f;
+    glm::mat4   p;
+    if (!carry_base(head, kCarryHolster, p)) p = p * glm::translate(glm::mat4{ 1.0f }, glm::vec3{ m * g_hp_pos[0].load(), -g_hp_pos[1].load(), -g_hp_pos[2].load() });
     p = p * glm::rotate(glm::mat4{ 1.0f }, glm::radians(m * g_hp_rot[0].load()), glm::vec3{ 0, 1, 0 }) *
         glm::rotate(glm::mat4{ 1.0f }, glm::radians(g_hp_rot[1].load()), glm::vec3{ 1, 0, 0 }) *
         glm::rotate(glm::mat4{ 1.0f }, glm::radians(m * g_hp_rot[2].load()), glm::vec3{ 0, 0, -1 });
@@ -536,6 +571,12 @@ glm::vec3 pouch_pos(const glm::mat4& head, bool mirror, glm::vec3& fwd)
     float p[3];
     fc5::reload::get_pouch(p);
     const float     m    = mirror ? -1.0f : 1.0f;   // reloadpouch's right is the weapon hand's side (its default, -0.22, the other hand's)
+    // bodyikworn: at the drawn belt, facing the body's heading (the place's -z).
+    glm::mat4 wb;
+    if (carry_base(head, kCarryMag, wb)) {
+        fwd = glm::normalize(glm::vec3{ wb * glm::vec4{ 0.0f, 0.0f, -1.0f, 0.0f } });
+        return glm::vec3{ wb[3] };
+    }
     if (fc5::reload::pouch_neck()) {
         // reloadpouchneck: from the neck (the head's pitch and roll no longer move it), on the pouch's own heading; the same point as before with
         // the head level and facing that heading.
@@ -632,7 +673,7 @@ Output update(const Input& in_game)
     // this poll's zones see the last poll's hold.
     const bool bow_sling  = bow_listed && fc5::bow::sling_on() && g_state[kSling].on.load();
     if (!in.bow && g_bow_hold != 0) g_bow_hold = 0;   // not the bow any more: on the sling when it comes back (kept through a menu or a load)
-    bool       bow_on     = bow_listed && (!bow_sling || g_bow_hold != 0);
+    bool       bow_on     = bow_listed && (!bow_sling || g_bow_hold == 1 || g_bow_hold == 2);   // (bowrighthand's 3: not the manual bow)
     // bowquivergrip (FarCry5Bow.h): the weapon hand's shoulder is the quiver only with the bow in hand and the other hand's grip held; otherwise
     // its weapon slot (set again below once this poll's sling hold is known).
     bool       quiver     = bow_on && (!fc5::bow::quiver_grip() || in.hand[kOtherHand].grip);
@@ -683,6 +724,9 @@ Output update(const Input& in_game)
                                               glm::rotate(glm::mat4{ 1.0f }, glm::radians(sh[2]), glm::vec3{ 0, 0, -1 }) };
             bc = glm::vec3{ sp[3] };
             ba = glm::normalize(glm::mat3{ sp } * hold * glm::vec3{ 0.0f, 1.0f, 0.0f });
+            // bowslingbody (FarCry5Bow.h): across the body instead, whatever slingrot turns the slung guns by.
+            if (fc5::bow::sling_body())
+                ba = glm::normalize(glm::mat3{ sp } * glm::transpose(sling_rot_turn(in.mirror)) * fc5::bow::sling_body_turn(in.mirror) * glm::vec3{ 0.0f, 1.0f, 0.0f });
         }
         // A hand inside another of its zones (the chest throwable with throwv2hand left) keeps its press for that zone.
         auto in_other = [&](int h) {
@@ -712,17 +756,30 @@ Output update(const Input& in_game)
                 spdlog::info("[Bow] bowsling: left grip pressed {:.2f} m from the sling (zone {:.2f} m), {:.2f} m from the bow's limbs (bowslinggrab {:.2f} m): the bow in the left hand while the grip is held",
                              dl, r, ll, rg);
             } else if (pressed[kWeaponHand] && active[kSling] && dr >= 0.0f && dr < r) {
-                g_bow_hold           = 2;
                 pressed[kWeaponHand] = false;
-                buzz(out, kOtherHand, kFireAmp, kFireSec);
-                buzz(out, kWeaponHand, kEnterAmp, kEnterSec);
-                spdlog::info("[Bow] bowsling: right grip pressed {:.2f} m from the sling (zone {:.2f} m): the bow put in the left hand until the left grip is pressed and let go", dr, r);
+                if (fc5::bow::right_hand()) {
+                    // bowrighthand: the bow stays in the right hand that took it, while its grip is held.
+                    g_bow_hold = 3;
+                    buzz(out, kWeaponHand, kFireAmp, kFireSec);
+                    spdlog::info("[Bow] bowsling: right grip pressed {:.2f} m from the sling (zone {:.2f} m): the bow in the right hand while the grip is held (bowrighthand)", dr, r);
+                } else {
+                    g_bow_hold = 2;
+                    buzz(out, kOtherHand, kFireAmp, kFireSec);
+                    buzz(out, kWeaponHand, kEnterAmp, kEnterSec);
+                    spdlog::info("[Bow] bowsling: right grip pressed {:.2f} m from the sling (zone {:.2f} m): the bow put in the left hand until the left grip is pressed and let go", dr, r);
+                }
             } else if (g_state[kSling].owned && in.hand[kWeaponHand].grip) {
                 // shoulderdraw's grab (a shoulder switch to the bow with the grip held), or a sling grab that switched to it.
-                g_bow_hold             = 2;
                 g_state[kSling].owned = false;
-                buzz(out, kOtherHand, kFireAmp, kFireSec);
-                spdlog::info("[Bow] bowsling: the bow came with the right grip held (a switch grab): put in the left hand until the left grip is pressed and let go");
+                if (fc5::bow::right_hand()) {
+                    g_bow_hold = 3;
+                    buzz(out, kWeaponHand, kFireAmp, kFireSec);
+                    spdlog::info("[Bow] bowsling: the bow came with the right grip held (a switch grab): in the right hand while the grip is held (bowrighthand)");
+                } else {
+                    g_bow_hold = 2;
+                    buzz(out, kOtherHand, kFireAmp, kFireSec);
+                    spdlog::info("[Bow] bowsling: the bow came with the right grip held (a switch grab): put in the left hand until the left grip is pressed and let go");
+                }
             }
         } else if (g_bow_hold == 1) {
             if (!lh.grip) {
@@ -735,6 +792,11 @@ Output update(const Input& in_game)
                 pressed[kOtherHand] = false;
                 spdlog::info("[Bow] bowsling: left grip pressed: the bow held by it, back on the sling when it is let go");
             }
+        } else if (g_bow_hold == 3) {
+            if (!in.hand[kWeaponHand].grip) {
+                g_bow_hold = 0;
+                spdlog::info("[Bow] bowsling: right grip let go: the bow back on the sling");
+            }
         }
         if (g_bow_hold == 0) {
             // A press near the slung bow that did not take it: where it was, for the next log (none of these was logged before).
@@ -745,12 +807,16 @@ Output update(const Input& in_game)
                 spdlog::info("[Bow] bowsling: right grip pressed {:.2f} m from the sling (zone {:.2f} m): not the bow's", dr, r);
         }
         if (g_bow_hold == 1) out.grip_taken[kOtherHand] = true;
-        if (g_bow_hold == 0 && was != 0) buzz(out, kOtherHand, kEnterAmp, kEnterSec);
-        bow_on = g_bow_hold != 0;
+        if (g_bow_hold == 3) out.grip_taken[kWeaponHand] = true;   // bowrighthand: the right grip holds the bow (no zone, no modifier)
+        if (g_bow_hold == 0 && was != 0) buzz(out, was == 3 ? kWeaponHand : kOtherHand, kEnterAmp, kEnterSec);
+        // bowrighthand: in the right hand the manual bow is not active (no quiver, no hand-drawn string): the game's own fire (RT) draws and
+        // looses it, as with a gun.
+        bow_on = g_bow_hold == 1 || g_bow_hold == 2;
         quiver = bow_on && (!fc5::bow::quiver_grip() || in.hand[kOtherHand].grip);
     } else if (!in.bow || !fc5::bow::sling_on() || !g_state[kSling].on.load()) {
         g_bow_hold = 0;   // no bow, or the bow not on the sling (bowsling or the sling off): always in the left hand as before
     }
+    g_bow_wh = bow_sling && g_bow_hold == 3;
     // twohandkeep: the weapon hand's grip let go this poll while the two-handed hold has the weapon: the weapon stays in the other hand, held as
     // it was (the weapon hand's controller in the other one's axes, fixed now). Ends when the other grip is let go (to the sling or the hip), a
     // grab takes it again (below: near the weapon's grip, or the sling's or hip's zone), or it can no longer be held (a vehicle, a menu, no
@@ -853,7 +919,7 @@ Output update(const Input& in_game)
         // is not the usual grip (no two-handed hold, no modifier).
         fc5::reload::In ri{};
         ri.listed   = in.reload && fc5::reload::on();
-        ri.active   = ri.listed && in.allowed && in.weapon && !g_slung.load() && !bow_on;   // (the sling's state of the last poll)
+        ri.active   = ri.listed && in.allowed && in.weapon && !g_slung.load() && !bow_on && g_bow_hold != 3;   // (the sling's state of the last poll)
         ri.sig      = in.sig;
         ri.gun_pos  = in.weapon_draw_rot_ok ? in.weapon_draw_pos : in.hand[kWeaponHand].pos;   // stockeye: the gun moved off the controller
         ri.gun_rot  = in.weapon_draw_rot_ok ? in.weapon_draw_rot : in.weapon_rot;   // reloadzonesfollow: the gun as drawn (gunstock calibration, two hands)
@@ -1446,7 +1512,8 @@ Output update(const Input& in_game)
     }
     // manualbow: the bow is in the other hand, never on the sling (the weapon hand's grip takes arrows and draws the string); with bowsling it hangs
     // there whenever the left hand does not hold it (g_bow_hold), whatever the weapon hand holds.
-    const bool  slung = g_state[kSling].on.load() && in.allowed && in.weapon && !bow_on && (bow_sling || !(held && g_sw_want.load() < 0));
+    // bowrighthand: the bow in the right hand (g_bow_hold 3) is in the hand, not on the sling.
+    const bool  slung = g_state[kSling].on.load() && in.allowed && in.weapon && !bow_on && g_bow_hold != 3 && (bow_sling || !(held && g_sw_want.load() < 0));
     if (slung != g_slung.load()) spdlog::info("[Gesture] sling: the weapon {}", slung ? "hangs on the sling" : "is in the hand");
     g_slung   = slung;
     out.slung = slung;
@@ -1989,6 +2056,7 @@ bool hand_point(int hand, glm::vec3& pos)
 }
 bool slung() { return g_slung.load(); }
 bool kept() { return g_keep.load(); }
+bool bow_weapon_hand() { return g_bow_wh.load(); }
 bool keep_on() { return g_keep_on.load(); }
 float keep_zone() { return g_keep_zone.load(); }
 bool sling_on() { init(); return g_state[kSling].on.load(); }

@@ -11,7 +11,7 @@
 
 namespace fc5::gputime
 {
-    enum Stage : int { kPair = 0, kGameCall, kExtraCall, kDlssPrep, kDlssEval, kCompose, kAim, kScopeCall, kCount };
+    enum Stage : int { kPair = 0, kGameCall, kExtraCall, kDlssPrep, kDlssEval, kCompose, kAim, kScopeCall, kDlssFovea, kCount };   // kDlssFovea (dlssfovea): the periphery pass and the blend
 
     void set_enabled(bool on);
     bool enabled();

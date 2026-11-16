@@ -11,12 +11,6 @@
 // Terrain presets' VirtualTextureLODBias (high 0.0): the terrain's virtual texture does not use the sampler mip bias (mipbias).
 // Since 6 Nov (texdetail) vtbias is no setting of its own: it follows the saved mipbias (F11 Display "Texture detail" sets both).
 // Both off by default; each one alone also builds the changed config.
-// perf switches (performance thread, author 6 Nov 2026, research\2026-11-06_perf): game render
-// costs that Stereo pays twice per pair (each eye's call renders the whole frame), each set one step down in the same config:
-// perfleafshadow (tree leaves cast into one shadow cascade, as at medium), perfgrassshadow (grass shadows only in the nearest
-// cascade, as at very high), perflampshadow (local light shadow maps updated once per call instead of twice: per picture as on
-// the flat screen), perfsoftshadow (PCSS soft shadow filter level 1), perfreflect (screen-space reflections mode 2, as at high),
-// perffog (volumetric fog 196 instead of 256, as at medium). Each off by default (the game's values); saved; next start.
 // sunranges (shadow clarity, 7 Nov 2026, research\2026-11-07_shadow_clarity.md): the Shadow presets' SunShadowRange0/1/2, the far
 // distance of each sun cascade (game 4 / 11 / 30 m; only "low" names them, the others use the code's defaults), set or added in every
 // preset but the cinematic and editor ones. Test, off by default; saved; next start.
@@ -63,13 +57,11 @@ namespace
     std::atomic<float> g_vt_bias{ 0.0f };                // vtbias: the setting (next start), 0 = the game's
     int                g_shadow_active = 0;              // this run's
     float              g_vt_active     = 0.0f;
-    std::atomic<int>   g_perf{ 0 };                      // perf switches: the setting (next start), bits of kPerf
     std::mutex         g_ranges_mx;                      // guards g_ranges (commands and the F11 menu)
     std::string        g_ranges        = "off";          // sunranges: the setting (next start), "off" or "a/b/c"
     std::string        g_ranges_active = "off";          // this run's (written once at the start)
     std::atomic<bool>  g_lowsun{ true };                 // lowsuncsm: the setting (next start); on by default
     bool               g_lowsun_active = false;          // this run's
-    int                g_perf_active   = 0;              // this run's
     bool               g_built         = false;          // this run's config is the changed one
     std::string        g_why    = "off";
     std::wstring       g_dat;                            // full path of the archive holding the entry
@@ -287,95 +279,6 @@ namespace
         return log;
     }
 
-    // Each <quality ...> tag of <section> (cinematic and editor presets left alone): key set to want where the tag has a larger
-    // value, or added where the tag has none and add is true (the game's default for it is larger). Returns the changes made; "!"
-    // when the section is not there.
-    std::string lower_section(std::string& t, const char* section, const char* key, double want, bool add)
-    {
-        const std::string open = std::string{ "<" } + section + ">", close = std::string{ "</" } + section + ">";
-        const size_t      s0 = t.find(open), s1 = t.find(close);
-        if (s0 == std::string::npos || s1 == std::string::npos || s1 < s0) return "!";
-        std::string      sec = t.substr(s0, s1 - s0), out, log;
-        size_t           pos = 0;
-        const std::regex rk{ std::string{ "(\\s)" } + key + "\\s*=\\s*\"([-0-9.]+)\"" };
-        const std::string wv = fmt::format("{}", want);
-        while (true) {
-            const size_t q = sec.find("<quality", pos);
-            if (q == std::string::npos) break;
-            const size_t e = sec.find('>', q);
-            if (e == std::string::npos) return "!";
-            out += sec.substr(pos, q - pos);
-            std::string tag = sec.substr(q, e - q);   // without '>' ('/' kept at the end of a closed tag)
-            std::smatch m;
-            const std::string id = std::regex_search(tag, m, std::regex{ R"re(id\s*=\s*"([^"]*)")re" }) ? m[1].str() : "?";
-            const bool skip = id.rfind("cinematic", 0) == 0 || id == "editor" || id == "off";
-            if (!skip && std::regex_search(tag, m, rk)) {
-                if (std::strtod(m[2].str().c_str(), nullptr) > want) {
-                    tag = m.prefix().str() + m[1].str() + key + "=\"" + wv + "\"" + m.suffix().str();
-                    log += fmt::format(" {} {} {} -> {};", id, key, m[2].str(), wv);
-                }
-            } else if (!skip && add) {
-                const bool closed = !tag.empty() && tag.back() == '/';
-                if (closed) tag.pop_back();
-                while (!tag.empty() && (tag.back() == ' ' || tag.back() == '\t' || tag.back() == '\r' || tag.back() == '\n')) tag.pop_back();
-                tag += std::string{ " " } + key + "=\"" + wv + "\"" + (closed ? " /" : " ");
-                log += fmt::format(" {} {} (default) -> {};", id, key, wv);
-            }
-            out += tag + ">";
-            pos = e + 1;
-        }
-        out += sec.substr(pos);
-        t = t.substr(0, s0) + out + t.substr(s1);
-        return log;
-    }
-
-    // The perf switches: command, bit, section, key, the value one step down, added where missing (the game's default is larger).
-    struct PerfKey { const char* cmd; int bit; const char* section; const char* key; double want; bool add; const char* what; };
-    constexpr PerfKey kPerf[] = {
-        { "perfleafshadow", 1, "Shadow", "ForceLeafSingleSlice", 0.0, false, "leaves in one shadow cascade" },   // special: set to 1 (below)
-        { "perfgrassshadow", 2, "Shadow", "LastGrassShadowCascade", 0.0, false, "grass shadows in the nearest cascade only" },
-        { "perflampshadow", 4, "Shadow", "LLSMFrameDynamicUpdates", 1.0, true, "lamp shadow maps updated once per call" },
-        { "perfsoftshadow", 8, "Shadow", "PCSSQuality", 1.0, false, "soft shadow filter level 1" },
-        { "perfreflect", 16, "Environment", "SSLRMode", 2.0, false, "screen-space reflections mode 2" },
-        { "perffog", 32, "VolumetricFog", "VolumetricFogValue", 196.0, false, "volumetric fog 196" },
-    };
-
-    // ForceLeafSingleSlice is a flag where 1 is the cheaper one (low and medium): set to 1 where it is 0, added where missing.
-    std::string leaf_single_slice(std::string& t)
-    {
-        const size_t s0 = t.find("<Shadow>"), s1 = t.find("</Shadow>");
-        if (s0 == std::string::npos || s1 == std::string::npos || s1 < s0) return "!";
-        std::string      sec = t.substr(s0, s1 - s0), out, log;
-        size_t           pos = 0;
-        const std::regex rk{ R"re((\s)ForceLeafSingleSlice\s*=\s*"([0-9]+)")re" };
-        while (true) {
-            const size_t q = sec.find("<quality", pos);
-            if (q == std::string::npos) break;
-            const size_t e = sec.find('>', q);
-            if (e == std::string::npos) return "!";
-            out += sec.substr(pos, q - pos);
-            std::string tag = sec.substr(q, e - q);
-            std::smatch m;
-            const std::string id = std::regex_search(tag, m, std::regex{ R"re(id\s*=\s*"([^"]*)")re" }) ? m[1].str() : "?";
-            if (id.rfind("cinematic", 0) != 0 && id != "editor") {
-                if (std::regex_search(tag, m, rk)) {
-                    if (m[2].str() != "1") { tag = m.prefix().str() + m[1].str() + "ForceLeafSingleSlice=\"1\"" + m.suffix().str(); log += fmt::format(" {} ForceLeafSingleSlice {} -> 1;", id, m[2].str()); }
-                } else {
-                    const bool closed = !tag.empty() && tag.back() == '/';
-                    if (closed) tag.pop_back();
-                    while (!tag.empty() && (tag.back() == ' ' || tag.back() == '\t' || tag.back() == '\r' || tag.back() == '\n')) tag.pop_back();
-                    tag += std::string{ " ForceLeafSingleSlice=\"1\"" } + (closed ? " /" : " ");
-                    log += fmt::format(" {} ForceLeafSingleSlice (0) -> 1;", id);
-                }
-            }
-            out += tag + ">";
-            pos = e + 1;
-        }
-        out += sec.substr(pos);
-        t = t.substr(0, s0) + out + t.substr(s1);
-        return log;
-    }
-
     // Each <quality ...> tag of <section> (cinematic, editor and off presets left alone): key set to value, added where the tag has
     // none. Returns the changes made; "!" when the section is not there.
     std::string set_section(std::string& t, const char* section, const char* key, const std::string& value)
@@ -426,15 +329,8 @@ namespace
         return fmt::format("{:g}/{:g}/{:g}", r[0], r[1], r[2]);
     }
 
-    std::string perf_names(int bits)
-    {
-        std::string s;
-        for (const auto& k : kPerf) if (bits & k.bit) s += (s.empty() ? "" : ", ") + std::string{ k.what };
-        return s.empty() ? std::string{ "off" } : s;
-    }
-
-    // lodfov, shadowres, vtbias and the perf switches, those set. Returns the changes made, empty with g_why set when one could not be made.
-    std::string change_all(std::string& t, float s, int shadow, float vt, int perf, const std::string& ranges, bool lowsun)
+    // lodfov, shadowres, vtbias, sunranges and lowsuncsm, those set. Returns the changes made, empty with g_why set when one could not be made.
+    std::string change_all(std::string& t, float s, int shadow, float vt, const std::string& ranges, bool lowsun)
     {
         std::string log;
         if (s > 0.0f && std::abs(s - 1.0f) >= 1e-3f) {
@@ -468,13 +364,6 @@ namespace
             if (c == "!") { g_why = "the config has no Shadow section (lowsuncsm)"; return {}; }
             log += c.empty() ? std::string{ " lowsuncsm: nothing to change;" } : c;
         }
-        for (const auto& k : kPerf) {
-            if (!(perf & k.bit)) continue;
-            const std::string c = k.bit == 1 ? leaf_single_slice(t) : lower_section(t, k.section, k.key, k.want, k.add);
-            if (c == "!") { g_why = fmt::format("the config has no {} section ({})", k.section, k.cmd); return {}; }
-            // Nothing to change (already at that step or below) is not a failure: the switch then does nothing.
-            log += c.empty() ? fmt::format(" {}: nothing to change;", k.cmd) : c;
-        }
         return log;
     }
 
@@ -500,7 +389,7 @@ namespace
         return t.size() == want;
     }
 
-    bool build(float s, int shadow, float vt, int perf, const std::string& ranges, bool lowsun)
+    bool build(float s, int shadow, float vt, const std::string& ranges, bool lowsun)
     {
         const std::wstring dir = std::filesystem::path{ fc5::exe_dir() }.parent_path().parent_path().wstring() + L"\\data_final\\pc\\";
         // patch.dat would override common.dat: the entry is looked for there first.
@@ -512,7 +401,7 @@ namespace
         std::vector<uint8_t> plain;
         if (comp.size() != g_csize || !lz4_decode(comp.data(), comp.size(), plain, g_usize)) { g_why = "the config entry did not decompress"; return false; }
         std::string t{ plain.begin(), plain.end() };
-        const std::string changes = change_all(t, s, shadow, vt, perf, ranges, lowsun);
+        const std::string changes = change_all(t, s, shadow, vt, ranges, lowsun);
         if (changes.empty()) return false;
         if (!fit_text(t, g_usize)) { g_why = "no room in the config's comments"; return false; }
         std::vector<uint8_t> nt{ t.begin(), t.end() };
@@ -524,9 +413,9 @@ namespace
         g_block = lz4_write(q, nt);
         std::vector<uint8_t> check;
         if (g_block.size() != g_csize || !lz4_decode(g_block.data(), g_block.size(), check, g_usize) || check != nt) { g_why = "the changed config did not check out"; g_block.clear(); return false; }
-        g_why = fmt::format("lodfov {}, shadowres {}, vtbias {}, perf {}, sunranges {}, lowsuncsm {} ({}):{}", s > 0.0f ? "x" + fmt_scale(s) : std::string{ "off" },
+        g_why = fmt::format("lodfov {}, shadowres {}, vtbias {}, sunranges {}, lowsuncsm {} ({}):{}", s > 0.0f ? "x" + fmt_scale(s) : std::string{ "off" },
                             shadow > 0 ? std::to_string(shadow) : std::string{ "off" }, vt != 0.0f ? fmt::format("{:+.2f}", vt) : std::string{ "off" },
-                            perf_names(perf), ranges, lowsun ? "on" : "off", std::filesystem::path{ g_dat }.filename().string(), changes);
+                            ranges, lowsun ? "on" : "off", std::filesystem::path{ g_dat }.filename().string(), changes);
         return true;
     }
 
@@ -693,25 +582,23 @@ void install_early()
         else if (cmd == "lowsuncsm") g_lowsun = arg == "on";
         else if (cmd == "mipbias") vt_mip = parse_vt(arg);
         else if (cmd == "vtbias") vt_old = parse_vt(arg);
-        else for (const auto& k : kPerf) if (cmd == k.cmd) g_perf = arg == "on" ? (g_perf.load() | k.bit) : (g_perf.load() & ~k.bit);
     }
     g_vt_bias = std::min(vt_mip, vt_old);
     float       s  = g_scale.load();
     const int   sh = g_shadow_res.load();
     const float vt = g_vt_bias.load();
-    const int   pf = g_perf.load();
     if (s <= 0.0f || std::abs(s - 1.0f) < 1e-3f) s = 0.0f;
     std::string rg;
     { std::lock_guard lk{ g_ranges_mx }; rg = g_ranges; }
     const bool ls = g_lowsun.load();
-    if (s <= 0.0f && sh <= 0 && vt == 0.0f && pf == 0 && rg == "off" && !ls) { spdlog::info("[LodFov] lodfov, shadowres, vtbias, sunranges, lowsuncsm and the perf switches off: the game's own render config"); return; }
-    if (!build(s, sh, vt, pf, rg, ls)) {
-        spdlog::warn("[LodFov] lodfov {} / shadowres {} / vtbias {:+.2f} / perf {} / sunranges {} / lowsuncsm {}: not used, {}", fmt_scale(s), sh, vt, perf_names(pf), rg,
+    if (s <= 0.0f && sh <= 0 && vt == 0.0f && rg == "off" && !ls) { spdlog::info("[LodFov] lodfov, shadowres, vtbias, sunranges and lowsuncsm off: the game's own render config"); return; }
+    if (!build(s, sh, vt, rg, ls)) {
+        spdlog::warn("[LodFov] lodfov {} / shadowres {} / vtbias {:+.2f} / sunranges {} / lowsuncsm {}: not used, {}", fmt_scale(s), sh, vt, rg,
                      ls ? "on" : "off", g_why);
         if (rg == "off" && !ls) return;
         // sunranges and lowsuncsm are tests: without them the other settings still get their changed config.
-        if (s <= 0.0f && sh <= 0 && vt == 0.0f && pf == 0) return;
-        if (!build(s, sh, vt, pf, "off", false)) { spdlog::warn("[LodFov] without sunranges and lowsuncsm: not used either, {}", g_why); return; }
+        if (s <= 0.0f && sh <= 0 && vt == 0.0f) return;
+        if (!build(s, sh, vt, "off", false)) { spdlog::warn("[LodFov] without sunranges and lowsuncsm: not used either, {}", g_why); return; }
         spdlog::info("[LodFov] built without sunranges and lowsuncsm");
     } else {
         g_ranges_active = rg;
@@ -721,7 +608,6 @@ void install_early()
     g_active        = s;
     g_shadow_active = sh;
     g_vt_active     = vt;
-    g_perf_active   = pf;
     g_built         = true;
     spdlog::info("[LodFov] lodfov {}: changed render config ready ({} bytes at {} in {}, {} bytes of text): {}", fmt_scale(s), g_csize, g_off,
                  std::filesystem::path{ g_dat }.filename().string(), g_usize, g_why);
@@ -772,34 +658,12 @@ void set_vt_bias(const std::string& arg)
 float vt_bias() { return g_vt_bias.load(); }
 float vt_bias_active() { return g_vt_active; }
 
-bool perf_command(const std::string& cmd, const std::string& arg)
-{
-    for (const auto& k : kPerf) {
-        if (cmd != k.cmd) continue;
-        if (arg == "on") g_perf = g_perf.load() | k.bit;
-        else if (arg == "off" || arg.empty()) g_perf = g_perf.load() & ~k.bit;
-        else return true;
-        spdlog::info("[LodFov] {} {} saved ({}): used from the next game start (this run: {})", k.cmd, (g_perf.load() & k.bit) ? "on" : "off", k.what,
-                     (g_perf_active & k.bit) ? "on" : "off");
-        return true;
-    }
-    return false;
-}
-int perf() { return g_perf.load(); }
-int perf_active() { return g_perf_active; }
-int perf_bit(const char* cmd)
-{
-    for (const auto& k : kPerf) if (std::strcmp(cmd, k.cmd) == 0) return k.bit;
-    return 0;
-}
-
 std::string describe()
 {
     if (!g_built) return "off";
     std::string s = g_active > 0.0f ? "x" + fmt_scale(g_active) : std::string{ "LOD off" };
     if (g_shadow_active > 0) s += fmt::format(", sun shadow maps {}", g_shadow_active);
     if (g_vt_active != 0.0f) s += fmt::format(", ground texture bias {:+.2f}", g_vt_active);
-    if (g_perf_active != 0) s += ", " + perf_names(g_perf_active);
     if (g_ranges_active != "off") s += ", sun cascades end at " + g_ranges_active + " m";
     if (g_lowsun_active) s += ", three sun cascades in the evening and at night (lowsuncsm)";
     return fmt::format("{}, given to the game {} times", s, g_patched.load());

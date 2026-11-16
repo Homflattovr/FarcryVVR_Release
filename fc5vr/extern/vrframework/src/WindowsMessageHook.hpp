@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 
 #include <Windows.h>
@@ -52,6 +53,9 @@ public:
     WindowsMessageHook& operator=(const WindowsMessageHook&& other) = delete;
 
     bool is_hook_intact();
+
+    // How many messages have reached our window procedure, by any route (also through another module's procedure on top of ours).
+    static uint32_t calls();
 
 private:
     HWND m_wnd;

@@ -108,6 +108,7 @@ namespace fc5::bow
     // string's full draw.
     bool  pull_on();
     float pull_frac();                          // the hand's pull from where it took the string to bowfull (0..1), while drawing
+    bool  test_draw();                          // bowdrawtest (test) under way: the string's draw is pull_frac(), not the tracked hand's place
     bool  rt_held();                            // the game's fire held for the draw
     void  set_pull(bool active, float t);       // render thread, each frame: the string follows the hand; its draw now (0..1, < 0 unknown)
     // The learnt draws are kept in bin\fc5vr_bowpull.txt (written when a bow is first learnt) over bin\fc5vr_bowpull_default.txt (shipped
@@ -180,6 +181,26 @@ namespace fc5::bow
     // The right grip keeps the sling zone only (its chest throwable lies 13 cm from the bow's line).
     bool  sling_grab();
     float sling_grab_zone();
+    // bowrighthand on|off (saved, default on; author 11 Nov): the slung bow taken with the right grip (at the sling, or a
+    // shoulder switch with the grip held) stays in the right hand while that grip is held, and goes back on the sling when it is let go. It is
+    // placed on the right controller by its own grip and turned upright exactly as in the left hand (bowupright's turn: arrow along the
+    // controller, limbs along its up). In the right hand it is not the manual bow (no quiver, no string by hand): RT draws and looses it as the
+    // game does. The left grip still takes it as before. Off: the right grip puts it in the left hand (as before 11 Nov).
+    bool  right_hand();
+    // bowfine on|off (never saved, default on; author 13 Nov 21:45Z with a video). It was not: the drawn bow's posed parts (bowpull: its limbs and string, skinned, and the arrow on the string,
+    // rigid) hang on the bow's main mesh through single-float products of map-size transforms (a general inverse and a product: up to a
+    // millimetre, new every frame; the rigid part's place written as a rounded float beside another place's fraction), and the same pose
+    // taken again as the full draw every 5 frames with new rounding. On: each part's place on the main mesh from small numbers in doubles
+    // (both draws from the game camera with their position fractions), a rigid part written as a float plus its own fraction; the arrow in
+    // the string hand, the string's draw and the sight pin measured the same way. Off: bit for bit as before. A result 5 mm or more from
+    // the old one is refused. One [BowArrow] bowfine line per draw gives the difference either way (FarCry5BowArrow.cpp).
+    bool  fine();
+    // bowpinmid on|off (never saved, default on; author 13 Nov 21:45Z): the dot's point on the
+    // bow was its smallest reticle draw (the pegs sight's pin glow, 12 indices). His bow's ring sight draws three: its glass twice (2208 and
+    // 384 indices, the ring's middle) and a small piece on the ring's rim (132 indices, 2.9 cm from the middle), so the dot sat on the rim.
+    // On: when the smallest draw sits alone (1.5 cm or more from every other) and two or more others agree to 5 mm, the dot's point is the
+    // smallest of those that agree (the ring's middle); otherwise the smallest, as before. Off: always the smallest.
+    bool  pin_mid();
     // bowquivergrip on|off (saved, default on; author 6 Nov 08:23): the weapon hand's shoulder is
     // the quiver only with the bow in hand and the other hand's grip held (FarCry5Gesture.cpp); otherwise it is the shoulder's weapon slot.
     bool  quiver_grip();
@@ -191,6 +212,15 @@ namespace fc5::bow
     // (the game's draw done), and a rigid part's (the arrow's) rest or full only if at least 80 % of its known draw away from the other end.
     bool  pull_keep();
     void  get_sling_hold(float v[3]);
+    // bowslingbody on|off (saved, default on) and bowslingbodyangle deg (saved, default 35; author 15 Nov 13:53Z): the slung bow hangs by its grip at the sling's place across the front of the body, its limbs from the right hip
+    // up towards the left shoulder (mirrored left-handed), this far from upright, flat against the body, whatever slingrot turns the slung guns
+    // by. bowslinghold applies only when off. (With slingrot 70 -30 0 and bowslinghold 0 0 90 its limbs stuck out forward and back from the
+    // sling, 45 cm each way.)
+    bool      sling_body();
+    float     sling_body_deg();
+    // The slung bow's turn in the sling place's frame without slingrot (x right, y up, z back on the body's heading): bow axes after
+    // bowupright (x across, y along the limbs, -z where the arrow points) to that frame.
+    glm::mat3 sling_body_turn(bool mirror);
     // bowmindraw F (saved, default 0.80; author 2 Nov 12:03): a string let go short of that share of full draw (the string's own draw with bowpull, else the hand's pull to bowfull) does
     // not shoot: the game's cancel-shot key is tapped (bowcancelkey scan code, saved, default 0x13 = R as his prompt shows; 0 = pad X)
     // with RT still held, RT let go 300 ms later, and the arrow stays on the bow (Nocked).

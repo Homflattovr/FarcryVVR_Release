@@ -25,6 +25,7 @@
 #include "FarCry5Bow.h"
 #include "FarCry5Reload.h"
 #include "FarCry5ReloadHint.h"
+#include "FarCry5Dlss.h"
 #include "FarCry5Drive.h"
 
 #include <mods/VR.hpp>
@@ -436,6 +437,12 @@ void FarCry5Stereo::gesture_zones_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D
         D3D11_TEXTURE2D_DESC ed{};
         eye->GetDesc(&ed);
         glow = fc5::reloadhint::composite(fr, float(ed.Width), float(ed.Height), hint);
+        if (glow && m_hint_unjit.load() && fc5::dlss::enabled()) {
+            // hintunjitter (FarCry5Stereo.h): the mask was drawn with this frame's jitter (px, py) in the projection, which puts what the
+            // picture shows at q at q - (px, py) in the mask (x: clip x gets + 2 px / W times z, w = -z; y likewise with y down).
+            hint.moff[0] -= m_dlss_jitter_px[0] * m_dlss_jitter_sign[0].load() * hint.texel[0];
+            hint.moff[1] -= m_dlss_jitter_px[1] * m_dlss_jitter_sign[1].load() * hint.texel[1];
+        }
         if (glow) {
             cb.hm[0] = hint.mscale[0]; cb.hm[1] = hint.mscale[1]; cb.hm[2] = hint.moff[0]; cb.hm[3] = hint.moff[1];
             for (int g = 0; g < fc5::reloadhint::kGroups; ++g) for (int k = 0; k < 4; ++k) cb.hc[g][k] = hint.col[g][k];
@@ -471,6 +478,26 @@ void FarCry5Stereo::gesture_zones_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D
         }
         const float     mx  = lh ? -1.0f : 1.0f;
         auto mir = [&](glm::vec3 p) { p.x *= mx; return p; };
+        // reloadballfollow (FarCry5Reload.cpp; author 16 Nov 10:37, the M133's yellow ball out past the muzzle): the reload measures and catches on
+        // the gun as drawn (reloadzonesfollow), so its ball, shell and boxes go there too: this frame's controller with the drawn gun's turn and
+        // offset against it (Stereo.h draw_turn, raw controller axes, as Stereo.cpp gives the pad poll). (testctrl: rv's pose is already the drawn one.)
+        if (gun && !m_test_ctrl.load() && fc5::reload::ball_follow()) {
+            glm::mat3 E{ 1.0f };
+            glm::vec3 off{ 0.0f };
+            if (draw_turn(E, off)) {
+                static uint32_t said_sig = 0;
+                if (said_sig != rv.sig) {
+                    said_sig            = rv.sig;
+                    const glm::vec3 w   = mir(rv.g.well);
+                    const float     deg = glm::degrees(std::acos(std::clamp((E[0][0] + E[1][1] + E[2][2] - 1.0f) * 0.5f, -1.0f, 1.0f)));
+                    spdlog::info("[Zones] weapon {}: reloadballfollow: the reload's balls drawn on the gun as drawn ({:.1f} deg, {:.1f} cm off its controller): "
+                                 "the well's ball {:.1f} cm from where the raw controller put it", rv.sig, deg, glm::length(off) * 100.0f,
+                                 glm::length(E * w + off - w) * 100.0f);
+                }
+                gp = gp + gr * off;
+                gr = gr * E;
+            }
+        }
         const glm::vec3 well = gp + gr * mir(rv.g.well);
         glm::vec3       U    = gr * mir(rv.g.axis);
         U                    = glm::length(U) > 1e-4f ? glm::normalize(U) : glm::vec3{ 0.0f, 1.0f, 0.0f };
@@ -522,7 +549,8 @@ void FarCry5Stereo::gesture_zones_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D
         const bool model = fc5::reload::model_shown();
         if (rv.hand_mag && hand && !model) spare(hp + hr * rv.hand_mag_off, hr[1], -hr[2], 1.0f);
         if (rv.engaged && gun && !model) spare(well - U * (1.0f - rv.insert) * rv.travel, U, -back, 1.0f);
-        if (rv.well_ball && gun && n < kBalls && !glow_mag) {   // (glow: the ghost magazine in the well instead)
+        // reloadhighlight off (author 11 Nov): no yellow or blue ball.
+        if (rv.well_ball && gun && n < kBalls && !glow_mag && fc5::reload::highlight_on()) {   // (glow: the ghost magazine in the well instead)
             // reloadmuzzlezone (author 5 Nov 15:51: the RPG's circle by the grip): a muzzle-loaded round's way in starts at the muzzle, its
             // travel ahead of the seated tail (the well).
             fc5::reload::Revolver mrp{};
@@ -558,7 +586,7 @@ void FarCry5Stereo::gesture_zones_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D
         if (rv.rack_ball && gun) {
             const glm::vec3 h0 = gp + gr * mir(rv.g.handle);
             const glm::vec3 h  = h0 + back * rv.rack * rv.rack_len;   // the handle follows the pull
-            if (n < kBalls && !glow_handle && rv.hl_show) {   // (glow: the handle itself lit instead; reloadhlwhen)
+            if (n < kBalls && !glow_handle && rv.hl_show && fc5::reload::highlight_on()) {   // (glow: the handle itself lit instead; reloadhlwhen)
                 cb.ball[n][0] = h0.x; cb.ball[n][1] = h0.y; cb.ball[n][2] = h0.z; cb.ball[n][3] = 0.03f;
                 cb.col[n][0]  = 0.3f; cb.col[n][1] = 0.6f; cb.col[n][2] = 1.0f; cb.col[n][3] = rv.racking ? 0.06f : 0.16f;
                 cb.rim[n][0]  = rv.racking ? 0.4f : 0.8f; cb.rim[n][1] = 0.0f; cb.rim[n][2] = 0.0f;

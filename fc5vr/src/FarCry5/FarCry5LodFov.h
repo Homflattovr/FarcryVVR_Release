@@ -30,10 +30,4 @@ namespace fc5::lodfov
     void set_low_sun_csm(bool on);
     bool low_sun_csm();          // the setting
     bool low_sun_csm_active();   // this run's
-    // perfleafshadow, perfgrassshadow, perflampshadow, perfsoftshadow, perfreflect, perffog on|off (saved; next start; performance
-    // thread 6 Nov): one game render setting each, a step down in the same changed config. True when cmd was one of them.
-    bool perf_command(const std::string& cmd, const std::string& arg);
-    int  perf();              // the settings' bits (next start)
-    int  perf_active();       // this run's bits
-    int  perf_bit(const char* cmd);
 }

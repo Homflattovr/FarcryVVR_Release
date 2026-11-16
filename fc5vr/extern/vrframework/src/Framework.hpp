@@ -295,6 +295,7 @@ private:
     bool m_first_initialize{true};
 
     bool m_sent_message{false};
+    uint32_t m_hook_test_calls{0};   // WindowsMessageHook::calls() when the hook test message was sent
     bool m_message_hook_requested{false};
     bool m_has_engine_thread{false};
 

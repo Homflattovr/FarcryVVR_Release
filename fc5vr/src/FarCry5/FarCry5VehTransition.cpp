@@ -34,6 +34,17 @@
 //    counts from 0): its driver drives with a weapon out, its passenger rides; seat 0, vehscript off or silent leave it to the LB latch.
 //    The game's seat, driver's seat and entity are logged on each vehtriggers change, "now driving / riding" and each change of the rule
 //    that decides (game_seat_text). Off: as before.
+//  - ridegun on|off (default on, saved; F11 Comfort > Cinematics and vehicles; author 14 Nov 07:41). The mod's "driving" (in_vehicle) is the driver's seat only; a passenger or gun seat "rides", and gesture_poll allowed every
+//    on-foot gesture there: the weapon hung on the sling until the right grip took it at the chest (its trigger cut meanwhile) and went back
+//    when the grip was let go, and the manual reload owned right B and held left Y back. Now, in a real vehicle's other seats (the game's types
+//    0, 1, 3, 4, 5; not the paraglider or wingsuit), no body gesture runs, as for the driver: the weapon stays in the hand and the right trigger
+//    fires (through the fire gate, as on foot), left Y is the game's reload. Logged on each change ("[Vehicle] ridegun: ..."). Off: as before.
+//  - ridestick on|off (default on, saved; F11 Comfort > Cinematics and vehicles; author 16 Nov 16:00). motion_post_present skipped all stick turning in a vehicle the
+//    view follows (only a mounted turret's stick turned): his 15:37-15:39 ride in seat 3 of a car had 13 right-stick pushes and no turn. Now
+//    in a passenger or gun seat of a real vehicle (m_ride_veh), once settled, the stick snap / smooth turns the body yaw as on foot; the
+//    vehicle follow adds its own steps on top, so the turn holds as an offset from the front until the next settle (a seat change or getting
+//    out faces the front again). Snaps are not synced through the mouse there (the aim loop follows) and not about the head. Logged:
+//    "[Turn] ridestick: ...". Off: as before.
 //  - vehaimfront on|off (default on, saved; F11 Comfort > Cinematics and vehicles; 5 Nov gesture driving run, research\2026-11-05_gesturedrive
 //    RESULTS_builder.md, testruns\2026-11-05_stickspeed): the settle ends with one cut of the view to the vehicle's front, but the game's own
 //    aim (its camera less the head look's offset) stays where the get-in left it. After a normal get-in the game's camera already faces the
@@ -123,6 +134,20 @@ bool FarCry5Stereo::vehtrans_command(const std::string& cmd, const std::string& 
         return true;
     }
     if (cmd == "vehdrivegun") { m_veh_drive_gun = on; persist = true; return true; }       // vehdrivegun on|off (saved)
+    if (cmd == "ridegun") {                                                                 // ridegun on|off (saved)
+        m_ride_gun = on;
+        spdlog::info("[Vehicle] ridegun {}", on ? "on: in a passenger or gun seat the weapon stays in the hand (no sling), the right trigger fires, left Y is the game's reload (no manual reload)"
+                                                : "off: a passenger seat has the on-foot gestures (the sling, the manual reload), as before 14 Nov");
+        persist = true;
+        return true;
+    }
+    if (cmd == "ridestick") {                                                               // ridestick on|off (saved)
+        m_ride_stick = on;
+        spdlog::info("[Vehicle] ridestick {}", on ? "on: in a passenger or gun seat the right stick turns the view (snap or smooth), the vehicle's turn on top"
+                                                  : "off: no stick turning in any vehicle seat, as before 16 Nov");
+        persist = true;
+        return true;
+    }
     if (cmd == "vehtriggers") {                                                            // vehtriggers left|right (saved)
         if (arg != "left" && arg != "right") return false;
         m_veh_triggers = arg == "left";
@@ -195,6 +220,7 @@ void FarCry5Stereo::veh_seat_probe(int frame, const float* f, UINT count, float 
     r.count = count;
     r.cam   = cam;
     r.dist  = dist;
+    r.rot   = rot;   // vehnosebigown: this vehicle's axes for the heading
 }
 
 namespace
@@ -299,52 +325,41 @@ void FarCry5Stereo::draw_vehtrans_menu(const std::function<void(const char*, std
         m_veh_follow_head = v;
         keep("vehfollowhead", v ? "vehfollowhead on" : "vehfollowhead off");
     }
-    hint("On (default): during the enter / exit animation the view turns with the animation's camera and your head still turns it on top; getting out ends without a "
-         "turn. Off: as before 23 Oct (the view held on the game's camera: turning the head did not turn the view during the animation, then a recentre).");
+    hint("Getting in or out of a vehicle, your head still turns the view.");
     v = m_veh_follow_snap.load();
     if (ImGui::Checkbox("Vehicles: the enter / exit animation's turn in snaps", &v)) {
         m_veh_follow_snap = v;
         keep("vehfollowsnap", v ? "vehfollowsnap on" : "vehfollowsnap off");
     }
-    hint("On (default): the animation's turn comes in steps of your snap-turn angle, like a snap turn, instead of the world turning smoothly around you. Off: a smooth turn.");
+    hint("The get-in and get-out turn comes in snap-turn steps instead of smoothly.");
     v = m_veh_seat_guard.load();
     if (ImGui::Checkbox("Vehicles: getting out, no extra recentre", &v)) {
         m_veh_seat_guard = v;
         keep("vehseatguard", v ? "vehseatguard on" : "vehseatguard off");
     }
-    hint("Getting out first looks like a change of seat to the mod. On (default): that is not settled while no vehicle is under you, so getting out has one settle. "
-         "Off: as before 23 Oct (a cut and a recentre 0.6 s before the exit's own).");
+    hint("Getting out of a vehicle doesn't recentre the view twice.");
     v = m_exit_yaw_ev.load();
     if (ImGui::Checkbox("Vehicles: getting out, the game draws where you look left or right", &v)) {
         m_exit_yaw_ev = v;
         keep("exityaw", v ? "exityaw on" : "exityaw off");
     }
-    hint("On (default; author 7 Nov): during the exit animation the game's head look also turns the camera the game draws "
-         "with to where your head looks, so the edges of the view are not cut while the animation swings round (the view still follows the animation in snaps). "
-         "Off: as before 7 Nov.");
+    hint("Getting out, the game draws where you look, so the edges of the view aren't cut.");
     v = m_veh_aim_front.load();
     if (ImGui::Checkbox("Vehicles: getting in, the game's camera turned to the vehicle's front", &v)) {
         m_veh_aim_front = v;
         keep("vehaimfront", v ? "vehaimfront on" : "vehaimfront off");
     }
-    hint("On (default; 5 Nov: getting into a vehicle while the game's camera looked far to the side, the quad's bars and the car's wheel were drawn about "
-         "20 deg off): when the get-in ends, the game's own camera is turned to the vehicle's front, as after a normal get-in, so the wheel or bars sit "
-         "straight ahead. Off: as before 5 Nov (the game's camera left where the get-in left it).");
+    hint("Getting in, the game's camera turns to the vehicle's front, so the wheel or bars sit straight ahead.");
     v = m_veh_heading_keep.load();
     if (ImGui::Checkbox("Vehicles: the view keeps the car's front in slides and jumps", &v)) {
         m_veh_heading_keep = v;
         keep("vehheadingkeep", v ? "vehheadingkeep on" : "vehheadingkeep off");
     }
-    hint("On (default; 6 Nov: after jumps and steep turns the view stopped following the car's front, turned to the right window and "
-         "readjusted itself): the mod keeps reading the car's own model for its front when your seat moves, comes back onto it after "
-         "losing it, does not take a slide for reversing or for a wrong front, and turns the game's own camera back to the front when a slide "
-         "leaves it behind. Off: as before 6 Nov.");
+    hint("The view keeps facing the car's front through slides and jumps.");
     v = m_veh_seat_hold.load();
     if (ImGui::Checkbox("Vehicles: stay in the vehicle while in its seat (boats)", &v)) {
         m_veh_seat_hold = v;
         keep("vehseathold", v ? "vehseathold on" : "vehseathold off");
     }
-    hint("On (default): the seat is learnt on the vehicle's model once you are in; while you sit in it you stay in the vehicle, and the driver stays the driver when "
-         "the game shows a weapon (in a boat the game draws the sidearm every few seconds, and the mod took you for on foot: no throttle). "
-         "Off: as before 28 Oct.");
+    hint("You stay in the vehicle while in its seat, even when the game shows a weapon (boats).");
 }

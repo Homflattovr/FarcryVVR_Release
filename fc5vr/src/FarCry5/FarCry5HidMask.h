@@ -18,6 +18,17 @@ namespace fc5::hidmask
     void set_mode(int m);
     int  mode();
     const char* mode_name(int m);
+    // How much of the runtime's hidden area is masked (0.1-1; 0.5 = the masked band half as deep, a margin toward the visible area).
+    constexpr float kDefaultCover = 0.5f;   // Author 14 Nov 12:44Z ("hidmask on" = 50 %)
+    void  set_cover(float c);
+    float cover();
+    // hidmaskturn (author 14 Nov 16:14Z): no mask in a head turn faster than this many degrees per second (0 = never). head_speed: the
+    // head's turn speed at each new pose sample (held about 0.3 s); turning: the mask is left out now.
+    constexpr float kDefaultTurnDps = 90.0f;
+    void  set_turn_limit(float dps);
+    float turn_limit();
+    void  head_speed(float dps);
+    bool  turning();
 
     // The runtime's hidden-area triangles of both eyes (once; retried a few times while the runtime gives none). instance/session are
     // the OpenXR handles (XrInstance / XrSession, passed as integers so this header needs no OpenXR include); has_ext: the extension
@@ -32,6 +43,15 @@ namespace fc5::hidmask
     // tangents: the eye image's own field (tan of left, right, up, down angles; left and down negative), as the projection the game
     // renders this eye with. Saves and restores the whole context state (ID3DDeviceContextState swap). False if not drawn.
     bool stamp(ID3D11DeviceContext* ctx, ID3D11DepthStencilView* dsv, int eye, const float tangents[4], float z);
+
+    // hidmask black (author 14 Nov): fill eye 0/1's hidden area black in the finished eye image tex (a render target, or a UAV-only
+    // image), so the headset's reprojection on a fast head turn shows black there. Same tangents as stamp. False if not drawn.
+    bool black(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, int eye, const float tangents[4]);
+
+    // afwpereye (AFW): the hidden area of eye 0/1 written as kHiddenMark into an R32F render target (AFW's linear depth copy of that eye's
+    // image), so the rebuild never takes a texel from there (the game drew nothing in it: black, or leftovers). False if not drawn.
+    constexpr float kHiddenMark = 1.0e30f;
+    bool mark(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, int eye, const float tangents[4]);
 
     // Counters since start, and the hidden share of each eye image (for the log and F11).
     std::string status();

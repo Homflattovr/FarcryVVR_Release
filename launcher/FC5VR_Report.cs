@@ -260,6 +260,18 @@ static class Report
         var vc = Reg(Registry.LocalMachine, @"SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64", "Version");
         sb.AppendLine("VC++ runtime x64: " + (vc ?? "not installed"));
         sb.AppendLine("ViGEmBus: " + (Launcher.ViGEmBusInstalled() ? "installed" : "NOT installed"));
+        var mod = Path.Combine(bin, "dxgi.dll");
+        sb.AppendLine("Mod dll: " + (File.Exists(mod) ? "dxgi.dll " + new FileInfo(mod).Length + " bytes, " +
+                                     File.GetLastWriteTime(mod).ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)
+                                   : "dxgi.dll MISSING from bin (the mod cannot load; antivirus quarantine?)"));
+        var log = LogPath(bin);
+        sb.AppendLine("Mod log: " + (File.Exists(log) ? log + ", last written " +
+                                     File.GetLastWriteTime(log).ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
+                                   : "none"));
+        try {
+            var ubi = Launcher.UbisoftOverlayOn();
+            sb.AppendLine("Ubisoft Connect overlay: " + (ubi == null ? "setting not found" : ubi == true ? "on" : "off"));
+        } catch { }
         sb.AppendLine("DLLs in bin:");
         try {
             foreach (var f in Directory.GetFiles(bin, "*.dll")) {
@@ -268,7 +280,10 @@ static class Report
                               File.GetLastWriteTime(f).ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture));
             }
         } catch { }
-        foreach (var w in Launcher.StartChecks()) sb.AppendLine("Warning: " + w);
+        try {
+            foreach (var c in Launcher.InstallChecks())
+                sb.AppendLine("Install check " + c.State.ToString().ToUpperInvariant() + ": " + c.Name + ": " + c.Summary);
+        } catch (Exception e) { sb.AppendLine("Install checks: " + e.Message); }
         var opts = Launcher.WrongGameOptions();
         if (opts == null) sb.AppendLine("Game options: no gamerprofile.xml read");
         else if (opts.Count == 0) sb.AppendLine("Game options: all set as the mod needs");

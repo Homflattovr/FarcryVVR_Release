@@ -272,7 +272,7 @@ namespace fc5::padglyph
                                            "left grip + B", "menu", "left grip + menu", "left stick", "right stick", "left stick press",
                                            "right stick press", "left stick up", "left stick down", "left stick left", "left stick right",
                                            "left grip + stick", "left grip + stick up", "left grip + stick down", "left grip + stick left",
-                                           "left grip + stick right" };
+                                           "left grip + stick right", "right stick up", "right stick down" };
         const int k = int(i);
         return k >= 0 && k < int(Icon::Count) ? kNames[k] : "?";
     }
@@ -336,6 +336,12 @@ namespace fc5::padglyph
             const int dir = int(icon) - int(Icon::StickLUp);
             stick(cv, { 32.0f, 32.0f }, 23.0f, "L");
             arrow(cv, dir, { 32.0f, 32.0f }, 31.0f, 10.0f);
+            break;
+        }
+        case Icon::StickRUp:
+        case Icon::StickRDown: {
+            stick(cv, { 32.0f, 32.0f }, 23.0f, "R");
+            arrow(cv, icon == Icon::StickRUp ? 0 : 1, { 32.0f, 32.0f }, 31.0f, 10.0f);
             break;
         }
         case Icon::LGripStick: {

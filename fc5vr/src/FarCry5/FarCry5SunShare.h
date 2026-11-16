@@ -30,12 +30,18 @@ namespace fc5::sunshare
     void set_stagger(int n);          // 1 = every pair (off)
     int  stagger();
     void set_drift(float texels);     // a far slice whose fit moved more than this is redrawn at the next pair (default 0)
-    void set_check_every(int pairs);  // 0 = no check pairs (default 150)
+    void set_check_every(int pairs);  // 0 = no check pairs (the default since 9 Nov)
 
     // Any constant buffer upload of 224..512 B on the render thread, before it reaches the GPU (scan_matrices). When it is a
     // cascade buffer (ShadowMapSize in c10, three slices of a shadow projection in c0-c8), learns the map size and may rewrite
     // the slice rows. call: g_frame_call (1 left, 2 right, 3 scope).
     void note_cb(int call, uint32_t size, float* d);
+    // The same upload made on another thread (a command-list worker), right call only: gets the pair's drawn rows (fix 4).
+    void note_cb_other(int call, uint32_t size, float* d);
+    // Render thread: this pair's right call skips its own cascade draws and reuses the left call's map.
+    bool sharing();
+    // Counts the switch-ons.
+    uint32_t on_serial();
 
     // A depth-only draw target seen in the game's call: the cascade target if its shape matches the map size. asm_atlas,
     // asm_tmp: the far-shadow atlas and its temporary when known (never shared).

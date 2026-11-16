@@ -27,6 +27,7 @@
 #include "FarCry5Dlss.h"
 #include "FarCry5GunPoseTable.h"
 #include "FarCry5StockEye.h"
+#include "FarCry5GunExact.h"
 #include "ModPath.h"
 
 #include <algorithm>
@@ -271,7 +272,16 @@ struct FarCry5Stereo::GunStillState
     uint64_t      first_current{ 0 }, first_stale{ 0 }, first_other{ 0 };
 
     // meleestill (FarCry5Melee.cpp): a melee weapon's game hand in the weapon's own axes (smoothed), per weapon.
-    struct MeleeHand { glm::vec3 h{ 0.0f }; bool ok{ false }, said{ false }; };
+    // melee fix 1 (12 Nov): h is the median of the last readings (up to 24, about 0.5 s) taken with the weapon settled in the hand and the
+    // game's own weapon still, then kept on the weapon's length (raw: the median as read).
+    struct MeleeHand
+    {
+        glm::vec3 h{ 0.0f }, raw{ 0.0f };
+        bool      ok{ false }, said{ false }, have_prev{ false };
+        glm::vec3 ring[24]{};
+        int       n{ 0 }, at{ 0 };
+        Pose      prev{};
+    };
     std::unordered_map<uint32_t, MeleeHand> melee{};
 
     // gunaxes: per weapon, the game's right hand in the gun's own axes (smoothed; "rhand" lines in fc5vr_gunposes.txt) and, standing,
@@ -286,6 +296,12 @@ struct FarCry5Stereo::GunStillState
     Pose      held{};
     uint32_t  held_sig{ 0 };
     bool      held_axes{ false };
+    bool      held_melee{ false };   // melee fix 3: a melee weapon on the sling at its made sling pose
+    // melee fix 4: the weapon's pose as this update draws it, game camera axes: the game's own pose eased toward the held one by alpha
+    // (melee_drawn_line: the hit line, the swept points, the game's rays and weaponcollide's ray of a melee weapon follow it).
+    Pose      drawn{};
+    uint32_t  drawn_sig{ 0 };
+    int64_t   drawn_frame{ -100 };
 };
 
 void FarCry5Stereo::gun_still_first_draw()
@@ -347,6 +363,141 @@ bool FarCry5Stereo::gun_still_hand_line(glm::vec3& g)
     if (!have || !it->second.line_ok) return false;
     g = glm::normalize(glm::mat3_cast(made ? m_gst->held.r : it->second.pose.r) * it->second.line);
     return g.z < -0.5f;   // forward-ish only (a bad measure is ignored)
+}
+
+// melee fix 8: the pose the gun hold draws this update (game camera axes), for the "[Melee] hold:" line.
+bool FarCry5Stereo::gun_still_drawn_rot(uint32_t sig, glm::quat& r) const
+{
+    if (!m_gst || sig == 0 || m_gst->drawn_sig != sig || static_cast<int64_t>(m_frame.load()) - m_gst->drawn_frame > 4) return false;
+    r = m_gst->drawn.r;
+    return true;
+}
+
+// melee fix 8: the weapon in the game's hand (rigid: the game attaches it to its hand bone), from the palm and the weapon of one frame:
+// palm^-1 x weapon, its offset from the hand's centre in the palm's axes. Averaged (10 %) per weapon.
+void FarCry5Stereo::melee_learn_in_hand()
+{
+    if (m_mel_q_sig == 0 || m_mel_q_sig != m_mel_palm_sig || m_mel_q_frame != m_mel_palm_frame || m_mel_learn_frame == m_mel_q_frame) return;
+    m_mel_learn_frame  = m_mel_q_frame;
+    // melee fix 11 (author 13 Nov 20:41Z): learned only in the game's idle hold. Not
+    // while the game swings (the mod's press, the trigger: the weapon's own swing), reloads, or for 0.8 s after either; not in the first 0.8 s
+    // the weapon is in the game's hand (the equip animation: his 21:27:51 re-equip was learned from 270 ms on); not while the game's palm
+    // turns over 3 deg a draw. Once learned, a sample over 6 deg off it within 2 s of a press is refused.
+    const auto now      = std::chrono::steady_clock::now();
+    const bool pressing = now.time_since_epoch().count() < m_mel_press_until.load() || m_mel_state != 0 || m_trigger.load() || (m_gst && m_gst->reload) ||
+                          fc5::reload::hides_game_reload();
+    if (pressing) m_mel_busy_t = now;
+    const bool      palm_turning = m_mel_palm_frame - m_mel_prev_palm_frame <= 4 &&
+                              glm::degrees(2.0f * std::acos(std::clamp(std::abs(glm::dot(m_mel_prev_palm, m_mel_palm_q)), 0.0f, 1.0f))) > 3.0f;
+    m_mel_prev_palm       = m_mel_palm_q;
+    m_mel_prev_palm_frame = m_mel_palm_frame;
+    // melee fix 12: nor for 0.8 s after a grab from the sling (his 22:33:18.072 sample was taken 161 ms after the grab at 22:33:17.911, the bat
+    // moving 10 m/s into the ground).
+    const bool recent     = now - m_mel_busy_t < std::chrono::milliseconds(800) || now - m_mel_grab_t < std::chrono::milliseconds(800);
+    if (recent || palm_turning || now - m_wsig_t < std::chrono::milliseconds(800)) return;
+    auto&           ih = m_mel_inhand[m_mel_q_sig];
+    const glm::quat pi = glm::inverse(m_mel_palm_q);
+    glm::quat       r  = glm::normalize(pi * m_mel_q.r);
+    const glm::vec3 t  = pi * (m_mel_q.t - m_mel_palm_c);
+    if (!(glm::length(t) < 0.6f) || !std::isfinite(r.w + r.x + r.y + r.z)) return;
+    if (ih.n > 0 && glm::dot(ih.r, r) < 0.0f) r = -r;
+    if (ih.n >= 20) {
+        const float off = glm::degrees(2.0f * std::acos(std::clamp(std::abs(glm::dot(ih.r, r)), 0.0f, 1.0f)));
+        if (off > 6.0f && now - m_mel_busy_t < std::chrono::seconds(2)) {
+            if (m_mel_refuse_said_sig != m_mel_q_sig) {
+                m_mel_refuse_said_sig = m_mel_q_sig;
+                const glm::vec3 L = r * glm::vec3{ 0.0f, 0.0f, 1.0f }, K = ih.r * glm::vec3{ 0.0f, 0.0f, 1.0f };
+                spdlog::info("[Melee] hold: weapon {}: the weapon in the game's hand not learned from this draw ({:.1f} deg off the learned one, {:.0f} ms after a press; "
+                             "its length toward ({:.2f}, {:.2f}, {:.2f}) in the palm's axes, kept ({:.2f}, {:.2f}, {:.2f})) (logged once a weapon)",
+                             m_mel_q_sig, off, std::chrono::duration<float, std::milli>(now - m_mel_busy_t).count(), L.x, L.y, L.z, K.x, K.y, K.z);
+            }
+            return;
+        }
+    }
+    // melee fix 12: the first value is the mean of 15 samples in a row, each within 2 deg of the run's mean (fix 8 and 11 took the first sample whole:
+    // one sample during an animation set the hold for the whole stint).
+    if (ih.n == 0) {
+        if (ih.cn > 0 && glm::dot(ih.cr, r) < 0.0f) r = -r;
+        const float off = ih.cn == 0 ? 0.0f : glm::degrees(2.0f * std::acos(std::clamp(std::abs(glm::dot(ih.cr, r)), 0.0f, 1.0f)));
+        if (ih.cn == 0 || off > 2.0f) {
+            ih.cr = r;
+            ih.ct = t;
+            ih.cn = 1;
+            return;
+        }
+        ih.cn++;
+        ih.cr = glm::normalize(glm::slerp(ih.cr, r, 1.0f / float(ih.cn)));
+        ih.ct = glm::mix(ih.ct, t, 1.0f / float(ih.cn));
+        if (ih.cn < 15) return;
+        ih.r = ih.cr;
+        ih.t = ih.ct;
+        ih.n = 1;
+        const glm::vec3 L = ih.r * glm::vec3{ 0.0f, 0.0f, 1.0f };
+        spdlog::info("[Melee] hold: weapon {}: the weapon in the game's hand taken from 15 steady samples (its length toward ({:.2f}, {:.2f}, {:.2f}) in the palm's axes, its origin "
+                     "{:.1f} cm from the hand's centre; {:.0f} ms after the last grab from the sling)",
+                     m_mel_q_sig, L.x, L.y, L.z, 100.0f * glm::length(ih.t), std::chrono::duration<float, std::milli>(now - m_mel_grab_t).count());
+        return;
+    }
+    const float k = 0.1f;
+    ih.r          = glm::normalize(glm::slerp(ih.r, r, k));
+    ih.t          = glm::mix(ih.t, t, k);
+    ih.n          = std::min(ih.n + 1, 1 << 20);
+    // meleegripfist: kept across sessions once 60 samples in (fc5vr_gunposes.txt, "mhold" lines): the next session's first grab is held at once.
+    if (ih.n >= 60 && !ih.saved) {
+        ih.saved            = true;
+        m_grip_save_pending = true;
+        const glm::vec3 L   = ih.r * glm::vec3{ 0.0f, 0.0f, 1.0f };
+        spdlog::info("[Melee] hold: weapon {}: the weapon in the game's hand kept for the next sessions (fc5vr_gunposes.txt; its length toward ({:.2f}, {:.2f}, {:.2f}) "
+                     "in the palm's axes, its origin {:.1f} cm from the hand's centre{})",
+                     m_mel_q_sig, L.x, L.y, L.z, 100.0f * glm::length(ih.t), ih.kept ? "; refined from the kept one" : "");
+    }
+}
+
+// melee fix 8: the gun hold's own hand on the controller (rest pose -> controller axes): the weapon hand's palm averaged while a gun was held,
+// else the grip pose (emptyhandgrip, the right palm on a pistol's grip); the left mirrored as empty_hand_target does.
+glm::quat FarCry5Stereo::melee_gun_hand(int side, bool* learned, uint32_t* from) const
+{
+    if (learned) *learned = false;
+    if (from) *from = 0;
+    if (m_mel_gunrel_n < 60) return empty_hand_target(side);
+    glm::quat g = glm::normalize(m_mel_gunrel_sum);   // stored as the right hand's
+    if (side == 1) g = glm::quat{ g.w, g.x, -g.y, -g.z };
+    if (learned) *learned = true;
+    if (from) *from = m_mel_gunrel_sig;
+    return g;
+}
+
+// melee fix 4: the drawn melee weapon in the world: o its model's origin (the grip, ATTACH_GRIP), d its length (+Z), from the pose this update draws
+// (game camera axes) placed as the weapon pass places it: the point m_grip_off on the controller, the game camera's axes turned onto the
+// controller's (with the pass's small model correction). False without a drawn pose of this weapon in the last 4 frames or a broken one.
+bool FarCry5Stereo::melee_drawn_line(uint32_t sig, glm::vec3& o, glm::vec3& d)
+{
+    if (!m_gst || sig == 0 || m_gst->drawn_sig != sig || static_cast<int64_t>(m_frame.load()) - m_gst->drawn_frame > 4) return false;
+    const glm::mat3 W = m_mo.ctrl_rot_world * (m_frame.load() - m_hand_map.frame <= 4 ? m_hand_map.corr : glm::mat3{ 1.0f });
+    glm::vec3       O{ m_grip_off[0].load(), m_grip_off[1].load(), m_grip_off[2].load() };
+    // melee fix 6: the point put on the controller as the weapon pass puts it (FarCry5Stereo.cpp, the weapon rewrite): with gripbyhand, this
+    // weapon's grip from the game's own right hand on it. Left out until now: 13 Nov's Pipe (weapon 19308, its grip 0.49 m from the one-for-all
+    // grip) had its hit line and rays 0.39 m under the drawn weapon, so every swing at the torso went through the legs.
+    if (m_grip_by_hand.load()) {
+        std::lock_guard _{ m_weapon_cal_mtx };
+        if (auto it = m_grip_hand.find(sig); it != m_grip_hand.end() && it->second.ok)
+            O += it->second.c - glm::vec3{ m_grip_hand_ref[0].load(), m_grip_hand_ref[1].load(), m_grip_hand_ref[2].load() };
+    }
+    const glm::vec3 z = W * (glm::mat3_cast(m_gst->drawn.r) * glm::vec3{ 0.0f, 0.0f, 1.0f });
+    const glm::vec3 p = m_mo.ctrl_pos_world + W * (m_gst->drawn.t - O);
+    const float     n = glm::length(z);
+    if (!(n > 0.5f && n < 2.0f) || !std::isfinite(p.x + p.y + p.z) || glm::length(p - m_mo.ctrl_pos_world) > 1.5f) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            spdlog::warn("[Melee] melee_drawn_line: weapon {}'s drawn pose left out (length {:.2f}, origin {:.2f} m from the controller): no hit line from it (logged once)", sig, n,
+                         std::isfinite(p.x + p.y + p.z) ? glm::length(p - m_mo.ctrl_pos_world) : -1.0f);
+        }
+        return false;
+    }
+    o = p;
+    d = z / n;
+    return true;
 }
 
 // onehandmatch (Stereo.h): called from update_motion right after the two-handed hold has set k (the weapon's frame: weapon controller with
@@ -955,7 +1106,38 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
     for (int r = 0; r < 3; ++r) for (int c = 0; c < 4; ++c) Om[c][r] = obj[r * 4 + c];
     glm::mat4 A{ hm.rot };
     A[3]              = glm::vec4{ -(hm.rot * hm.cam), 1.0f };
-    const glm::mat4 Q = A * Om;   // the gun's pose in the game camera's axes, as the game animates it
+    glm::mat4 Q = A * Om;   // the gun's pose in the game camera's axes, as the game animates it
+    // camfine: that product subtracts two world-size numbers after each was rounded (up to a millimetre of noise in the gun's place,
+    // new every frame, which the hold then put on the drawn gun), and it leaves out the two fractions the shader adds. The same in
+    // doubles: the gun from the camera first (exact: both floats lie on the same grid), the fractions, then the turn. A pose from
+    // gunstilllate's part or gunstillexact's copy comes with its own fraction when that is known; a pass first placed without one
+    // keeps one camera (the gun mesh's placement and the pair's right eye leave the fractions out as well).
+    {
+        glm::dvec3 gp = glm::dvec3{ Om[3] } - glm::dvec3{ hm.cam };
+        const glm::vec3 gf = est ? glm::vec3{ m_gst_est_frac[0], m_gst_est_frac[1], m_gst_est_frac[2] } : glm::vec3{ m_gun_obj_frac[0], m_gun_obj_frac[1], m_gun_obj_frac[2] };
+        const glm::vec3 cf = m_hand_map_cam_frac;
+        auto frac_ok = [](const glm::vec3& v) { return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z) && std::abs(v.x) < 1.0f && std::abs(v.y) < 1.0f && std::abs(v.z) < 1.0f; };
+        bool use_frac = (est ? m_gst_est_frac_ok : m_gun_obj_frac_ok) && frac_ok(gf) && frac_ok(cf);
+        if (m_cam_fine.load()) {
+            if (est) {
+                if (use_frac) m_cf_est_frac++;
+                else { m_cf_est_nofrac++; m_cf_nofrac_pair = frame & ~1; }
+            } else if (use_frac && m_cf_nofrac_pair == (frame & ~1)) {
+                use_frac = false;
+                m_cf_mesh_nofrac++;
+            }
+        }
+        if (use_frac) gp += glm::dvec3{ gf } - glm::dvec3{ cf };
+        glm::mat4 Qd{ glm::mat3{ hm.rot } * glm::mat3{ Om } };
+        Qd[3]             = glm::vec4{ glm::vec3{ glm::dmat3{ hm.rot } * gp }, 1.0f };
+        const float q_mm  = 1000.0f * glm::length(glm::vec3{ Qd[3] } - glm::vec3{ Q[3] });
+        if (q_mm < 5.0f) {
+            m_cf_q_n++;
+            m_cf_q2 += double(q_mm) * q_mm;
+            m_cf_q_max = std::max(m_cf_q_max, q_mm);
+            if (m_cam_fine.load()) Q = Qd;
+        }
+    }
 
     // One step per game update (a stereo pair, or each frame in AFW): learning, the reload state, the update-to-update
     // change for the prediction.
@@ -990,6 +1172,15 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
                     s.pr_deg[k] += e_deg[k];
                     s.pr_max_cm[k]  = std::max(s.pr_max_cm[k], e_cm[k]);
                     s.pr_max_deg[k] = std::max(s.pr_max_deg[k], e_deg[k]);
+                }
+                // guessed draws: this pass had indexed draws drawn with the guess: how far off that guess was.
+                if (m_gst_geo_frame == s.pred_frame && m_gst_geo_pass > 0) {
+                    const int u = std::clamp(m_gst_predict.load(), 0, 3);
+                    m_gst_geo_passes++;
+                    m_gst_geo_cm += e_cm[u];
+                    m_gst_geo_deg += e_deg[u];
+                    m_gst_geo_max_cm  = std::max(m_gst_geo_max_cm, e_cm[u]);
+                    m_gst_geo_max_deg = std::max(m_gst_geo_max_deg, e_deg[u]);
                 }
             }
             s.pred_frame = -100;
@@ -1367,37 +1558,147 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
     // made instead: the weapon turned so its length (the model's +Y, the barrel's axis on guns) points along meleepitch / meleeyaw /
     // meleeroll from the aim's axis, about the game's hand on it, which stays at its grip point; held at all times but a throw.
     bool melee_hold = false;
-    if (melee_still_now() && melee_weapon(sig) && !m_mo.slung) {
-        auto&     mh = s.melee[sig];
+    Pose melee_pose{};   // melee fix 8: the made pose of a melee weapon this update (sling or hand), never kept in ref
+    // melee fix 1 (the 12 Nov run, lodge-night): (1) only a weapon in hand for 0.25 s with no spawnhand draw under way (weapon_settled): the
+    // ids shown for a few frames at a change and the save's Pipe_02 the game draws for 0.7 s when spawnhand drops the held weapon were held
+    // as melee weapons. (2) The game's hand on the weapon was the first reading, then a 5 % mix of readings under 0.6 m. Hoe_Long (10638)
+    // first read (-0.31, 0.18, -0.32) m and was drawn 18 cm left of, 43 cm above and 11 cm nearer than the fist (picture b_HoeLong, 5 s
+    // later: the shaft at the face, the glove empty): the game carries that tool across the body, its origin on the body's axis 42 cm under
+    // the camera (the same matrix 6 s later: no draw animation), and the hand point it gives is 36 cm off the shaft's own line, so no grip
+    // on it. Now: the median of the readings taken with the weapon settled and the game's weapon still (12 at least, the last 24), never
+    // the grip point in place of a hand; and the fist stays on the tool: the part of the reading along the length is kept (to 0.6 m), the
+    // part off it only up to 6 cm (a hand round a handle), else dropped. Until measured the model's origin is in the fist (the melee
+    // models' ATTACH_GRIP: Shovel_Long read 2.4 cm from it, Pipe_02 1.7).
+    // melee fix 3 (author 12 Nov 13:31): on the sling too. It was left out there since
+    // 3 Nov, and a melee weapon is never learned, so on the sling the hold eased out and the weapon was drawn where the game carries it (55-60 cm
+    // under the camera, nearly level): it hung that far under the sling's place. Now its fist goes on the point a slung gun's grip lands on (the
+    // game's hand on it when gripbyhand has measured it, else the one-for-all grip: the weapon pass puts either on the same place), and its length
+    // hangs down from the fist (melee_sling_rot); no weaponcollide turn there. The hand's reading is taken only in the hand.
+    const bool slung_now = m_mo.slung;
+    if (!slung_now) m_slg_said = false;
+    // melee fix 4 (author 12 Nov 20:08): in the hand a melee weapon has no made pose and no melee-only angle (meleestill, meleepitch / yaw / roll, meleegrip, meleefist,
+    // meleeedge, meleegripweapons and the meleecollide turn are deleted): it is held by the same code as a gun. Only on the sling (melee fix 3) it
+    // hangs at its made sling pose; its fist there is the grip point a slung gun's grip lands on (the model's origin, ATTACH_GRIP, in it).
+    if (slung_now && melee_weapon(sig) && weapon_settled(sig)) {
         glm::vec3 c{ 0.0f };
-        bool      c_ok = false;
+        bool      measured = false;
         {
             std::lock_guard _{ m_weapon_cal_mtx };
-            if (auto it = m_grip_hand.find(sig); it != m_grip_hand.end() && it->second.ok) { c = it->second.c; c_ok = true; }
+            if (auto it = m_grip_hand.find(sig); it != m_grip_hand.end() && it->second.ok) { c = it->second.c; measured = true; }
         }
-        const bool hand_now = m_frame.load() - m_wpn_hand_frame <= 3;
-        if (!c_ok && hand_now) { c = m_wpn_hand_cam; c_ok = true; }
-        // The game's hand on it (else its grip point, where the game holds that hand on average) in the weapon's axes.
-        if (new_update && (hand_now || c_ok)) {
-            const glm::vec3 h = glm::vec3{ glm::inverse(Q) * glm::vec4{ hand_now ? m_wpn_hand_cam : c, 1.0f } };
-            if (glm::length(h) < 0.6f) {
-                mh.h  = mh.ok ? glm::mix(mh.h, h, 0.05f) : h;
-                mh.ok = true;
-            }
-        }
-        if (mh.ok && c_ok) {
-            const glm::quat R = glm::normalize(melee_collide_rot() * melee_hold_rot());
-            ref.pose          = Pose{ R, c - R * mh.h };
-            ref.ok            = true;
+        const glm::vec3 ref_grip{ m_grip_hand_ref[0].load(), m_grip_hand_ref[1].load(), m_grip_hand_ref[2].load() };
+        if (!(measured && m_grip_by_hand.load())) c = ref_grip;
+        {
+            // melee fix 8: the sling pose is this update's held pose only (melee_pose). It was written into the weapon's learned pose (ref.pose,
+            // ref.ok), so after a grab the hand held the weapon at the sling's pose on the controller: handle up, heavy end hanging under the fist
+            // (author 13 Nov 14:25Z; his 15:02:43-15:02:53 Bat 5694 grabs, the length (-0.23, -0.94, -0.26)).
+            const glm::quat R = melee_sling_rot(sig);
+            melee_pose        = Pose{ R, c };
             melee_hold        = true;
-            if (!mh.said) {
-                mh.said             = true;
-                const glm::vec3 len = glm::mat3_cast(qp.r) * glm::vec3{ 0.0f, 1.0f, 0.0f };
-                spdlog::info("[Melee] meleestill: weapon {} held as a melee weapon (the game held its length toward ({:.2f}, {:.2f}, {:.2f}) in the camera's axes, its hand at "
-                             "({:.2f}, {:.2f}, {:.2f}) in the weapon's; now meleepitch {:.0f}, meleeyaw {:.0f}, meleeroll {:.0f})",
-                             sig, len.x, len.y, len.z, mh.h.x, mh.h.y, mh.h.z, m_mel_pitch.load(), m_mel_yaw.load(), m_mel_roll.load());
+            // melee fix 3: one line each time a melee weapon goes on the sling: its grip (the fist) right / up / forward of the head, and the last
+            // slung gun's, for the builder (within about 5 cm of each other expected). c less the point the weapon pass puts on the sling (O).
+            if (slung_now && !m_slg_said) {
+                const glm::vec3 O = glm::vec3{ m_grip_off[0].load(), m_grip_off[1].load(), m_grip_off[2].load() } + (measured && m_grip_by_hand.load() ? c - ref_grip : glm::vec3{ 0.0f });
+                glm::vec3       rel{ 0.0f };
+                if (sling_grip_rel(sig, c - O, rel)) {
+                    m_slg_said        = true;
+                    const glm::vec3 L = glm::mat3_cast(R) * glm::vec3{ 0.0f, 0.0f, 1.0f };
+                    glm::vec3       Lb{ 0.0f, -1.0f, 0.0f };   // the length in the body's axes (y up)
+                    {
+                        std::lock_guard _s{ m_slg_mtx };
+                        Lb = glm::transpose(m_slg_body) * (glm::mat3{ m_slg_k } * L);
+                    }
+                    // melee fix 11: the tip (the length's far end) right / up / forward of the head, as the fist
+                    glm::vec3 tip{ 0.0f };
+                    if (!sling_grip_rel(sig, c - O + melee_sling_len(sig) * L, tip)) tip = glm::vec3{ 0.0f };
+                    spdlog::info("[Melee] sling: melee weapon {} on the sling, its grip (the fist, {}) {:.3f} right, {:.3f} up, {:.3f} forward of the head (m); its length ({:.2f} m taken) "
+                                 "from the fist toward ({:.2f}, {:.2f}, {:.2f}) in the sling's axes, {:.0f} deg off straight down, its tip {:.3f} right, {:.3f} up, {:.3f} forward of the head; {}",
+                                 sig, measured ? "the game's hand on it" : "the one-for-all grip", rel.x, rel.y, rel.z, melee_sling_len(sig), L.x, L.y, L.z,
+                                 glm::degrees(std::acos(std::clamp(-Lb.y, -1.0f, 1.0f))), tip.x, tip.y, tip.z,
+                                 m_slg_gun_ok ? fmt::format("the last slung gun {} ({}) had its grip at {:.3f}, {:.3f}, {:.3f}: {:.1f} cm apart", m_slg_gun_sig, m_slg_gun_meas ? "its measured grip" : "the one-for-all grip",
+                                                            m_slg_gun_rel.x, m_slg_gun_rel.y, m_slg_gun_rel.z, 100.0f * glm::length(rel - m_slg_gun_rel))
+                                              : std::string{ "no gun on the sling yet this session" });
+                }
             }
         }
+    }
+    // melee fix 3: a slung gun's grip (where the weapon pass puts the game's hand on it), right / up / forward of the head, for the melee line above.
+    if (slung_now && !melee_hold && sig != 0 && !m_bow_slung_now && !melee_weapon(sig)) {
+        const glm::vec3 ref_grip{ m_grip_hand_ref[0].load(), m_grip_hand_ref[1].load(), m_grip_hand_ref[2].load() };
+        bool            meas = false;
+        if (m_grip_by_hand.load()) {
+            std::lock_guard _{ m_weapon_cal_mtx };
+            const auto it = m_grip_hand.find(sig);
+            meas          = it != m_grip_hand.end() && it->second.ok;
+        }
+        glm::vec3 rel{ 0.0f };
+        if (sling_grip_rel(sig, ref_grip - glm::vec3{ m_grip_off[0].load(), m_grip_off[1].load(), m_grip_off[2].load() }, rel)) {
+            m_slg_gun_ok   = true;
+            m_slg_gun_meas = meas;
+            m_slg_gun_sig  = sig;
+            m_slg_gun_rel  = rel;
+        }
+    }
+    // melee fix 8 (author 13 Nov 14:25Z): in the
+    // hand a melee weapon is weapon = controller x (the weapon hand on its controller as on a gun) x (the weapon in the game's hand, as the game
+    // holds it). No melee-only angle: the hand's pose is the gun hold's own (melee_gun_hand: the palm on its controller averaged while a gun is
+    // held, else the grip pose), the weapon's place in the hand is the game's (learned from a palm and a weapon of the same frame, any time the
+    // game holds the weapon, slung or not), and the hand's centre goes on the point the weapon pass puts on the controller (as the sling's fist).
+    // Nothing from the sling or from where the hand closed survives a grab: the pose depends only on the weapon and the controller.
+    if (melee_weapon(sig) && sig != 0) {
+        const int64_t fr = static_cast<int64_t>(m_frame.load());
+        // the game's weapon of the measured frame, for the learning of the weapon in the game's hand (melee_learn_in_hand: with the palm of the
+        // same frame, whichever of the gun mesh and the gloves is drawn first)
+        if (!est && !throwing && weapon_settled(sig)) {
+            m_mel_q       = MeleePose{ qp.r, qp.t };
+            m_mel_q_frame = static_cast<int64_t>(m_gun_obj_seen);
+            m_mel_q_sig   = sig;
+            melee_learn_in_hand();
+        }
+        if (!slung_now && !melee_hold && weapon_settled(sig) && fr - m_hand_map.frame <= 8) {
+            const auto it = m_mel_inhand.find(sig);
+            if (it != m_mel_inhand.end() && it->second.n > 0) {
+                glm::vec3 c{ 0.0f };
+                bool      measured = false;
+                {
+                    std::lock_guard _{ m_weapon_cal_mtx };
+                    if (auto g = m_grip_hand.find(sig); g != m_grip_hand.end() && g->second.ok) { c = g->second.c; measured = true; }
+                }
+                if (!(measured && m_grip_by_hand.load())) c = glm::vec3{ m_grip_hand_ref[0].load(), m_grip_hand_ref[1].load(), m_grip_hand_ref[2].load() };
+                const int       side = left_handed() ? 1 : 0;
+                const glm::quat corr = glm::normalize(glm::quat_cast(m_hand_map.corr));
+                // meleegripfist (author 15 Nov 21:19Z): the hand on the weapon is the empty hand's fist: its palm at the grip pose on its controller (empty_hand_target, where
+                // emptyhandalign puts the empty hand; his 22:11:29 and 22:11:58 bat holds were 47 deg off it, 0.4-2.4 deg from the 1911's gun hold), its
+                // centre on the point the weapon pass puts on the controller, where the empty hand's centre goes (unarmedhand, the sling's fist): the
+                // gun hold's place was the reference right hand's, 12 cm from it (griphand - the grip offset). Off: melee fix 8's gun hold.
+                const bool      fist  = m_mel_grip_fist.load();
+                const glm::quat hand  = fist ? empty_hand_target(side) : melee_gun_hand(side);
+                if (fist) c = glm::vec3{ m_grip_off[0].load(), m_grip_off[1].load(), m_grip_off[2].load() } + c -
+                              glm::vec3{ m_grip_hand_ref[0].load(), m_grip_hand_ref[1].load(), m_grip_hand_ref[2].load() };   // the weapon pass's grip point (gripbyhand)
+                const glm::quat palm = glm::normalize(glm::inverse(corr) * hand);   // the palm, game camera axes, so that it lies on the controller as the empty fist (or on a gun)
+                melee_pose           = Pose{ glm::normalize(palm * it->second.r), c + palm * it->second.t };
+                melee_hold           = true;
+            }
+        }
+    }
+    // melee fix 12 (author 13 Nov 21:44Z): in the hand a melee weapon stays at
+    // its made pose whatever the game plays. When an update cannot make it (the hand map late, the weapon's place in the game's hand not taken
+    // yet after a re-equip), the last made pose of this weapon in this stint is drawn again (up to 3 s), so the game's swing never eases in.
+    if (melee_weapon(sig) && sig != 0 && !slung_now) {
+        const auto tnow = std::chrono::steady_clock::now();
+        if (melee_hold) {
+            m_mel_last_hold     = MeleePose{ melee_pose.r, melee_pose.t };
+            m_mel_last_hold_sig = sig;
+            m_mel_last_hold_t   = tnow;
+        } else if (sig == m_mel_last_hold_sig && tnow - m_mel_last_hold_t < std::chrono::seconds(3)) {
+            melee_pose = Pose{ m_mel_last_hold.r, m_mel_last_hold.t };
+            melee_hold = true;
+            if (m_mel_last_hold_used++ % 90 == 0)
+                spdlog::info("[Melee] hold: weapon {}: this update could not make its pose: the last one kept ({:.0f} ms old)", sig,
+                             std::chrono::duration<float, std::milli>(tnow - m_mel_last_hold_t).count());
+        }
+    } else if (slung_now) {
+        m_mel_last_hold_sig = 0;   // a new stint after the sling
     }
     // A pose taken for one switch only (temp) is dropped once that switch's hold is over.
     if (ref.temp && !weapon_switch_needs_pose(sig) && !weapon_switch_holds(sig)) {
@@ -1408,7 +1709,7 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
     // made from its own axes instead of the game's: its barrel (the mesh's +Y) along the aim's axis (-Z), its top (+Z) up, turned
     // about the game's right hand on it, which is put at the gun's grip point (so that hand sits on the controller as on every gun).
     // Known from the first updates a gun is in hand, standing or not; the game's own pose is still what tells a reload.
-    Pose hpose     = ref.pose;
+    Pose hpose     = melee_hold ? melee_pose : ref.pose;
     bool axes_hold = false;
     if (!melee_hold && m_gun_axes.load() && sig != 0 && !melee_weapon(sig) && !gun_axes_game(sig)) {
         auto& ax = s.axes[sig];
@@ -1536,8 +1837,10 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
     s.held      = hpose;
     s.held_sig  = sig;
     s.held_axes = axes_hold;
+    s.held_melee = melee_hold;
     if (m_weapon_audit.exchange(false)) gun_still_audit(sig, axes_hold, melee_hold);
-    const bool known = ref.ok || axes_hold;
+    // melee fix 8: a melee weapon is held only at its made pose (sling or hand), never at a learned one (a pose saved for a melee id, e.g. 18600).
+    const bool known = (ref.ok && !melee_weapon(sig)) || axes_hold || melee_hold;
     // Held unless a reload or a throw is under way, the pose is unknown, or the gun is far from it (another mesh).
     // shoulderdraw (FarCry5WeaponSwitch.cpp): a weapon just taken by a switch gesture is held at once and fully, wherever the game's
     // draw animation has it, and that animation is no reload.
@@ -1546,6 +1849,10 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
     const bool hold = melee_hold ? !throwing
                                  : switch_hold || (m_gun_still.load() && known && !s.reload && !throwing && glm::length(qp.t - hpose.t) < 0.6f);
     s.alpha         = switch_hold ? 1.0f : std::clamp(s.alpha + (hold ? 1.0f : -1.0f) * da / std::max(0.02f, m_gst_ease.load()), 0.0f, 1.0f);
+    // melee fix 4: the pose this update draws (the game's own eased toward the held one), for melee_drawn_line.
+    s.drawn       = s.alpha <= 0.0f ? qp : Pose{ glm::normalize(glm::slerp(qp.r, hpose.r, s.alpha)), glm::mix(qp.t, hpose.t, s.alpha) };
+    s.drawn_sig   = sig;
+    s.drawn_frame = static_cast<int64_t>(m_frame.load());
     const int  prev_applied = s.applied_frame;
     const bool prev_full    = s.applied_full;
     s.applied_frame = frame;
@@ -1948,6 +2255,12 @@ void FarCry5Stereo::sling_mv_note(int fr)
         glm::mat4 view{ c.view_rot };
         view[3]              = glm::vec4{ -(c.view_rot * c.cam), 1.0f };
         const glm::mat4 full = c.proj * view;   // the game pass's world -> this eye's clip, as the gun mesh is drawn
+        // camfine: the gun's own axes -> this eye's clip in doubles, from the camera and the gun as the shaders place them (their fractions too).
+        glm::dmat4 view_d{ glm::dmat3{ c.view_rot } };
+        view_d[3] = glm::dvec4{ -(glm::dmat3{ c.view_rot } * (c.fine ? c.cam_d : glm::dvec3{ c.cam })), 1.0 };
+        glm::dmat4 O_d{ gw.Om };
+        if (c.fine && m_gun_obj_frac_ok) O_d[3] += glm::dvec4{ double(m_gun_obj_frac[0]), double(m_gun_obj_frac[1]), double(m_gun_obj_frac[2]), 0.0 };
+        const glm::dmat4 Md = glm::dmat4{ c.proj } * view_d * O_d;
         // slingthrowhide: not while the game's gun is hidden (it is being put away or raised; the copy on the sling is what shows).
         // gunmv (author 6 Nov 21:53 video, OFXR Hybrid with DLSS vectors: the whole gun in hand flickered in OFXR's frames): the gun in
         // hand is placed by the mod at the controller too, so the same motion holds for it. Not the bow (its limbs leave the barrel line).
@@ -1961,7 +2274,24 @@ void FarCry5Stereo::sling_mv_note(int fr)
                 if (glm::length(e0 - e1) > 0.25f || glm::length(e0) < 0.05f || glm::length(e1) < 0.05f) {
                     m_slmv_jump++;   // a teleport, a weapon swap under the same id: no motion
                 } else {
-                    const glm::mat4 S  = h.full * h.O * glm::inverse(gw.Om) * glm::inverse(full);
+                    glm::mat4 S        = h.full * h.O * glm::inverse(gw.Om) * glm::inverse(full);
+                    if (c.fine && h.fine) {
+                        // camfine: the same motion in doubles; how far the single-float one put the gun's origin in the previous image, in pixels.
+                        const glm::dmat4 Sd = h.Md * glm::inverse(Md);
+                        const glm::dvec4 c0 = Md * glm::dvec4{ 0.0, 0.0, 0.0, 1.0 };
+                        const glm::dvec4 pd = Sd * c0;
+                        const glm::vec4  pf = S * glm::vec4{ c0 };
+                        if (std::abs(pd.w) > 1e-6 && std::abs(pf.w) > 1e-6f) {
+                            const double dx = (double(pf.x) / double(pf.w) - pd.x / pd.w) * 0.5 * double(m_cf_view_w), dy = (double(pf.y) / double(pf.w) - pd.y / pd.w) * 0.5 * double(m_cf_view_h);
+                            const float  px = float(std::sqrt(dx * dx + dy * dy));
+                            if (std::isfinite(px)) {
+                                m_cf_mv_n++;
+                                m_cf_mv2 += double(px) * px;
+                                m_cf_mv_max = std::max(m_cf_mv_max, px);
+                            }
+                        }
+                        if (m_cam_fine.load()) S = glm::mat4{ Sd };
+                    }
                     const glm::mat4 IP = glm::inverse(c.proj);
                     float           s_rows[16], ip_rows[16];
                     for (int r = 0; r < 4; ++r) {
@@ -2000,7 +2330,7 @@ void FarCry5Stereo::sling_mv_note(int fr)
                 }
             }
         }
-        h = { fr, sig, full, view, gw.Om };
+        h = { fr, sig, full, view, gw.Om, Md, c.fine };
     }
     if (!given) fc5::dlss::clear_sling_motion();
     const auto now = clock::now();
@@ -2077,6 +2407,53 @@ bool FarCry5Stereo::gun_still_command(const std::string& cmd, const std::string&
     }
     if (cmd == "gunstillpair") { m_gst_pair = on; persist = true; return true; }   // Stereo: the right eye takes the left eye's hold (both eyes the same gun)
     if (cmd == "gunstilllate") { m_gst_late = on; persist = true; return true; }   // the guessed pass's weapon camera placed again at the gun mesh's draw (both eyes exact)
+    if (cmd == "hintfine" || cmd == "hintunjitter" || cmd == "armfine") {   // set 9 (FarCry5Stereo.h)
+        (cmd == "hintfine" ? m_hint_fine : cmd == "hintunjitter" ? m_hint_unjit : m_arm_fine) = on;
+        persist = true;
+        spdlog::info("[GunStill] {} {}", cmd, on ? "on" : "off");
+        return true;
+    }
+    if (cmd == "nearfine") {   // the copies, throwables and the arrow placed with their own position fraction (default on)
+        m_near_fine = on;
+        persist     = true;
+        spdlog::info("[GunStill] nearfine {}", on ? "on: the mod's own placements written as a float and its fraction" : "off: as before");
+        return true;
+    }
+    if (cmd == "handfine") {   // the hands' transforms and the moved reload parts' last product without map-size single floats (default on)
+        m_hand_fine = on;
+        persist     = true;
+        spdlog::info("[GunStill] handfine {}", on ? "on: the hands placed from small numbers in doubles" : "off: as before");
+        return true;
+    }
+    if (cmd == "camfine") {   // the eyes' cameras, the grip against the eye and gunstill's measure exact (doubles and the engine's position fractions)
+        m_cam_fine = on;
+        persist    = true;
+        spdlog::info("[GunStill] camfine {}", on ? "on: camera places written with their fractions, the gun composed and measured without world-size single floats" : "off: as before 12 Nov");
+        return true;
+    }
+    if (cmd == "gunstillexact") {   // the left eye's weapon camera placed at the pass's first draw from the game's own copy of the gun's transform
+        m_gst_exact = on;
+        persist     = true;
+        spdlog::info("[GunStill] gunstillexact {}", on ? "on: the gun's pose of each update read from the game's memory at the weapon pass's first draw (the guess when no copy is proven)"
+                                                       : "off: the guess, then gunstilllate's parts (the copy is still looked for on gunexactscan and measured)");
+        return true;
+    }
+    if (cmd == "gunexactscan") {   // test: one search for copies of the gun's transform now
+        fc5::gunexact::request_scan();
+        return true;
+    }
+    if (cmd == "partsnap") {   // rigid attachments drawn at their usual place on the gun mesh (FarCry5Stereo.h)
+        m_part_snap = on;
+        persist     = true;
+        spdlog::info("[GunStill] partsnap {}", on ? "on: each rigid part of the gun in hand drawn at the gun mesh's transform times its usual place on it" : "off: parts as the game places them (measured only)");
+        return true;
+    }
+    if (cmd == "gunstillwideobj") {   // the weapon pass's 192 / 384 byte object constants kept too (parts drawn with them can place the camera)
+        m_gst_wide_obj = on;
+        persist        = true;
+        spdlog::info("[GunStill] gunstillwideobj {}", on ? "on: parts drawn with a 192 or 384 byte object-constants buffer can place the gun too" : "off (as before 12 Nov)");
+        return true;
+    }
     if (cmd == "gunstillpartcheck") { m_gst_part_check = on; persist = true; return true; }   // gunstilllate parts: no broken or resized part (muzzle flash) places the gun
     if (cmd == "gunstillpredict") {   // test: the next update's gun guessed by hold | linear | timed | half
         m_gst_predict = arg == "hold" ? 0 : arg == "timed" ? 2 : arg == "half" ? 3 : 1;
@@ -2329,6 +2706,92 @@ bool FarCry5Stereo::gun_still_command(const std::string& cmd, const std::string&
                      "(not finite or collapsed: a muzzle flash), {} guesses refused (the part resized since it was learned, or the guess not finite)",
                      m_gst_dbg_noobj, m_gst_dbg_noobj_size, m_gst_dbg_seen, m_gst_dbg_tries, m_gst_dbg_mesh, m_gst_dbg_learn, m_gst_part_check.load() ? "on" : "off",
                      m_gst_part_unfit, m_gst_part_refused);
+        spdlog::info("[GunStill] guessed draws: {} indexed draws in {} guessed passes were drawn before the camera was placed again ({} with no kept object "
+                     "constants, {} no known part, {} broken) | the guess those passes used: {:.3f} cm / {:.3f} deg mean, {:.2f} cm / {:.2f} deg max | gunstillwideobj {}: "
+                     "{} wide part draws taken as a transform, {} not one | the bare arms, drawn first: {} draws before the camera was placed again (not in the count)",
+                     m_gst_geo_n, m_gst_geo_passes, m_gst_geo_noobj, m_gst_geo_unknown, m_gst_geo_broken, m_gst_geo_cm / double(std::max<uint64_t>(1, m_gst_geo_passes)),
+                     m_gst_geo_deg / double(std::max<uint64_t>(1, m_gst_geo_passes)), m_gst_geo_max_cm, m_gst_geo_max_deg, m_gst_wide_obj.load() ? "on" : "off", m_gst_wide_yes,
+                     m_gst_wide_no, m_gst_geo_arms);
+        m_gst_geo_arms = 0;
+        m_gst_geo_n = m_gst_geo_passes = m_gst_geo_noobj = m_gst_geo_broken = m_gst_geo_unknown = m_gst_wide_yes = m_gst_wide_no = 0;
+        m_gst_geo_cm = m_gst_geo_deg = 0.0;
+        m_gst_geo_max_cm = m_gst_geo_max_deg = 0.0f;
+        spdlog::info("[GunStill] parts on the gun: {} rigid part draws with this update's gun known ({} more before it was), {} measured against their usual place on the "
+                     "gun mesh: {:.3f} mm / {:.4f} deg mean, {:.2f} mm / {:.3f} deg max (as the game places them, measured in doubles); {} away from it (not on the gun, or moving on it: left "
+                     "alone) | partsnap {}: {} draws put at their usual place, as drawn {:.3f} mm mean, {:.2f} mm max from it",
+                     m_ps_seen, m_ps_nogun, m_ps_measured, m_ps_mm / double(std::max<uint64_t>(1, m_ps_measured)), m_ps_deg / double(std::max<uint64_t>(1, m_ps_measured)), m_ps_max_mm,
+                     m_ps_max_deg, m_ps_moving, m_part_snap.load() ? "on" : "off", m_ps_snapped, m_ps_drawn_mm / double(std::max<uint64_t>(1, m_ps_drawn_n)), m_ps_drawn_max_mm);
+        m_ps_drawn_n      = 0;
+        m_ps_drawn_mm     = 0.0;
+        m_ps_drawn_max_mm = 0.0f;
+        spdlog::info("{}", fc5::gunexact::stat_line(m_gst_exact.load()));
+        {
+            auto rms = [](double s2, uint64_t n) { return n ? std::sqrt(s2 / double(n)) : 0.0; };
+            const auto& w = m_cf_stat[0];
+            const auto& g = m_cf_stat[1];
+            spdlog::info("[GunStill] float grid, camfine {}: each eye's camera as uploaded against its exact place | world pass {:.4f} mm rms, {:.3f} max, its change frame to frame {:.4f} "
+                         "rms, {:.3f} max ({} uploads, {} not taken) | weapon pass {:.4f} mm rms, {:.3f} max, change {:.4f} rms, {:.3f} max ({} uploads, {} not taken) | the other way "
+                         "(camfine {}) they would read: world {:.4f} rms, {:.3f} max, weapon {:.4f} rms, {:.3f} max | previous cameras written exactly: world {}, weapon {} | the grip "
+                         "against the eye, world-size floats against the tracking offsets: {:.4f} mm rms, {:.3f} max ({}) | the gun against the game camera (gunstill), single floats "
+                         "against doubles with the fractions: {:.4f} mm rms, {:.3f} max ({}) | passes first placed from the copy or a part: with its fraction {}, without {} (gun mesh and right eye "
+                         "placements then kept without fractions: {}) | the gun's motion for DLSS (gunmv), single floats against doubles, at the gun's origin: {:.2f} px rms, {:.2f} max ({}) "
+                         "| 1 mm at 25 cm is {:.1f} render pixels",
+                         m_cam_fine.load() ? "on" : "off", rms(w.e2, w.n), w.e_max, rms(w.chg2, w.chg_n), w.chg_max, w.n, w.skipped, rms(g.e2, g.n), g.e_max, rms(g.chg2, g.chg_n), g.chg_max,
+                         g.n, g.skipped, m_cam_fine.load() ? "off" : "on", m_cam_fine.load() ? rms(w.old2, w.n) : 0.0, m_cam_fine.load() ? w.old_max : 0.0f,
+                         m_cam_fine.load() ? rms(g.old2, g.n) : 0.0, m_cam_fine.load() ? g.old_max : 0.0f, w.prev_fine, g.prev_fine, rms(m_cf_grip2, m_cf_grip_n), m_cf_grip_max, m_cf_grip_n,
+                         rms(m_cf_q2, m_cf_q_n), m_cf_q_max, m_cf_q_n, m_cf_est_frac, m_cf_est_nofrac, m_cf_mesh_nofrac, rms(m_cf_mv2, m_cf_mv_n), m_cf_mv_max, m_cf_mv_n, m_cf_px_per_mm);
+            m_cf_est_frac = m_cf_est_nofrac = m_cf_mesh_nofrac = 0;
+            m_cf_mv_n   = 0;
+            m_cf_mv2    = 0.0;
+            m_cf_mv_max = 0.0f;
+            for (auto& st : m_cf_stat) {
+                const bool       h0 = st.have[0], h1 = st.have[1];
+                const glm::dvec3 p0 = st.prev[0], p1 = st.prev[1];
+                st         = CamFineStat{};
+                st.have[0] = h0;
+                st.have[1] = h1;
+                st.prev[0] = p0;
+                st.prev[1] = p1;
+            }
+            spdlog::info("[GunStill] float grid, handfine {}: the hands' transforms (Om^-1 A Om), single floats against doubles with the fractions, as drawn: {:.4f} mm rms, {:.3f} max ({} "
+                         "hand draws, {} not taken) | a hand's place from the gun's, map-size floats against the tracking offsets: {:.4f} mm rms, {:.3f} max ({}) | the moved reload parts "
+                         "(magazine, shell, round, handle), their last product only: {:.4f} mm rms, {:.3f} max ({} bones, {} not taken)",
+                         m_hand_fine.load() ? "on" : "off", rms(m_hf_hand2, m_hf_hand_n), m_hf_hand_max, m_hf_hand_n, m_hf_hand_refused, rms(m_hf_diff2, m_hf_diff_n), m_hf_diff_max, m_hf_diff_n,
+                         rms(m_hf_part2, m_hf_part_n), m_hf_part_max, m_hf_part_n, m_hf_part_refused);
+            spdlog::info("[GunStill] float grid, nearfine {}: what the mod places itself, as uploaded (a rounded float beside another place's fraction) against exact | holstered, slung and "
+                         "hip copies, the holster: {:.4f} mm rms, {:.3f} max ({} parts, {} not taken) | the throwable in the hand and its pouch: {:.4f} mm rms, {:.3f} max ({}, {} not taken) | "
+                         "the arrow in the hand: {:.4f} mm rms, {:.3f} max ({}, {} not taken)",
+                         m_near_fine.load() ? "on" : "off", rms(m_nf2[0], m_nf_n[0]), m_nf_max[0], m_nf_n[0], m_nf_refused[0], rms(m_nf2[1], m_nf_n[1]), m_nf_max[1], m_nf_n[1], m_nf_refused[1],
+                         rms(m_nf2[2], m_nf_n[2]), m_nf_max[2], m_nf_n[2], m_nf_refused[2]);
+            spdlog::info("[GunStill] float grid, set 9 (hintfine {}, hintunjitter {}, armfine {}): the glow's bones of parts that are not moved, back from the world against the game's own "
+                         "bone: {:.4f} mm rms, {:.3f} max ({} bones) | the hands' centre points, map-size floats against small numbers with the fractions: {:.4f} mm rms, {:.3f} max ({}) | "
+                         "the body IK's object -> drawn world matrix, single floats against doubles: {:.4f} mm rms, {:.3f} max ({} draws)",
+                         m_hint_fine.load() ? "on" : "off", m_hint_unjit.load() ? "on" : "off", m_arm_fine.load() ? "on" : "off", rms(m_s9_2[0], m_s9_n[0]), m_s9_max[0], m_s9_n[0],
+                         rms(m_s9_2[1], m_s9_n[1]), m_s9_max[1], m_s9_n[1], rms(m_s9_2[2], m_s9_n[2]), m_s9_max[2], m_s9_n[2]);
+            for (int a = 0; a < 3; ++a) {
+                m_s9_n[a]   = 0;
+                m_s9_2[a]   = 0.0;
+                m_s9_max[a] = 0.0f;
+                m_nf_n[a] = m_nf_refused[a] = 0;
+                m_nf2[a]    = 0.0;
+                m_nf_max[a] = 0.0f;
+            }
+            m_hf_hand_n = m_hf_hand_refused = m_hf_part_n = m_hf_part_refused = m_hf_diff_n = 0;
+            m_hf_hand2 = m_hf_part2 = m_hf_diff2 = 0.0;
+            m_hf_hand_max = m_hf_part_max = m_hf_diff_max = 0.0f;
+            m_cf_grip_n = m_cf_q_n = 0;
+            m_cf_grip2 = m_cf_q2 = 0.0;
+            m_cf_grip_max = m_cf_q_max = 0.0f;
+        }
+        spdlog::info("[GunStill] skinned parts on the gun (flip-up sights, bolt, bullets; measured only): {} draws, the object transform of {} against its usual place on the gun mesh: "
+                     "{:.3f} mm mean, {:.2f} mm max; {} away from it",
+                     m_ps_sk_seen, m_ps_sk_measured, m_ps_sk_mm / double(std::max<uint64_t>(1, m_ps_sk_measured)), m_ps_sk_max_mm, m_ps_sk_moving);
+        m_ps_sk_seen = m_ps_sk_measured = m_ps_sk_moving = 0;
+        m_ps_sk_mm     = 0.0;
+        m_ps_sk_max_mm = 0.0f;
+        m_ps_seen = m_ps_measured = m_ps_snapped = m_ps_moving = m_ps_nogun = 0;
+        m_ps_mm = m_ps_deg = 0.0;
+        m_ps_max_mm = m_ps_max_deg = 0.0f;
         m_gst_dbg_noobj = m_gst_dbg_seen = m_gst_dbg_tries = m_gst_dbg_mesh = m_gst_dbg_learn = 0;
         m_gst_part_unfit = m_gst_part_refused = 0;
         m_gst_est_n = m_gst_est_none = m_gst_est_chk = m_gst_est_bad = 0;
@@ -2377,6 +2840,7 @@ void FarCry5Stereo::gun_still_load()
     std::string   line;
     int           n = 0;
     int           grips = 0;
+    int           mholds = 0;
     while (std::getline(f, line)) {
         std::istringstream ls{ line };
         if (line.rfind("rhand ", 0) == 0) {   // gunaxes: the game's right hand in the gun's axes
@@ -2387,6 +2851,22 @@ void FarCry5Stereo::gun_still_load()
                 auto& ax = m_gst->axes[hsig];
                 ax.h     = h;
                 ax.n     = 90;
+            }
+            continue;
+        }
+        if (line.rfind("mhold ", 0) == 0) {   // meleegripfist: a melee weapon in the game's hand (palm^-1 x weapon: w x y z, its origin from the hand's centre)
+            std::string tag;
+            uint32_t    msig = 0;
+            glm::quat   r{ 1.0f, 0.0f, 0.0f, 0.0f };
+            glm::vec3   t{ 0.0f };
+            if ((ls >> tag >> msig >> r.w >> r.x >> r.y >> r.z >> t.x >> t.y >> t.z) && msig != 0 && glm::length(r) > 0.5f && glm::length(t) < 0.6f &&
+                std::isfinite(r.w + r.x + r.y + r.z + t.x + t.y + t.z)) {
+                auto& ih = m_mel_inhand[msig];
+                ih.r     = glm::normalize(r);
+                ih.t     = t;
+                ih.n     = 20;   // (refined at 10 % a sample, a far sample near a press refused, as once learned in a session)
+                ih.kept  = true;
+                ++mholds;
             }
             continue;
         }
@@ -2421,6 +2901,7 @@ void FarCry5Stereo::gun_still_load()
         ++n;
     }
     if (n || grips) spdlog::info("[Motion] gunstill: {} weapons' poses and {} grip points read from fc5vr_gunposes.txt", n, grips);
+    if (mholds) spdlog::info("[Melee] hold: {} melee weapons' place in the game's hand read from fc5vr_gunposes.txt (held at once on the first grab)", mholds);
     // gunposebuiltin (Stereo.h): what the file does not have, from the built-in table (measured for every weapon in the simulator).
     if (m_gun_builtin.load()) {
         int bp = 0, bg = 0, bh = 0;
@@ -2483,6 +2964,10 @@ void FarCry5Stereo::gun_still_save()
     // gunaxes: each gun's right hand in its own axes, once measured over 90 updates.
     for (const auto& [sig, ax] : m_gst->axes)
         if (ax.n >= 90) f << "rhand " << sig << ' ' << ax.h.x << ' ' << ax.h.y << ' ' << ax.h.z << '\n';
+    // meleegripfist: each melee weapon's place in the game's hand, once learned (or kept from an earlier session).
+    for (const auto& [sig, ih] : m_mel_inhand)
+        if (sig != 0 && (ih.kept || ih.n >= 60))
+            f << "mhold " << sig << ' ' << ih.r.w << ' ' << ih.r.x << ' ' << ih.r.y << ' ' << ih.r.z << ' ' << ih.t.x << ' ' << ih.t.y << ' ' << ih.t.z << '\n';
     spdlog::info("[Motion] gunstill: {} weapons' poses and {} grip points saved to fc5vr_gunposes.txt", n, g);
 }
 
@@ -2518,6 +3003,7 @@ const char* FarCry5Stereo::gun_axes_status() const
 bool FarCry5Stereo::two_hand_blocked(uint32_t sig)
 {
     if (two_hand_game_blocked(sig)) return true;
+    if (melee_weapon(sig)) return true;   // melee fix 17 (author 16 Nov 13:27Z): a melee weapon is held in one hand only, the other hand stays free
     std::lock_guard _{ m_weapon_cal_mtx };
     return m_two_hand_block.contains(sig);
 }

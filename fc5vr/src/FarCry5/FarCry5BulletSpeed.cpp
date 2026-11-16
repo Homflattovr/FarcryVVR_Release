@@ -15,6 +15,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -266,9 +268,88 @@ namespace fc5::bullet
         std::atomic<uint64_t>              g_rel_press_ms{ 0 }, g_rel_weapon{ 0 };
         // shotbuzz: the callback, the press whose first shot named the player's weapon, that weapon (r14).
         std::atomic<void (*)()>            g_shot_cb{ nullptr };
-        std::atomic<uint64_t>              g_buzz_press{ 0 }, g_buzz_weapon{ 0 };
-        // The ammo ledger's one-shot hold (FarCry5Reload.cpp ledger_on_shot): the player's shots, told as they happen (as shotbuzz finds them).
-        std::atomic<uint64_t>              g_pl_press{ 0 }, g_pl_weapon{ 0 };
+        // shotowner: the mod's releases counted (GetTickCount64 of the last one), for the shot code call that follows each.
+        std::atomic<uint64_t>              g_rel_seq{ 0 }, g_rel_ms{ 0 };
+        std::atomic<bool>                  g_owner_on{ true };   // shotowner on|off (not saved; F11 Tests)
+        std::mutex                         g_owner_mtx;
+
+        // shotowner-begin (kept free of Windows and game code: research\2026-11-15_norecoil\shotowner_harness.cpp compiles this part)
+        // shotowner (author 15 Nov 21:22, his play of 21:35-22:17):
+        // which shot code calls are the player's shots. Recoil's kick (fc5::recoil::note_shot), the shot pulse (shotbuzz) and the ammo
+        // ledger's last-round hold all hang on that answer.
+        // Before: "the first call of a press is the player's weapon, later calls only from that weapon", a press lasting while the
+        // trigger comes back within 500 ms. Another character's shot landing first (in the fire gate's wait after the press, or the
+        // 1-50 ms before the game's own shot) took the whole press: none of the player's shots kicked the gun or buzzed until the trigger
+        // had rested 500 ms (a semi-automatic fired steadily, or bursts close together, is one long press). In that play the AR-C's last
+        // round (21:49:43.9) left with no ledger count, so no kick: the only sign the log can show.
+        // Now: the first call after each of the mod's releases (within 500 ms of it) is the player's, and so is every call, while the
+        // trigger is down or within 500 ms of it, from one of the last 4 weapon objects so taken (main weapon, sidearm, ...). So another
+        // character firing first costs at most that one release's first shot of a new weapon, never the press. A taken object that fires
+        // with the player's trigger up for over 1.5 s is someone else's gun: it is dropped from the list.
+        struct ShotOwner
+        {
+            static constexpr int      kSlots = 4;
+            static constexpr uint64_t kWindowMs = 500, kOtherMs = 1500;
+            uint64_t mine[kSlots]{};
+            uint64_t rel_seen{ 0 };
+            uint64_t old_press{ 0 }, old_w{ 0 };   // the rule before (kept for the log: when the two disagree)
+
+            bool is_mine(uint64_t w) const
+            {
+                if (w == 0) return false;
+                for (uint64_t m : mine)
+                    if (m == w) return true;
+                return false;
+            }
+            void add_mine(uint64_t w)
+            {
+                int i = kSlots - 1;
+                for (int k = 0; k < kSlots; ++k)
+                    if (mine[k] == w) { i = k; break; }
+                for (; i > 0; --i) mine[i] = mine[i - 1];
+                mine[0] = w;
+            }
+            bool drop_mine(uint64_t w)
+            {
+                for (int k = 0; k < kSlots; ++k)
+                    if (mine[k] == w) {
+                        for (int j = k; j < kSlots - 1; ++j) mine[j] = mine[j + 1];
+                        mine[kSlots - 1] = 0;
+                        return true;
+                    }
+                return false;
+            }
+            enum Why { kNotPlayer = 0, kReleased, kMine, kOther, kDropped };
+            // w: the weapon object of this shot code call (r14). now, trig: GetTickCount64 now and of the player's last trigger frame;
+            // press: the press's start; rel_seq, rel: the mod's releases so far and the last one's time. old_take: what the rule before said.
+            Why take(uint64_t w, uint64_t now, uint64_t trig, uint64_t press, uint64_t rel_seq, uint64_t rel, bool& old_take)
+            {
+                old_take = false;
+                const uint64_t up = now > trig ? now - trig : 0;
+                if (trig == 0 || up > kOtherMs) return drop_mine(w) ? kDropped : kNotPlayer;
+                if (up > kWindowMs) return kNotPlayer;
+                if (old_press != press) {
+                    old_press = press;
+                    old_w     = w;
+                }
+                old_take = w == old_w;
+                const bool first = rel_seq != rel_seen && rel != 0 && (now <= rel || now - rel <= kWindowMs);
+                if (first) rel_seen = rel_seq;
+                if (is_mine(w)) {
+                    if (first) add_mine(w);
+                    return kMine;
+                }
+                if (first) {
+                    add_mine(w);
+                    return kReleased;
+                }
+                return kOther;
+            }
+        };
+        // shotowner-end
+        ShotOwner g_owner;   // game thread (g_owner_mtx)
+        // shotowner's log: calls the two rules disagree on, told once per press (and counted).
+        std::atomic<uint64_t> g_own_new_only{ 0 }, g_own_old_only{ 0 }, g_own_logged_new{ 0 }, g_own_logged_old{ 0 };
 
         bool read_f(const float* p, float& v)
         {
@@ -286,17 +367,37 @@ namespace fc5::bullet
         void speed_probe(safetyhook::Context& c)
         {
             const uint64_t n = ++g_shots;
-            if (GetTickCount64() - g_player_fire_ms.load() <= 500) {
-                // the ammo ledger: the first shot code call of a press is the player's weapon; later calls count only from that weapon (as shotbuzz).
-                const uint64_t press = g_press_ms.load();
-                if (g_pl_press.exchange(press) != press) g_pl_weapon = c.r14;
-                if (c.r14 == g_pl_weapon.load()) fc5::reload::ledger_on_shot();
-            }
-            if (auto cb = g_shot_cb.load(); cb && GetTickCount64() - g_player_fire_ms.load() <= 500) {
-                // shotbuzz: the first shot code call of a press is the player's weapon; later calls count only from that weapon.
-                const uint64_t press = g_press_ms.load();
-                if (g_buzz_press.exchange(press) != press) g_buzz_weapon = c.r14;
-                if (c.r14 == g_buzz_weapon.load()) cb();
+            {
+                // shotowner (ShotOwner above): is this call one of the player's shots? Then the ammo ledger, the shot pulse and recoil hear of it.
+                bool                 old_take = false;
+                ShotOwner::Why       why      = ShotOwner::kNotPlayer;
+                const uint64_t       press    = g_press_ms.load();
+                const uint64_t       trig     = g_player_fire_ms.load();
+                const uint64_t       rel_seq  = g_rel_seq.load();   // read before its time (note_shot_release writes the time first)
+                const uint64_t       rel_ms   = g_rel_ms.load();
+                {
+                    std::lock_guard _{ g_owner_mtx };
+                    why = g_owner.take(c.r14, GetTickCount64(), trig, press, rel_seq, rel_ms, old_take);
+                }
+                const bool new_take = why == ShotOwner::kReleased || why == ShotOwner::kMine;
+                const bool mine     = g_owner_on.load() ? new_take : old_take;
+                if (mine) {
+                    fc5::reload::ledger_on_shot();
+                    if (auto cb = g_shot_cb.load()) cb();
+                }
+                if (new_take != old_take) {
+                    if (new_take) ++g_own_new_only;
+                    else ++g_own_old_only;
+                    if ((new_take ? g_own_logged_new : g_own_logged_old).exchange(press) != press)
+                        spdlog::info("[Shot] shotowner {}: weapon object {:x} {} ({}); the rule before 15 Nov {} it (so far {} such calls taken only now, {} only before)",
+                                     g_owner_on.load() ? "on" : "off", c.r14, new_take ? "is the player's" : "is not the player's",
+                                     why == ShotOwner::kReleased ? "the first shot after the mod let the trigger through"
+                                     : why == ShotOwner::kMine   ? "one of the player's weapons"
+                                                                 : "another gun fired while the trigger was down",
+                                     old_take ? "took" : "left out (another gun had fired first in this press)", g_own_new_only.load(), g_own_old_only.load());
+                } else if (why == ShotOwner::kDropped) {
+                    spdlog::info("[Shot] shotowner: weapon object {:x} fired with the trigger up for over 1.5 s: not the player's, taken off the list", c.r14);
+                }
             }
             if (g_rel_armed.exchange(false)) {
                 const int64_t ms = (std::chrono::steady_clock::now().time_since_epoch().count() - g_rel_t.load()) / 1000000;
@@ -370,9 +471,21 @@ namespace fc5::bullet
         g_rel_weapon   = weapon;
         g_rel_t        = std::chrono::steady_clock::now().time_since_epoch().count();
         g_rel_armed    = true;
+        g_rel_ms       = GetTickCount64();   // shotowner: the next shot code call is the player's
+        g_rel_seq.fetch_add(1);
     }
+    void set_shot_owner(bool on)
+    {
+        g_owner_on = on;
+        spdlog::info("[Shot] shotowner {}: {} (so far {} shot code calls taken only by the new rule, {} only by the old one)", on ? "on" : "off",
+                     on ? "the player's shots are the first after each release and every later one from the player's weapons"
+                        : "as before 15 Nov: the weapon of the press's first shot",
+                     g_own_new_only.load(), g_own_old_only.load());
+    }
+    bool shot_owner() { return g_owner_on.load(); }
     bool  speed_available() { return (bool)g_speed_hook; }
     void  set_player_shot_callback(void (*cb)()) { g_shot_cb = cb; }
+    uint64_t shot_calls() { return g_shots.load(); }
 
     void speed_status()
     {

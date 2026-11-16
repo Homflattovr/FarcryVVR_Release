@@ -22,6 +22,9 @@
 namespace runtimes{
 struct OpenXR final : public VRRuntime {
     inline static double s_fc5_wait_ms{0.0}, s_fc5_end_ms{0.0}, s_fc5_copy_ms{0.0};   // Far Cry 5 submit timing (pacing log)
+    // Performance pass 13 Nov: the parts of "eye copies" spent inside xrAcquireSwapchainImage, xrWaitSwapchainImage and
+    // xrReleaseSwapchainImage (the headset software's side), so the pacing line tells a wait there from the copy itself.
+    inline static double s_fc5_copy_acquire_ms{0.0}, s_fc5_copy_wait_ms{0.0}, s_fc5_copy_release_ms{0.0};
     // Far Cry 5 hitchlog: the same times as running totals in microseconds (never reset), read before and after each game call.
     inline static std::atomic<int64_t> s_fc5_wait_us{0}, s_fc5_begin_us{0}, s_fc5_end_us{0}, s_fc5_copy_us{0};
     // Far Cry 5 framelock (29 Oct, replaces xrhalf): every picture is shown for the same number of refreshes. -1 auto, 0 off,
@@ -41,6 +44,11 @@ struct OpenXR final : public VRRuntime {
     inline static std::atomic<uint32_t> s_fc5_local_space_changes{0};
     inline static std::atomic<uint32_t> s_fc5_vismask_changes{0};   // hidmask: XrEventDataVisibilityMaskChangedKHR seen (Far Cry 5 re-reads the hidden area)
     inline static std::atomic<int64_t>  s_fc5_local_space_change_time{0};
+    // xrlocalfix (FC5, 16 Nov): SteamVR through its Oculus driver (Quest by Virtual Desktop's SteamVR mode) can hand out a
+    // LOCAL space that is upside down (turned 180 deg about X, origin at the floor): the whole picture, menus included,
+    // upside down. On (default, not saved): LOCAL is checked against STAGE and, if its up is over 30 deg off, the mod's
+    // space becomes a level STAGE space at the head. Off: the runtime's LOCAL as before.
+    inline static std::atomic<bool>     s_fc5_local_fix{true};
     inline static std::chrono::steady_clock::time_point s_fc5_last_wait_return{};
 
     enum class SwapchainIndex: uint8_t {
@@ -76,6 +84,13 @@ struct OpenXR final : public VRRuntime {
     bool                            fc5_menu_proj_ready{false};
     XrPosef                         fc5_menu_proj_pose[2]{};
     XrFovf                          fc5_menu_proj_fov[2]{};
+    // Far Cry 5 menus in VR: each eye's kept play image (D3D11Component fc5_backdrop_keep) and the pose, field and image rectangle
+    // (x, y, width, height as fractions of the swapchain) it went to the headset with, taken at the next end_frame.
+    bool                            fc5_backdrop_pending[2]{};
+    bool                            fc5_backdrop_valid[2]{};
+    XrPosef                         fc5_backdrop_pose[2]{};
+    XrFovf                          fc5_backdrop_fov[2]{};
+    float                           fc5_backdrop_rect[2][4]{};
     static bool fc5_simulator_runtime() {
         static const bool sim = [] {
             char rt[512]{};
@@ -150,6 +165,7 @@ struct OpenXR final : public VRRuntime {
 
     VRRuntime::Error synchronize_frame(int frame) override;
     VRRuntime::Error update_poses(int frame) override;
+    void fc5_check_local_upright(XrTime display_time);   // xrlocalfix
     VRRuntime::Error update_render_target_size() override;
     uint32_t get_width() const override;
     uint32_t get_height() const override;
@@ -257,6 +273,13 @@ public:
     XrSession session{XR_NULL_HANDLE};
     XrSpace stage_space{XR_NULL_HANDLE};
     XrSpace view_space{XR_NULL_HANDLE}; // for generating view matrices
+    // xrlocalfix: the runtime's own LOCAL space (stage_space as created), a plain STAGE space to check it against, and
+    // the state: 0 not checked yet, 1 LOCAL upright (used), 2 replaced by a level STAGE space, -1 no STAGE (LOCAL used).
+    XrSpace fc5_local_raw{XR_NULL_HANDLE};
+    XrSpace fc5_stage_ref{XR_NULL_HANDLE};
+    int      fc5_local_state{0};
+    uint32_t fc5_local_changes_checked{0};
+    int      fc5_local_tries{0};
     XrSystemId system{XR_NULL_SYSTEM_ID};
     XrFormFactor form_factor{XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY};
     XrViewConfigurationType view_config{XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO};

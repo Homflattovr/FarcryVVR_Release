@@ -26,7 +26,33 @@ namespace fc5::hidmask
         const char* kSrc = R"(
 float4 main(float2 p : POSITION) : SV_Position { return float4(p, DEPTH_Z, 1.0); }
 )";
+        // hidmask black (author 14 Nov 12:23Z): the
+        // hidden triangles filled black in the finished eye image, so the headset's reprojection shows black there on a fast turn instead
+        // of the leftovers the game no longer draws. Two variants: an ordinary colour target (the swap chain's eye image, DLAA) and a
+        // UAV-only image (the DLSS eye image), written from the pixel shader with no render target bound (like hudmarksize's boxes).
+        // afwpereye: a third variant (MARK) writes AFW's "no texel here" value into its R32F depth copy (kHiddenMark).
+        const char* kBlackSrc = R"(
+#ifdef USE_UAV
+RWTexture2D<float4> img : register(u0);
+void main(float4 pos : SV_Position) { img[uint2(pos.xy)] = float4(0.0, 0.0, 0.0, 1.0); }
+#elif defined(MARK)
+float4 main(float4 pos : SV_Position) : SV_Target { return float4(1.0e30, 1.0e30, 1.0e30, 1.0); }
+#else
+float4 main(float4 pos : SV_Position) : SV_Target { return float4(0.0, 0.0, 0.0, 1.0); }
+#endif
+)";
         std::atomic<int> g_mode{ kOff };
+        // hidmask cover (author 14 Nov 12:43Z): 1 = the runtime's whole hidden area; 0.5 = each inner corner of the mesh moved half
+        // way out to the image edge, along its line from the eye's straight-ahead point, so the masked band is half as deep. 50 % is the
+        // default (author 12:44Z).
+        std::atomic<float> g_cover{ kDefaultCover };
+        // hidmaskturn (author 14 Nov 16:14Z): in a head turn
+        // faster than this (degrees per second; 0 = never), the frames are drawn without the mask, so a late frame the headset shifts
+        // shows picture at the lens edge, not black. The speed holds for about 0.3 s after the turn slows (store_xr_views).
+        std::atomic<float>    g_turn_dps{ kDefaultTurnDps };
+        std::atomic<float>    g_head_dps{ 0.0f };
+        std::atomic<bool>     g_turning{ false };
+        std::atomic<uint64_t> g_turn_frames{ 0 };
 
         std::mutex             g_mtx;   // the triangles (fetch on any thread, stamp on the render thread)
         std::vector<XrVector2f> g_tri[2];   // per eye: the hidden triangles' corners, three per triangle, in tangent units (z = -1 plane)
@@ -53,6 +79,13 @@ float4 main(float2 p : POSITION) : SV_Position { return float4(p, DEPTH_Z, 1.0);
             float         hidden = 0.0f;   // share of the eye image (0-1)
         };
         EyeVb g_eye[2];
+
+        ID3D11PixelShader* g_ps_black[3]{};   // 0: render target, 1: UAV, 2: AFW's hidden mark (afwpereye)
+        bool               g_black_failed = false;
+        bool               g_black_logged = false;   // one line for an eye image it cannot draw into
+        std::atomic<uint64_t> g_black[2]{};          // [eye]
+        std::atomic<uint64_t> g_marks[2]{};          // [eye] afwpereye: AFW depth copies marked
+        std::atomic<uint64_t> g_black_fail{ 0 };
 
         std::atomic<uint64_t> g_stamps[2][2]{};   // [eye][near]
         std::atomic<uint64_t> g_fail{ 0 };
@@ -128,7 +161,21 @@ float4 main(float2 p : POSITION) : SV_Position { return float4(p, DEPTH_Z, 1.0);
                 const auto& t = g_tri[eye];
                 v.reserve(t.size() * 2);
                 const float l = tan[0], r = tan[1], u = tan[2], d = tan[3];
-                for (const auto& p : t) {
+                const float k = 1.0f - std::clamp(g_cover.load(), 0.1f, 1.0f);   // share of the way out to the edge
+                const bool  centred = l < 0.0f && r > 0.0f && d < 0.0f && u > 0.0f;
+                for (const auto& p0 : t) {
+                    XrVector2f p = p0;
+                    if (k > 0.0f && centred && (p.x != 0.0f || p.y != 0.0f)) {
+                        // Where the line from straight ahead through p leaves the image (p * te); a corner on or past the edge stays.
+                        const float tx = p.x > 0.0f ? r / p.x : p.x < 0.0f ? l / p.x : 1e30f;
+                        const float ty = p.y > 0.0f ? u / p.y : p.y < 0.0f ? d / p.y : 1e30f;
+                        const float te = std::min(tx, ty);
+                        if (te > 1.0f) {
+                            const float s = 1.0f + k * (te - 1.0f);
+                            p.x *= s;
+                            p.y *= s;
+                        }
+                    }
                     v.push_back((2.0f * p.x - (r + l)) / (r - l));
                     v.push_back((2.0f * p.y - (u + d)) / (u - d));
                 }
@@ -159,9 +206,51 @@ float4 main(float2 p : POSITION) : SV_Position { return float4(p, DEPTH_Z, 1.0);
             e.count  = UINT(v.size() / 2);
             e.hidden = float(hidden) / float(kGrid * kGrid);
             std::memcpy(e.tan, tan, sizeof e.tan);
-            spdlog::info("[HidMask] {} eye: {} hidden triangles, {:.1f} % of the eye image (tangents L {:.3f} R {:.3f} U {:.3f} D {:.3f})", eye ? "right" : "left", e.count / 3,
-                         e.hidden * 100.0f, tan[0], tan[1], tan[2], tan[3]);
+            spdlog::info("[HidMask] {} eye: {} hidden triangles, cover {:.0f} %, {:.1f} % of the eye image (tangents L {:.3f} R {:.3f} U {:.3f} D {:.3f})", eye ? "right" : "left", e.count / 3,
+                         g_cover.load() * 100.0f, e.hidden * 100.0f, tan[0], tan[1], tan[2], tan[3]);
             return true;
+        }
+    }
+
+    namespace
+    {
+        bool black_init(ID3D11Device* dev)
+        {
+            if (g_ps_black[0] || g_black_failed) return g_ps_black[0] != nullptr;
+            using CompileFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+            static auto fn = reinterpret_cast<CompileFn>(GetProcAddress(LoadLibraryA("d3dcompiler_47.dll"), "D3DCompile"));
+            bool ok = fn != nullptr;
+            for (int k = 0; k < 3 && ok; ++k) {
+                const D3D_SHADER_MACRO uav[]{ { "USE_UAV", "1" }, { nullptr, nullptr } };
+                const D3D_SHADER_MACRO mrk[]{ { "MARK", "1" }, { nullptr, nullptr } };
+                ID3DBlob* code = nullptr;
+                ID3DBlob* err  = nullptr;
+                ok = SUCCEEDED(fn(kBlackSrc, std::strlen(kBlackSrc), "fc5_hidmask_black", k == 1 ? uav : k == 2 ? mrk : nullptr, nullptr, "main", "ps_5_0", 0, 0, &code, &err)) &&
+                     SUCCEEDED(dev->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_ps_black[k]));
+                if (!ok) spdlog::error("[HidMask] black shader: {}", err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
+                if (err) err->Release();
+                if (code) code->Release();
+            }
+            if (!ok) {
+                for (auto*& p : g_ps_black) { if (p) p->Release(); p = nullptr; }
+                g_black_failed = true;
+                spdlog::error("[HidMask] could not make the black fill's shaders: the hidden area is not drawn black");
+            }
+            return ok;
+        }
+
+        // A typed view format for the eye image (a TYPELESS image needs one; a UAV cannot be sRGB).
+        DXGI_FORMAT view_format(DXGI_FORMAT f, bool uav)
+        {
+            switch (f) {
+            case DXGI_FORMAT_R8G8B8A8_TYPELESS:     return DXGI_FORMAT_R8G8B8A8_UNORM;
+            case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:   return uav ? DXGI_FORMAT_R8G8B8A8_UNORM : f;
+            case DXGI_FORMAT_B8G8R8A8_TYPELESS:     return DXGI_FORMAT_B8G8R8A8_UNORM;
+            case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:   return uav ? DXGI_FORMAT_B8G8R8A8_UNORM : f;
+            case DXGI_FORMAT_R10G10B10A2_TYPELESS:  return DXGI_FORMAT_R10G10B10A2_UNORM;
+            case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+            default:                                return f;
+            }
         }
     }
 
@@ -171,6 +260,30 @@ float4 main(float2 p : POSITION) : SV_Position { return float4(p, DEPTH_Z, 1.0);
         if (g_mode.exchange(m) != m) spdlog::info("[HidMask] hidmask {}", mode_name(m));
     }
     int mode() { return g_mode.load(); }
+    void set_cover(float c)
+    {
+        c = std::clamp(c, 0.1f, 1.0f);
+        if (std::abs(g_cover.exchange(c) - c) > 1e-4f) {
+            g_gen++;   // the eye buffers are rebuilt with the new cover
+            spdlog::info("[HidMask] cover {:.0f} % of the runtime's hidden area", c * 100.0f);
+        }
+    }
+    float cover() { return g_cover.load(); }
+    void set_turn_limit(float dps)
+    {
+        dps = std::clamp(dps, 0.0f, 1000.0f);
+        if (std::abs(g_turn_dps.exchange(dps) - dps) > 0.01f) spdlog::info("[HidMask] off in head turns faster than {:.0f} deg/s{}", dps, dps <= 0.0f ? " (never)" : "");
+    }
+    float turn_limit() { return g_turn_dps.load(); }
+    void head_speed(float dps)
+    {
+        g_head_dps        = dps;
+        const float lim   = g_turn_dps.load();
+        const bool  fast  = lim > 0.0f && dps > lim;
+        g_turning         = fast;
+        if (fast && g_mode.load() != kOff) g_turn_frames++;
+    }
+    bool turning() { return g_turning.load(); }
     const char* mode_name(int m) { return m == kDepth ? "depth" : m == kRestore ? "restore" : "off"; }
 
     void fetch(uint64_t instance, uint64_t session, bool has_ext)
@@ -315,10 +428,111 @@ float4 main(float2 p : POSITION) : SV_Position { return float4(p, DEPTH_Z, 1.0);
         return true;
     }
 
+    namespace
+    {
+        // The hidden triangles of eye 0/1 filled in tex: black (an eye image: render target or UAV-only), or AFW's hidden mark (mark: an
+        // R32F render target).
+        bool fill_area(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, int eye, const float tangents[4], bool mark);
+    }
+
+    bool black(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, int eye, const float tangents[4]) { return fill_area(ctx, tex, eye, tangents, false); }
+
+    bool mark(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, int eye, const float tangents[4]) { return fill_area(ctx, tex, eye, tangents, true); }
+
+    namespace
+    {
+    bool fill_area(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, int eye, const float tangents[4], bool mark)
+    {
+        if (!ctx || !tex || eye < 0 || eye > 1 || !ready()) return false;
+        if (ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return false;
+        if (!(tangents[1] > tangents[0]) || !(tangents[2] > tangents[3])) return false;
+        D3D11_TEXTURE2D_DESC td{};
+        tex->GetDesc(&td);
+        const bool rt  = (td.BindFlags & D3D11_BIND_RENDER_TARGET) != 0;
+        const bool uav = !rt && !mark && (td.BindFlags & D3D11_BIND_UNORDERED_ACCESS) != 0;
+        ID3D11Device* dev = nullptr;
+        ctx->GetDevice(&dev);
+        if (!dev) return false;
+        bool ok = td.Width > 0 && td.Height > 0 && td.SampleDesc.Count == 1 && td.ArraySize == 1 && (rt || uav) && init(dev) && black_init(dev) && build(dev, eye, tangents);
+        ID3D11RenderTargetView*    rtv = nullptr;
+        ID3D11UnorderedAccessView* uv  = nullptr;
+        if (ok) {
+            fc5::ownpass::Scope own;
+            if (rt) {
+                D3D11_RENDER_TARGET_VIEW_DESC rd{};
+                rd.Format        = view_format(td.Format, false);
+                rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                ok = SUCCEEDED(dev->CreateRenderTargetView(tex, &rd, &rtv)) && rtv;
+            } else {
+                D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+                ud.Format        = view_format(td.Format, true);
+                ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+                ok = SUCCEEDED(dev->CreateUnorderedAccessView(tex, &ud, &uv)) && uv;
+            }
+        }
+        dev->Release();
+        if (!ok) {
+            g_black_fail++;
+            if (!g_black_logged && !g_failed && !g_black_failed) {
+                g_black_logged = true;
+                spdlog::info("[HidMask] {}: cannot draw into the {} {}x{} format {} bind {:#x} samples {} layers {} ({})", mark ? "AFW mark" : "black fill",
+                             mark ? "AFW depth copy" : "eye image", td.Width, td.Height, (int)td.Format, td.BindFlags, td.SampleDesc.Count, td.ArraySize,
+                             mark ? "the rebuild may take the hidden area's texels" : "the hidden area is not drawn black");
+            }
+            if (rtv) rtv->Release();
+            if (uv) uv->Release();
+            return false;
+        }
+        ID3D11DeviceContext1* ctx1 = nullptr;
+        if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&ctx1)))) {
+            if (rtv) rtv->Release();
+            if (uv) uv->Release();
+            g_black_fail++;
+            return false;
+        }
+        const EyeVb& e = g_eye[eye];
+        {
+            fc5::ownpass::Scope own;   // the hooks pass these calls through untouched
+            ID3DDeviceContextState* prev = nullptr;
+            ctx1->SwapDeviceContextState(g_state, &prev);
+            const UINT    stride = 8, offset = 0;
+            ID3D11Buffer* vb     = e.vb;
+            ctx->IASetInputLayout(g_layout);
+            ctx->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx->VSSetShader(g_vs[0], nullptr, 0);
+            ctx->PSSetShader(g_ps_black[mark ? 2 : rt ? 0 : 1], nullptr, 0);
+            ctx->RSSetState(g_rs);
+            const D3D11_VIEWPORT vp{ 0.0f, 0.0f, float(td.Width), float(td.Height), 0.0f, 1.0f };
+            ctx->RSSetViewports(1, &vp);
+            ctx->OMSetDepthStencilState(nullptr, 0);   // no depth target bound: no depth test
+            ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
+            if (rt) ctx->OMSetRenderTargets(1, &rtv, nullptr);
+            else    ctx->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 1, &uv, nullptr);
+            ctx->Draw(e.count, 0);
+            // Leave nothing of the game's bound in the mod's state object.
+            if (rt) ctx->OMSetRenderTargets(0, nullptr, nullptr);
+            else    ctx->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 0, nullptr, nullptr);
+            ID3D11Buffer* none = nullptr;
+            ctx->IASetVertexBuffers(0, 1, &none, &stride, &offset);
+            ctx->PSSetShader(nullptr, nullptr, 0);
+            ctx1->SwapDeviceContextState(prev, nullptr);
+            if (prev) prev->Release();
+        }
+        ctx1->Release();
+        if (rtv) rtv->Release();
+        if (uv) uv->Release();
+        (mark ? g_marks : g_black)[eye]++;
+        return true;
+    }
+    }
+
     std::string status()
     {
-        return fmt::format("hidmask {}: mesh {}; hidden {:.1f} % / {:.1f} % of the left / right image; stamps near {} / {}, far (restore) {} / {}; not drawn {}",
-                           mode_name(g_mode.load()), ready() ? "from the runtime" : "none", g_eye[0].hidden * 100.0f, g_eye[1].hidden * 100.0f, g_stamps[0][1].load(),
-                           g_stamps[1][1].load(), g_stamps[0][0].load(), g_stamps[1][0].load(), g_fail.load());
+        return fmt::format("hidmask {} (cover {:.0f} %): mesh {}; hidden {:.1f} % / {:.1f} % of the left / right image; stamps near {} / {}, far (restore) {} / {}; not drawn {}; "
+                           "black fills {} / {}, not drawn {}; AFW depth copies marked {} / {} (afwpereye); off in fast head turns (over {:.0f} deg/s, now {:.0f}) for {} frames",
+                           mode_name(g_mode.load()), g_cover.load() * 100.0f, ready() ? "from the runtime" : "none", g_eye[0].hidden * 100.0f, g_eye[1].hidden * 100.0f, g_stamps[0][1].load(),
+                           g_stamps[1][1].load(), g_stamps[0][0].load(), g_stamps[1][0].load(), g_fail.load(), g_black[0].load(), g_black[1].load(), g_black_fail.load(),
+                           g_marks[0].load(), g_marks[1].load(), g_turn_dps.load(), g_head_dps.load(), g_turn_frames.load());
     }
 }

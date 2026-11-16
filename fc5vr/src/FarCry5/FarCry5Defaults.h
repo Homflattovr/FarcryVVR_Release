@@ -36,6 +36,16 @@
 // reload data and learnt reload sounds too (reloadgeom, reloadhandgrabw, reloadhandmagw, reloadhandlepart, reloadmagmesh, reloadsoundlearnt)
 // and bowarrowmesh with 25110; scopecal, scopeglassat, scopezoom and sightcal stay per player (they follow the optic fitted).
 // 7 Nov 19:47 (author): lowsuncsm on (three sun cascades in the evening and at night).
+// 13 Nov 14:22 (author): cinematics 3d (was flat); his cinesteerstart 15 is the code default now.
+// 13 Nov (author 14:22): cinedelay removed (cutscenes are the game's own sequences).
+// 13 Nov (performance pass, author): bbcopyskip, eyeprobeoff and savelater lines
+// removed (retired commands: the mod always does what they switched on). perfdrawflags is on in the code, so it needs no line here.
+// 13 Nov (F11 reorganisation, author 19:24Z): hudmarkcap, hudmarkers, hudprim, hudprimcam, hudprimworld,
+// shoulderdraw, throwfile and throwlibrary lines removed: no longer settings, always on in the code (a saved line is ignored).
+// firegate 0.10 removed the same way (author 19:31Z): it is the code default now, with firewaitmax 250, firefast and firemoving on.
+// gamedrawgrab on, throwv2 on and throwv2rb grab removed (holster, bow and throwables clean-up, 19:27Z): the code defaults, no longer settings.
+// fingergame on (Hands, body and arms, 19:44Z), dlaaphases 16 and ssrmv off (Experimental gone, 19:45Z) removed the same way.
+// hands on removed the same way (author 20:25Z: the hands are always drawn).
 namespace fc5 {
 inline constexpr const char* kReleaseSettings = R"FC5VR(
 # Far Cry 5 VR settings: the same commands as fc5vr_cmd.txt, replayed at start (edited by the mod).
@@ -47,7 +57,6 @@ aoexact on
 autorecenter on
 autorecenterdist 0.50
 autorecenterwait 0.5
-bbcopyskip on
 bodyview on
 bowarrowmesh 25110:3693 51543:3693
 bowhold 0 -11 0
@@ -55,10 +64,8 @@ bowmindraw 0.49
 bowstringhand 0.00 0.00 -0.04
 bowweapons 51543
 bulletspeed 3.00
-cinedelay 6.0
-cinematics flat
+cinematics 3d
 decaleye on
-dlaaphases 16
 dlss on
 dlsscammv 1
 dlssmvbest on
@@ -66,10 +73,7 @@ dlssmvcheck on
 dlsspreset 11
 dlsssharp 0.20
 dlsstrim 7
-eyeprobeoff on
 f11image off
-fingergame on
-firegate 0.10
 firemeasure on
 firesplit on
 fovexact on
@@ -77,7 +81,6 @@ fovmargin 0
 fovnarrow 1.00
 framedouble on
 framelock off
-gamedrawgrab on
 gesturebuzz on
 gputime on
 grippitch -5.0
@@ -85,7 +88,6 @@ gunanchor on
 gunaxes on
 gunstill on
 gunstillrecoil off
-hands on
 hapticthread on
 hidetracers on
 hidmask on
@@ -93,9 +95,7 @@ hipspread 0.00
 huddist 2.27
 hudfullres on
 hudheight -0.16
-hudmarkcap on
 hudmarkdist 8
-hudmarkers on
 hudmarkicon 2.0
 hudmarkmax 4.0
 hudmarksize 0.21
@@ -103,9 +103,6 @@ hudmarksmooth 0.3
 hudmask on
 hudmode 1
 hudmul on
-hudprim on
-hudprimcam on
-hudprimworld on
 hudscreen on
 hudsize 40
 lakeoverscan 1.00
@@ -139,7 +136,6 @@ render stereo
 resscale 1.0
 rumble both
 rumblegain 2.00
-savelater on
 scope on
 scopecal 0.0000 0.0640 0.0740 0.0180 1.00 18912
 scopecal 0.0000 0.0640 0.0740 0.0180 1.00 24417
@@ -169,7 +165,7 @@ scopecal 0.0000 0.0640 0.0740 0.0180 1.00 30567
 scopecal 0.0000 0.0640 0.0740 0.0180 1.00 42549
 scopecal 0.0000 0.0640 0.0740 0.0180 1.00 63120
 scopeevery 1
-scopeeye right
+scopeeye auto
 scopeglassat -0.0032 0.0279 0.0734 0.0254 42000
 scopeglassat -0.0457 0.0677 0.0759 0.0069 61926
 scopehistswap on
@@ -185,7 +181,6 @@ shadowmv on
 shadowmvnew 0.05
 shadowres 2048
 shotbuzzms 93
-shoulderdraw on
 shoulderswitch on
 shoulderswitchsize 0.20
 sidearm on
@@ -223,7 +218,6 @@ smoothmotion on
 snapresetfix on
 snapsync on
 ssrjitterpair on
-ssrmv off
 ssrtileclear on
 startrecenter 3.0
 steadyexact on
@@ -233,15 +227,11 @@ throwable on
 throwablesize 0.22
 throwarc on
 throwchest off
-throwfile on
 throwhandscale 0.70
-throwlibrary on
 throwpeek off
 throwpos 0.10 0.53 -0.10
 throwpouch on
-throwv2 on
 throwv2hand right
-throwv2rb grab
 tracersfromgun off
 upright on
 vehicleperpair on

@@ -32,12 +32,15 @@
 #include "FarCry5SteerTune.h"
 #include "FarCry5BoneMap.h"
 #include "FarCry5Drive.h"
+#include "FarCry5Lua.h"
 #include "FarCry5Record.h"
 #include "FarCry5VehWheelTable.h"
+#include "FarCry5VehControlFit.h"
 #include "ModPath.h"
 
 #include <spdlog/spdlog.h>
 
+#include <glm/gtc/matrix_access.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 
@@ -145,6 +148,157 @@ namespace
         }
         spdlog::info("[VehHands] vehwheels: {} vehicles' wheels saved to fc5vr_vehwheels.txt", n);
     }
+
+    // vehcontrol (veh_control_draw at the end of this file; FarCry5VehControlFit.h): the vehicle's own wheel, bars or stick, found when you
+    // sit. A vehicle's draws are skinned at its origin with a palette of 256 bones; they have no BLENDINDICES: each vertex's bone is its
+    // position's 4th component (the 9 Nov round 2 dumps: the Compact's steering bone holds 1706 vertices over 8 slots of two draws, turning
+    // 143 deg at full lock; the rim from its own vertices is 16-20 cm on the four cars read, with the game's hands on it).
+    struct VcEntry   // fc5vr_vehcontrol.txt: one vehicle model's control, in its bone's bind pose (game metres)
+    {
+        int       style{ 0 };   // fc5::drive::kWheel, kBars, kStick
+        UINT      count{ 0 };   // the draw's index count
+        int       slot{ -1 };   // the bone's palette slot in that draw (-1: no bone found: kept where it was found, in the seat's frame)
+        int       nverts{ 0 };  // that draw's vertices on that slot (the model's fingerprint with the count)
+        glm::vec3 c{ 0.0f };    // wheel: the rim's centre; bars: their centre; stick: its top
+        glm::vec3 n{ 0.0f, 0.0f, 1.0f };   // wheel: the axis towards the driver; bars: the steering axis (up); stick: its long axis
+        float     r{ 0.0f };    // wheel: the rim's radius; bars: the half width between the hands
+        int       sure{ 0 };    // 1: its turn with the steering was seen (the animation agreed)
+    };
+    struct VcDraw   // a vehicle draw near the driver this drive (count, start, base, vertex buffer)
+    {
+        UINT               count{ 0 }, start{ 0 };
+        INT                base{ 0 };
+        void*              vb{ nullptr };
+        std::vector<float> pal_ref, pal_now;   // the palette at the first sight (the reference for the first steer), and this frame's
+        glm::mat4          b1{ 1.0f };
+        glm::vec3          eye{ 0.0f };        // the eyes (world) when it was last seen (the same frame as b1 and pal_now)
+        bool               seat{ false };
+        float              scale{ 0.0f };      // VS b2: the vertex positions' scale
+        int                frame{ -1000 };
+        bool               has_verts{ false }, queued{ false };
+        int                nslot{ 256 };       // the slots its vertices use (the highest + 1), once read
+        // drivemodelshow (veh_control_show): its slots that belong to the control's bone, each with its pose relative to the draw's slot 0
+        // when taken, and the bone's axis in slot 0's frame (a point on it, its direction: a positive turn about it is the bone's own).
+        bool                                    ov{ false };
+        std::vector<std::pair<int, glm::mat4>>  ov_slots;
+        glm::vec3                               ov_ax{ 0.0f, 0.0f, 1.0f }, ov_piv{ 0.0f };
+        std::vector<std::array<int16_t, 4>> verts;   // each vertex once: x y z, w = its bone
+    };
+    struct VcJob   // a vertex read waiting for an immediate context (the draw was recorded on a deferred one)
+    {
+        int           d{ -1 };
+        ID3D11Buffer* vb{ nullptr };
+        ID3D11Buffer* ib{ nullptr };
+        UINT          stride{ 0 }, voff{ 0 }, ib_off{ 0 }, count{ 0 }, start{ 0 };
+        INT           base{ 0 };
+        bool          i32{ false };
+        UINT          pos_off{ 0 };
+        int           bi_off{ -1 }, w_off{ -1 };   // BLENDINDICES / BLENDWEIGHT (the boats' draws): the vertex's bone is its heaviest
+        bool          w_bgra{ false };
+    };
+    struct VcState
+    {
+        std::mutex mtx;
+        int        cur_frame{ -1000 }, last_frame{ -1000 };
+        int        style{ 0 };
+        int        state{ 0 };   // 0 looking (at the sit, then at the first steer), 2 following, 3 not found this drive
+        std::vector<VcDraw> draws;
+        std::vector<VcJob>  jobs;
+        std::map<ID3D11Buffer*, std::vector<uint8_t>> cache;   // buffers read back while the draws are collected
+        int        reads{ 0 }, read_frame{ -1000 }, reads_in_frame{ 0 };
+        int        settled_frame{ -1000 };    // the first frame seated and settled this drive
+        int        tries{ 0 }, try_frame{ -1000 };
+        bool       drive_on{ false };         // gesture driving (drive on), read once a frame
+        float      anim_ang{ 0.0f };          // the turn the animation was last weighed at
+        bool       tried_hands{ false }, hinted{ false }, nudged{ false };
+        // The game's entry animation (vehscript: in a vehicle, its seat not yet given): nothing is looked for during it, and what was looked
+        // for before it ended is looked for again. The author's plane, 12 Nov 20:52:09: the view settled 0.7 s into a 4.4 s entry, the three
+        // tries and the four turning-part tries were spent in the next half second on the 1700 vertices seen from the door, and the stick
+        // was "not found in this vehicle's model" 3 s before he sat; his van a minute earlier lost two tries the same way.
+        bool       entering{ false };
+        int        enter_frame{ -100000 };
+        int        hand_arm_frame[2]{ -100000, -100000 };   // vc_note_hand: when each hand's palm was last read from its own arm's mesh
+        int        hold_tries{ 0 }, hold_frame{ 0 };   // handlebars: the looks for the game's two-hand hold after a find without it
+        glm::vec3  hand_w[2]{};               // the game's hands (veh_hands_place: the palms' centres, world, before the mod moves them)
+        // The detection's frame: the eyes, with the driven vehicle's own axes (x across to the right, y up, z back). Not the view's: at the
+        // sit the view can be far off the vehicle's front (pass 5, 11 Nov: 58 deg in the heavy truck, 23 in the Offroad, whose wheels then lay
+        // to the side or half behind the eyes' plane and were missed or found late). Sd: world -> that frame, as of the last cloud built;
+        // home: a draw of the driven vehicle (its VS b1 gives the axes).
+        glm::mat4  Sd{ 1.0f };
+        int        home{ -1 };
+        int        hand_frame[2]{ -1000, -1000 };
+        // The animation: the slot that turned the most since the first sight, the same two frames in a row.
+        struct Best
+        {
+            float     ang{ 0.0f };
+            int       d{ -1 }, slot{ -1 }, frame{ -1000 };
+            glm::vec3 ax_w{ 0.0f }, piv_w{ 0.0f };   // the axis and its point nearest the eyes (world)
+        };
+        std::vector<Best> cands, prev_cands;   // this frame's turning slots (the 8 largest turns), and the frame before's
+        int        cand_frame{ -1000 };
+        bool       by_hands{ false };         // bars: placed where the game's two hands hold
+        bool       told{ false };             // the drive was told the other control once this drive (wheel <-> handlebars)
+        std::map<std::pair<void*, UINT>, std::array<int32_t, 5>> args;   // indirect draws' arguments read this drive (buffer, offset)
+        int        anim_tries{ 0 };
+        // Following: the key and the control in the key slot's bind pose (slot -1: in the seat's frame).
+        VcEntry    key;
+        int        key_draw{ -1 };
+        int        adopt_frame{ -1000 };
+        const char* source{ "" };
+        float      conf{ 0.0f };
+        float      turn{ 0.0f }, turn_raw{ 0.0f };   // the bone's turn about its axis (rad, unwrapped; positive: to the left)
+        bool       turn_ok{ false }, turn_any{ false };
+        // This frame's control in the reference (game metres; the controllers' space), for veh_hands_place.
+        int        out_frame{ -1000 };
+        float      out_d{ 1e9f };
+        glm::mat4  G_ref{ 1.0f };
+        glm::vec3  c_ref{ 0.0f }, n_ref{ 0.0f, 0.0f, 1.0f };
+        bool       said_follow{ false };
+        // drivemodelshow: the control drawn at the hand's angle. ov_ok: every slot of the bone is known (its turn was seen this drive);
+        // before that, a wheel's own slot only. ov_turn_c: the bone's turn (turn) when the slots' poses were taken.
+        bool       ov_ok{ false }, ov_said{ false };
+        // The followed bone's centre in the vehicle's own space when first followed, and the farthest from it said so far (a log line).
+        glm::vec3  piv0{ 0.0f };
+        int        piv_draw{ -2 }, piv_slot{ -2 };
+        float      piv_said{ 0.0f };
+        // A stick's bone: its lean from where it was first followed (a log line: what the game does with the left stick it is sent).
+        glm::mat3  lean_R0{ 1.0f };
+        int        lean_draw{ -2 }, lean_slot{ -2 }, lean_frame{ 0 }, lean_lines{ 0 };
+        float      lean_said{ 0.0f };
+        int        fine_until{ 0 }, fine_frame{ 0 };   // the fine lines while a steerstep runs and 3 s after it
+        float      ov_turn_c{ 0.0f };
+        std::vector<UINT> ov_counts;
+        glm::vec3  key_b1{ 0.0f };            // the followed vehicle's origin (world), to leave a parked twin's wheel alone
+        bool       show_on{ false };          // fc5::drive::model_show, read once a stereo pair
+        float      show_turn{ 0.0f };
+        int        show_frame{ -1000 };
+        bool       table_loaded{ false };
+        std::vector<VcEntry> table;
+    };
+    VcState g_vc;
+
+    // veh_hands_place: the control bone's frame in the reference this frame (its rotation, at the rim's centre / the bars' centre / the stick's
+    // top), and whether its search failed this drive (then the wheel is learnt from the game's hands as before).
+    bool vc_pose(int frame, int style, glm::mat4& G, bool& failed)
+    {
+        std::lock_guard _{ g_vc.mtx };
+        failed = g_vc.style == style && g_vc.state == 3;
+        if (g_vc.style != style || g_vc.state != 2 || frame - g_vc.out_frame > 1) return false;
+        G = g_vc.G_ref;
+        return true;
+    }
+    // veh_hands_place: a game hand's palm centre (world), where the game animates it on the control: one of the detection's sources.
+    // from_arm: read from a one-arm mesh (that arm's own palm slot); else from a pair of gloves. An arm's palm read in the last 3 frames is
+    // kept over the gloves': the gloves' right palm is not on the control in the passes (jetski, 12 Nov: (-30, -25, +19) cm, behind the
+    // eyes, its mesh's "RightHand joint 57 cm" from its vertices; the JacobSeed plane, 13 Nov: on the stick in the dump, not in the live run).
+    void vc_note_hand(int s, const glm::vec3& p, int frame, bool from_arm)
+    {
+        std::lock_guard _{ g_vc.mtx };
+        if (from_arm) g_vc.hand_arm_frame[s] = frame;
+        else if (frame - g_vc.hand_arm_frame[s] <= 3) return;
+        g_vc.hand_w[s]     = p;
+        g_vc.hand_frame[s] = frame;
+    }
 }
 
 struct FarCry5Stereo::VehHandsState
@@ -154,6 +308,7 @@ struct FarCry5Stereo::VehHandsState
     uint64_t           shown{ 0 }, hidden{ 0 }, drives{ 0 };
     bool               keep_bones_was{ false };
     std::vector<float> pal;                   // the palette being built (render thread)
+    std::vector<float> game;                  // the game's palette of that draw (bodyikveh)
     struct Scan
     {
         int                      max_bone{ -1 };   // the highest palette slot any vertex uses (any of its 4 weights)
@@ -178,6 +333,11 @@ struct FarCry5Stereo::VehHandsState
         int         lines{ 0 };                   // log lines this drive (takes, let-gos, state changes)
         std::string state;                        // the last state logged
         bool        far_said{ false };            // the recorded hold left out (its palm too far from the controller), logged
+        // drivehandhold (15 Nov, tester's first launch: the left hand on the wheel there or not): once this side's recorded hold (its own, or
+        // the other hand's mirrored) has put the palm over 12 cm from the controller, it stays left out for the drive. Before, the left
+        // hand's mirrored hold was tried again every frame and sat right at the limit (12 cm, at +5 -8 +8 cm): the hand switched between
+        // the two poses (121 switches in the tester's first log), its pose on the wheel jumping between them with it.
+        bool        hold_far{ false };   // (not "far": a Windows macro)
         // drivehandsmodel: glued to the vehicle's own control. Bars and stick ride a game hand (ref: which side's; k: the hand's pose in that
         // game hand's frame; g0: that game hand at the start, for the log). Wheel: k is the hand's pose at the glue and th0 the wheel model's
         // turn then. h_last: the pose last drawn, kept while no game hand is seen.
@@ -342,7 +502,7 @@ struct FarCry5Stereo::VehHandsState
         if (!std::isfinite(m.centre.x + m.centre.y + m.centre.z + m.n.x + m.n.y + m.n.z) || glm::length(m.centre) > 1.5f * ws) return;
         if (model_lines < 3) {
             model_lines++;
-            spdlog::info("[VehHands] drivehandsmodel: the vehicle's {} from the game's hands: ({:+.0f}, {:+.0f}, {:+.0f}) cm from the eyes (right, up, back){}",
+            spdlog::info("[VehHands] drivehandsmodel: the vehicle's {} from the game's hands: ({:+.0f}, {:+.0f}, {:+.0f}) cm from the eyes (right, up, back, the recentred view's axes){}",
                          style == fc5::drive::kWheel ? "wheel" : style == fc5::drive::kBars ? "handlebars" : "stick", m.centre.x / ws * 100.0f,
                          m.centre.y / ws * 100.0f, m.centre.z / ws * 100.0f, note);
         }
@@ -407,7 +567,7 @@ struct FarCry5Stereo::VehHandsState
         wcand_frame = frame;
     }
 
-    void game_hand(int s, const glm::mat4& x, int frame, float ws, int style)
+    void game_hand(int s, const glm::mat4& x, int frame, float ws, int style, bool learn = true)
     {
         gh[s].x     = x;
         gh[s].frame = frame;
@@ -415,6 +575,7 @@ struct FarCry5Stereo::VehHandsState
         h.x         = x;
         h.frame     = frame;
         if (style != fc5::drive::kWheel) return;   // the wheel only (a helicopter's hands learnt "wheels" 76 cm under the eyes in round 1)
+        if (!learn) return;                        // vehcontrol: the wheel from the vehicle's own bone instead
         const glm::mat3 Rn{ x };
         const glm::vec3 cn{ x[3] };
         // Learn the wheel from this hand's turn since an older frame (the oldest that turned enough).
@@ -672,6 +833,24 @@ int FarCry5Stereo::veh_hands_max_bone(ID3D11DeviceContext* ctx, UINT count, UINT
     return verts > 0 ? mb : -1;
 }
 
+bool FarCry5Stereo::veh_hands_active() const
+{
+    return fc5::drive::hands_mode() == 1 && m_motion.load() && m_in_vehicle.load() && m_veh_driving.load() && m_veh_settle.load() == 0 && !m_chute_vehicle && !m_cine_on &&
+           !flat_screen_on();
+}
+
+// bodyikveh: the move drivehandsgrab gave that side's hand (path B, world), this frame or the last; hidden: it draws no hand there.
+bool FarCry5Stereo::veh_hand_move(int side, glm::mat4& t, bool& hidden, bool& held) const
+{
+    if (!m_vh || side < 0 || side > 1) return false;
+    const auto& sd = m_vh->side[side];
+    if (m_frame.load() - sd.t_frame > 1) return false;
+    t      = sd.t;
+    hidden = sd.t_hide;
+    held   = sd.on;   // drivehandsgrab: on the wheel, the bars or the stick (else on its controller)
+    return true;
+}
+
 bool FarCry5Stereo::veh_hands_draw(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, ID3D11Buffer* palette_cb)
 {
     const int mode = fc5::drive::hands_mode();
@@ -755,7 +934,8 @@ bool FarCry5Stereo::veh_hands_draw(ID3D11DeviceContext* ctx, UINT count, UINT st
                 say(n, 4, "hidden: no copy of its palette yet");
                 return false;
             }
-            st.pal = it->second;
+            st.pal  = it->second;
+            st.game = it->second;   // bodyikveh: the game's pose of the rest of the body
         }
         float scale = 1.13f / 32767.0f;   // barehands' default; VS b2's when it holds one
         {
@@ -845,6 +1025,7 @@ bool FarCry5Stereo::veh_hands_draw(ID3D11DeviceContext* ctx, UINT count, UINT st
             }
             veh_hands_place(ctx, st.pal, std::min(256, int(gm->cent.size())), sides, hpalm, piv, fore, n, start, base, gm, scale);
         }
+        bodyik_veh(ctx, st.pal, st.game, n, start, base, true);   // bodyikveh: the arm from the seated shoulder to the hand (else as above)
         if (!hands_cb_swap(ctx, st.pal)) {
             st.hidden++;
             say(n, 5, "hidden: the palette could not be swapped");
@@ -1027,7 +1208,8 @@ bool FarCry5Stereo::veh_hands_draw(ID3D11DeviceContext* ctx, UINT count, UINT st
             say(n, 4, fmt::format("hidden: {}: no copy of its palette yet", fc5::bonemap::model(d)));
             return false;
         }
-        st.pal = it->second;
+        st.pal  = it->second;
+        st.game = it->second;   // bodyikveh
     }
     // Each side's fold target, posed (object space): the palette matrix (3x4 rows) times the anchor's vertices' centre (x the scale); the
     // bone table's joint if those are not known, else the matrix's translation. The log says how far the joint's point lies from it.
@@ -1105,6 +1287,7 @@ bool FarCry5Stereo::veh_hands_draw(ID3D11DeviceContext* ctx, UINT count, UINT st
         }
         veh_hands_place(ctx, st.pal, std::min(nb, 256), sides, hpalm, piv, nullptr, n, start, base);
     }
+    bodyik_veh(ctx, st.pal, st.game, n, start, base, true);   // bodyikveh
     if (!hands_cb_swap(ctx, st.pal)) {
         st.hidden++;
         say(n, 5, "hidden: the palette could not be swapped");
@@ -1310,7 +1493,13 @@ void FarCry5Stereo::veh_hands_place(ID3D11DeviceContext* ctx, std::vector<float>
     // vehwheels: once this vehicle's seat is known, its wheel from the table (the ring on the vehicle's own wheel before any turn); a wheel
     // learnt here (or learnt again) saved for it.
     // Handlebars and sticks (9 Nov): from the table too (built in only), kept while the game's hands are not on them.
-    if (ho.model && have_cv) {
+    // vehcontrol (veh_control_draw): the vehicle's own control bone this frame, in the reference. While on, the vehwheels table, driveautoturn
+    // and the wheel learnt from the game's hands are left out (that wheel is learnt again only in a drive where the bone's rim was not found).
+    const bool vc_on     = m_vehcontrol.load() && have_cv;
+    glm::mat4  vc_G{ 1.0f };
+    bool       vc_failed = false;
+    const bool vc_ok     = vc_on && vc_pose(frame, cv.style, vc_G, vc_failed);
+    if (ho.model && have_cv && !vc_on) {
         if (!st.key_tried && m_vsh_valid && m_vsh_count != 0 && m_vsh_learn_frame >= st.drive_frame - 600) {
             st.key_tried = true;
             st.key_ok    = true;
@@ -1402,7 +1591,7 @@ void FarCry5Stereo::veh_hands_place(ID3D11DeviceContext* ctx, std::vector<float>
         bool       rec       = false;
         const bool mesh_side = gm && (gm->gloves || gm->arm_side == s) && palm[s] < int(gm->cent.size());
         const glm::vec3 palm_rest = mesh_side ? glm::vec3{ gm->cent[palm[s]].y, gm->cent[palm[s]].z, gm->cent[palm[s]].w } * scale : glm::vec3{ 0.0f };
-        if (mesh_side && s == wside) {
+        if (mesh_side && s == wside && !sd.hold_far) {
             std::vector<std::pair<int, glm::mat4>> rbones;
             glm::mat3                              rcorr{ 1.0f };
             glm::vec3                              rgrip{ 0.0f };
@@ -1418,7 +1607,7 @@ void FarCry5Stereo::veh_hands_place(ID3D11DeviceContext* ctx, std::vector<float>
                     st.rel_ok = rec;
                 }
             }
-        } else if (mesh_side && st.rel_ok) {
+        } else if (mesh_side && s != wside && st.rel_ok && !sd.hold_far) {
             // The other hand: the weapon hand's hold mirrored (its controller is the weapon one's mirror image, x right for both, and so is
             // its arm's rest pose).
             const float off = glm::length(palm_rest - glm::vec3{ -st.rel_c.x, st.rel_c.y, st.rel_c.z });
@@ -1438,7 +1627,8 @@ void FarCry5Stereo::veh_hands_place(ID3D11DeviceContext* ctx, std::vector<float>
         if (rec) {
             const glm::vec3 off = glm::vec3{ Rel * (glm::inverse(Gb) * glm::vec4{ cw, 1.0f }) };
             if (glm::length(off) > 0.12f) {
-                rec = false;
+                rec    = false;
+                sd.hold_far = true;   // drivehandhold: left out for the rest of the drive
                 if (s == wside) st.rel_ok = false;   // nor mirrored onto the other hand
                 if (!sd.far_said) {
                     sd.far_said = true;
@@ -1475,8 +1665,9 @@ void FarCry5Stereo::veh_hands_place(ID3D11DeviceContext* ctx, std::vector<float>
                 gy = glm::normalize(gy);
                 glm::mat4 G{ glm::mat3{ gx, gy, glm::cross(gx, gy) } };
                 G[3] = glm::vec4{ cw, 1.0f };
-                st.game_hand(s, to_ref(G), frame, ws, cv.style);
-                st.send_model(cv.style, frame, ws, cv_pt(cv.stick_top));
+                st.game_hand(s, to_ref(G), frame, ws, cv.style, !vc_on || vc_failed);
+                if (vc_on) vc_note_hand(s, cw, frame, gm && !gm->gloves && gm->arm_side == s);   // vehcontrol: where the game holds the control, one of its sources
+                if (!vc_ok) st.send_model(cv.style, frame, ws, cv_pt(cv.stick_top));   // vehcontrol: the bone's control sent instead
             }
         }
         // Its controller (by physical side: the weapon hand's is update_motion's controller, or its own while the weapon hangs elsewhere).
@@ -1558,7 +1749,39 @@ void FarCry5Stereo::veh_hands_place(ID3D11DeviceContext* ctx, std::vector<float>
             //  - bars: rides the game hand of the same side (or the other while this one holds the game's sidearm);
             //  - stick: rides the game hand on the stick (stick_hand: the one nearer the drive's stick); none within 45 cm: with the drive's own.
             // No game hand this frame: where it was.
-            if (ho.model && cv.style == fc5::drive::kWheel) {
+            // vehcontrol: rides the vehicle's own control bone (wheel, bars or stick) from where the hand took it; that bone not drawn this
+            // frame: where it was.
+            if (ho.model && vc_on && (vc_ok || (sd.glued && sd.ref == 2))) {
+                if (vc_ok) {
+                    if (!sd.glued || sd.ref != 2) {
+                        const glm::mat4 from = sd.glued ? sd.h_last : sd.h0;
+                        sd.k                 = glm::inverse(vc_G) * from;
+                        sd.g0                = vc_G;
+                        sd.glued             = true;
+                        sd.ref               = 2;
+                        sd.glue_log_frame    = frame;
+                        if (sd.lines < 40) {
+                            sd.lines++;
+                            spdlog::info("[VehHands] vehcontrol: the {} hand rides the vehicle's own {} bone ({:.0f} cm from its {} when taken)", names[s], ctl,
+                                         glm::length(glm::vec3{ from * sd.lc } - glm::vec3{ vc_G[3] }) / ws * 100.0f,
+                                         cv.style == fc5::drive::kWheel ? "rim's centre" : cv.style == fc5::drive::kBars ? "centre" : "top");
+                        }
+                    }
+                    H = vc_G * sd.k;
+                    if (frame - sd.glue_log_frame >= 180 && sd.lines < 40) {   // every 2 s: the game's turn of its control against the drive's own
+                        sd.glue_log_frame = frame;
+                        sd.lines++;
+                        glm::quat q = glm::quat_cast(glm::mat3{ vc_G } * glm::transpose(glm::mat3{ sd.g0 }));
+                        if (q.w < 0.0f) q = -q;
+                        const float phi = 2.0f * std::acos(std::clamp(q.w, -1.0f, 1.0f));
+                        const float sgn = glm::dot(glm::vec3{ q.x, q.y, q.z }, axis) < 0.0f ? -1.0f : 1.0f;
+                        spdlog::info("[VehHands] vehcontrol: the {} hand on the {}: the game turned its bone {:+.0f} deg since the take (positive: to the left), the "
+                                     "drive's {:+.0f} deg", names[s], ctl, glm::degrees(sgn * phi), glm::degrees(cv.angle - sd.a0));
+                    }
+                } else {
+                    H = sd.h_last;
+                }
+            } else if (ho.model && cv.style == fc5::drive::kWheel) {
                 if (st.wheel_ok()) {
                     if (!sd.glued) {
                         sd.glued          = true;
@@ -1663,11 +1886,12 @@ void FarCry5Stereo::veh_hands_place(ID3D11DeviceContext* ctx, std::vector<float>
         const bool fingers = gm && m_finger_grip.load();
         if (fingers) {
             m_finger_count = count;   // fingernames: the hand draw being posed, by its index count
-            hand_fingers(pal, gm->cent, s, gm->hand_from, scale);
+            // drivegripfist (default on; author 15 Nov): on the wheel, bars or stick the whole hand closes round it by the grip alone.
+            hand_fingers(pal, gm->cent, s, gm->hand_from, scale, false, sd.on && ho.fist);
         }
         const std::string how = rec ? (s == wside ? std::string{ " (as on foot: the recorded hold)" } : fmt::format(" (as on foot: the {} hand's hold, mirrored)", names[wside]))
                                     : std::string{ " (the rest pose's axes: no recorded hold)" };
-        say_state(sd.on ? fmt::format("on the {}", ctl) : fmt::format("on its controller{}{}", how, fingers ? ", fingers by grip and trigger" : ""),
+        say_state(sd.on ? fmt::format("on the {}{}", ctl, fingers && ho.fist ? ", the whole hand closed round it (drivegripfist)" : "") : fmt::format("on its controller{}{}", how, fingers ? ", fingers by grip and trigger" : ""),
                   fmt::format(": its palm {:.0f} cm from the eyes' base, which is {:.0f} cm from the game camera", glm::length(glm::vec3{ H * sd.lc }) * 100.0f,
                               glm::length(m_mo.draw_shift) * 100.0f));
     }
@@ -1715,7 +1939,7 @@ void FarCry5Stereo::veh_wheel_scan(ID3D11DeviceContext* ctx, const float* f, UIN
 
 // vehdump full|pal NAME (test, not saved; vehcontrol research, author 9 Nov 08:36): in the next frame, every draw whose object origin (VS b1) is within 3.5 m of
 // the camera, world draws (kind w: the vehicle's parts, whatever their material) and the player's own hidden body draws (kind b: the arms on
-// the wheel), written once each to VRMod_dev\dumps\vehdump_NAME\: its VS b1 matrix, the vertex scale (VS b2), its skinning palette (VS b3, the
+// the wheel), written once each to fc5vr_dumps\vehdump_NAME\: its VS b1 matrix, the vertex scale (VS b2), its skinning palette (VS b3, the
 // CPU copy) and, for "full", its vertices (position, palette slots and weights; round 2: the position's 4th component and the vertex's bytes). Read by tools\wheelglue\vehdump_fit.py. "pal": no vertices
 // (cheap: the bones at another steering angle). A draw recorded on a deferred context has its vertex read done at the next immediate draw.
 namespace
@@ -1911,6 +2135,15 @@ void FarCry5Stereo::veh_dump_draw(ID3D11DeviceContext* ctx, int kind, UINT count
         std::memcpy(&u, &pal[k], 4);
         ph = (ph ^ u) * 1099511628211ull;
     }
+    // An indirect draw (no count here; the van's rim, the boats' parts): its index count, start and base from its arguments.
+    if (count == 0 && !deferred && m_hud_draw_kind == 5 && m_hud_draw_args) {
+        std::array<int32_t, 5> ia{};
+        if (indirect_args(ctx, m_hud_draw_args, m_hud_draw_args_off, ia) && ia[0] > 0) {
+            count = UINT(ia[0]);
+            start = UINT(std::max(0, ia[2]));
+            base  = INT(ia[3]);
+        }
+    }
     const auto key = std::make_tuple(kind == 1 ? 'b' : 'w', count, start, base, (void*)(uintptr_t(vb) ^ uintptr_t(ph)));
     if (!g_vd.done.insert(key).second) {
         if (vb) vb->Release();
@@ -1985,5 +2218,1168 @@ void FarCry5Stereo::veh_dump_draw(ID3D11DeviceContext* ctx, int kind, UINT count
         vdump_write(ctx, j);
         if (j.vb) j.vb->Release();
         if (j.ib) j.ib->Release();
+    }
+}
+
+// vehcontrol on|off (saved, default on; F11 Layout > Vehicles; author 11 Nov 09:09). The detection itself is FarCry5VehControlFit.h
+// (pure geometry, also run offline by research\2026-11-11_vehcontrol2\vcfit_harness.cpp); this feeds it and follows the result:
+//  0. A table first (bin\fc5vr_vehcontrol.txt): a vehicle model found before (its draw's index count, the bone's slot, that draw's vertex
+//     count on the slot) is taken at once.
+//  1. Collecting, from the moment the seat is taken (the camera still settling): every vehicle draw (a Vehicle_ material) within 3.5 m of
+//     the camera has its vertices read once (position, and its 4th component: the vertex's bone) and its palette copied each frame.
+//  2. At the sit (the first settled frame with the reads in): the vertices around the driver, placed by their bones, in the seat's frame
+//     (the drive's recentred reference: the eyes, x right, y up, z back), go to fc5::vcfit::detect with the game's hands' palms when seen
+//     (veh_hands_place): geometry (a ring, two grips, a thin upright part), spatial (ahead, below the eyes, centred, the hands on it).
+//     Tried again when the game's hands are first seen, and 120 frames on. With no control known for the vehicle yet (the game's type not
+//     answered), a wheel or bars found sure enough is handed to the drive as its style (fc5::drive::set_shape_hint).
+//  3. The animation: the slot that turns with the steering (5 deg or more, sticks 3 to 45, relative to its draw's slot 0, about an axis near
+//     the eyes, the same two frames in a row: not a rotor) confirms the control, corrects it (the shape searched about that axis in the
+//     parts that turn), or finds it when step 2 could not (then one quick small turn is sent, driveautoturn, so it comes at once).
+//  4. Every frame: VS b1 x palette[slot] places the control; the drive's wheel, bars or stick is set there with the bone's own turn about its
+//     axis (fc5::drive::set_model: the steering follows the model's wheel), and veh_hands_place lets a held hand ride the bone.
+namespace
+{
+    const char* vc_style_name(int s) { return s == fc5::drive::kWheel ? "wheel" : s == fc5::drive::kBars ? "handlebars" : s == fc5::drive::kStick ? "stick" : "control"; }
+    int         vc_style_of(const std::string& s) { return s == "wheel" ? fc5::drive::kWheel : s == "bars" ? fc5::drive::kBars : s == "stick" ? fc5::drive::kStick : 0; }
+
+    void vc_load()
+    {
+        if (g_vc.table_loaded) return;
+        g_vc.table_loaded = true;
+        std::ifstream f{ fc5::mod_file("fc5vr_vehcontrol.txt") };
+        std::string   line;
+        while (std::getline(f, line)) {
+            // (control2, builds before 11 Nov round 4: dropped; the quad's front rack was saved as its bars. control3, before 12 Nov round 6:
+            // dropped; the jetski's 42 cm part was saved as its bars and kept the round 5 build from looking again)
+            if (line.rfind("control4 ", 0) != 0) continue;
+            std::istringstream ls{ line.substr(9) };
+            std::string        st;
+            VcEntry            e;
+            if (!(ls >> st >> e.count >> e.slot >> e.nverts >> e.c.x >> e.c.y >> e.c.z >> e.n.x >> e.n.y >> e.n.z >> e.r >> e.sure)) continue;
+            e.style = vc_style_of(st);
+            if (e.style == 0 || e.nverts <= 0 || e.slot < 0 || e.slot > 255 || !std::isfinite(e.c.x + e.c.y + e.c.z + e.n.x + e.n.y + e.n.z + e.r)) continue;
+            g_vc.table.push_back(e);
+        }
+        spdlog::info("[VehHands] vehcontrol: {} vehicles' controls read from fc5vr_vehcontrol.txt", g_vc.table.size());
+    }
+    void vc_save(const VcEntry& e)
+    {
+        vc_load();
+        bool replaced = false;
+        for (auto& t : g_vc.table)
+            if (t.style == e.style && t.count == e.count && t.slot == e.slot && t.nverts == e.nverts) t = e, replaced = true;
+        if (!replaced) g_vc.table.push_back(e);
+        std::ofstream f{ fc5::mod_file("fc5vr_vehcontrol.txt"), std::ios::trunc };
+        f << "# Far Cry 5 VR: each vehicle's own wheel, handlebars or stick, found in its model (vehcontrol; FarCry5VehHands.cpp). One line per vehicle:\n"
+             "# control4 wheel|bars|stick <draw index count> <bone slot> <that draw's vertices on the slot> <centre x y z> <axis x y z> <radius or half width> <1: seen turning>\n"
+             "# (the bone's bind pose, game metres; wheel: the rim's centre, the axis towards the driver; bars: their centre, the steering axis; stick: its top).\n"
+             "# Delete a line to find that vehicle's control again the next time you sit in it.\n";
+        for (const auto& t : g_vc.table)
+            f << fmt::format("control4 {} {} {} {} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {}\n",
+                             t.style == fc5::drive::kWheel ? "wheel" : t.style == fc5::drive::kBars ? "bars" : "stick", t.count, t.slot, t.nverts, t.c.x, t.c.y, t.c.z, t.n.x,
+                             t.n.y, t.n.z, t.r, t.sure);
+    }
+    // The control looked for again (another style, or lost): the draws and their vertices are kept.
+    void vc_reset_find(int frame)
+    {
+        g_vc.state       = 0;
+        g_vc.cands.clear();
+        g_vc.prev_cands.clear();
+        g_vc.by_hands    = false;
+        g_vc.anim_tries  = 0;
+        g_vc.anim_ang    = 0.0f;
+        g_vc.tries       = 0;
+        g_vc.try_frame   = -1000;
+        g_vc.tried_hands = false;
+        g_vc.hold_tries  = 0;
+        g_vc.hold_frame  = 0;
+        g_vc.nudged      = false;
+        g_vc.out_frame   = -1000;
+        g_vc.adopt_frame = frame;
+        g_vc.settled_frame = -1000;   // the draws seen again (two frames) before the next try
+        g_vc.key         = VcEntry{};
+        g_vc.key_draw    = -1;
+        g_vc.turn_ok = g_vc.turn_any = false;
+        g_vc.turn        = 0.0f;
+        g_vc.said_follow = false;
+        g_vc.piv_draw = g_vc.piv_slot = -2;
+        g_vc.lean_draw = g_vc.lean_slot = -2;
+        g_vc.ov_ok = g_vc.ov_said = false;
+        g_vc.ov_counts.clear();
+        for (auto& D : g_vc.draws) {
+            D.pal_ref = D.pal_now;
+            D.ov      = false;
+            D.ov_slots.clear();
+        }
+    }
+    // A new drive: everything.
+    void vc_reset_drive(int frame)
+    {
+        for (auto& j : g_vc.jobs) {
+            if (j.vb) j.vb->Release();
+            if (j.ib) j.ib->Release();
+        }
+        g_vc.jobs.clear();
+        g_vc.draws.clear();
+        g_vc.cache.clear();
+        g_vc.args.clear();
+        g_vc.reads         = 0;
+        g_vc.hinted        = false;
+        g_vc.told          = false;
+        g_vc.hand_frame[0] = g_vc.hand_frame[1] = -1000;
+        g_vc.style         = 0;
+        vc_reset_find(frame);
+    }
+    bool vc_rigid(const glm::mat4& m)
+    {
+        const float d = glm::determinant(glm::mat3{ m });
+        return std::isfinite(d) && std::abs(d - 1.0f) < 0.05f;
+    }
+    glm::mat4 vc_slot(const std::vector<float>& p, int s) { return from_rows12(p.data() + size_t(s) * 12); }
+    // The rigid move A as a turn: its angle (rad, 0..pi), axis and the point on that axis nearest the origin.
+    bool vc_motion(const glm::mat4& A, float& ang, glm::vec3& ax, glm::vec3& piv)
+    {
+        glm::quat q = glm::quat_cast(glm::mat3{ A });
+        if (q.w < 0.0f) q = -q;
+        ang                = 2.0f * std::acos(std::clamp(q.w, -1.0f, 1.0f));
+        const glm::vec3 xv = glm::vec3{ q.x, q.y, q.z };
+        if (ang < 1e-3f || glm::length(xv) < 1e-6f) return false;
+        ax                 = glm::normalize(xv);
+        const glm::vec3 t  = glm::vec3{ A[3] };
+        const glm::vec3 tp = t - ax * glm::dot(t, ax);
+        piv                = 0.5f * (tp + glm::cross(ax, tp) / std::tan(0.5f * ang));   // t = (I - R) c for c across the axis
+        return std::isfinite(piv.x + piv.y + piv.z);
+    }
+    // The draw's vertices (each once: position x y z and its 4th component, the bone), read back on an immediate context. Buffers read
+    // once each while the draws are collected (a vehicle's draws share them).
+    void vc_run_job(ID3D11DeviceContext* ctx, const VcJob& j, VcDraw& D)
+    {
+        D.verts.clear();
+        D.has_verts = true;
+        D.queued    = false;
+        auto get = [&](ID3D11Buffer* b) -> const std::vector<uint8_t>* {
+            auto it = g_vc.cache.find(b);
+            if (it == g_vc.cache.end()) {
+                std::vector<uint8_t> d;
+                if (g_vc.cache.size() > 64 || !read_gpu(ctx, b, d)) return nullptr;
+                it = g_vc.cache.emplace(b, std::move(d)).first;
+            }
+            return &it->second;
+        };
+        const std::vector<uint8_t>* vbd = get(j.vb);
+        const std::vector<uint8_t>* ibd = get(j.ib);
+        if (!vbd || !ibd) return;
+        std::vector<bool> seen;
+        int               top = 0;
+        for (UINT k = 0; k < j.count; ++k) {
+            const size_t io = size_t(j.ib_off) + size_t(j.start + k) * (j.i32 ? 4 : 2);
+            if (io + (j.i32 ? 4 : 2) > ibd->size()) break;
+            uint32_t idx = 0;
+            std::memcpy(&idx, ibd->data() + io, j.i32 ? 4 : 2);
+            if (idx >= 4u << 20) continue;
+            if (idx >= seen.size()) seen.resize(size_t(idx) + 1, false);
+            if (seen[idx]) continue;
+            seen[idx]       = true;
+            const int64_t v = int64_t(idx) + j.base;
+            if (v < 0) continue;
+            const size_t vs = size_t(j.voff) + size_t(v) * j.stride;
+            const size_t vo = vs + j.pos_off;
+            if (vs + j.stride > vbd->size() || vo + 8 > vbd->size()) continue;
+            std::array<int16_t, 4> q{};
+            std::memcpy(q.data(), vbd->data() + vo, 8);
+            if (j.bi_off >= 0) {
+                const uint8_t* bi = vbd->data() + vs + j.bi_off;
+                int            hv = bi[0], hw = -1;
+                if (j.w_off >= 0) {
+                    const uint8_t* wp = vbd->data() + vs + j.w_off;
+                    for (int c = 0; c < 4; ++c)
+                        if (int(wp[c]) > hw) hw = wp[c], hv = bi[j.w_bgra ? (c == 0 ? 2 : c == 2 ? 0 : c) : c];
+                }
+                q[3] = int16_t(hv);
+            }
+            if (q[3] < 0 || q[3] > 255) continue;
+            top = std::max(top, int(q[3]));
+            D.verts.push_back(q);
+        }
+        D.nslot = top + 1;
+    }
+}
+
+void FarCry5Stereo::veh_control_draw(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base)
+{
+    if (!m_vehcontrol.load() || !m_motion.load() || !m_in_vehicle.load() || !m_veh_driving.load() || m_chute_vehicle || m_cine_on || flat_screen_on()) return;
+    if (!m_keep_bones.load()) m_keep_bones = true;   // the palettes' CPU copies (note_object_constants)
+    const int       frame    = m_frame.load();
+    const bool      deferred = fc5::rec::is_deferred(ctx);
+    const bool      settled  = m_veh_settle.load() == 0;
+    const glm::vec3 cam      = m_world_cam_pos;
+    auto&           vc       = g_vc;
+    std::lock_guard _{ vc.mtx };
+
+    // The seat's frame: the drive's recentred reference, as veh_hands_place: ref = body_rot (world - (camera + draw shift)); game metres.
+    const bool      seat_ok = m_mo.valid && frame - m_mo.frame <= 1;
+    const glm::mat3 B       = m_mo.body_rot;
+    const glm::vec3 o       = m_mo.cam + m_mo.draw_shift;
+    const float     ws      = std::max(1e-3f, m_world_scale.load());
+    glm::mat4       S4{ B };
+    S4[3] = glm::vec4{ -(B * o), 1.0f };
+
+    // The detection's frame (VcState::Sd), from the draws seen since frame f: the driven vehicle is the origin (VS b1's translation, within
+    // 15 cm) holding the most vertices among them; its b1 gives the axes (x across, y to the front, z up: the same on the 11 vehicles of the
+    // 11 Nov passes), the eyes the origin.
+    auto det_frame = [&](int f) {
+        int    best = -1;
+        size_t bn   = 0;
+        for (int di = 0; di < int(vc.draws.size()); ++di) {
+            const VcDraw& D = vc.draws[size_t(di)];
+            if (!D.has_verts || D.verts.empty() || D.frame < f || !D.seat) continue;
+            size_t n = 0;
+            for (const VcDraw& E : vc.draws)
+                if (E.has_verts && E.frame >= f && glm::length(glm::vec3{ E.b1[3] } - glm::vec3{ D.b1[3] }) < 0.15f) n += E.verts.size();
+            if (n > bn) bn = n, best = di;
+        }
+        vc.home = best;
+        if (best < 0) return false;
+        const VcDraw&   H   = vc.draws[size_t(best)];
+        const glm::vec3 fwd = glm::normalize(glm::vec3{ H.b1[1] }), up = glm::normalize(glm::vec3{ H.b1[2] });
+        glm::vec3       rt  = glm::cross(fwd, up);
+        if (glm::length(rt) < 1e-4f) return false;
+        rt = glm::normalize(rt) * (glm::determinant(glm::mat3{ H.b1 }) < 0.0f ? -1.0f : 1.0f);
+        const glm::mat3 R = glm::transpose(glm::mat3{ rt, up, -fwd });   // rows: right, up, back
+        vc.Sd             = glm::mat4{ R };
+        vc.Sd[3]          = glm::vec4{ -(R * H.eye), 1.0f };
+        return true;
+    };
+    // The vehicle's vertices around the driver, in the detection's frame, each with its part (a draw's slot), from the draws seen since frame f.
+    using Parts = std::vector<std::pair<int, int>>;
+    auto build_cloud = [&](int f, fc5::vcfit::Cloud& cl, Parts& parts) {
+        cl = fc5::vcfit::Cloud{};
+        parts.clear();
+        if (!det_frame(f)) return;
+        for (int di = 0; di < int(vc.draws.size()); ++di) {
+            const VcDraw& D = vc.draws[size_t(di)];
+            if (!D.has_verts || D.verts.empty() || D.frame < f || D.scale <= 0.0f || !D.seat) continue;
+            const int              ns = std::min(D.nslot, int(D.pal_now.size() / 12));
+            std::vector<glm::mat4> M(size_t(std::max(0, ns)));
+            std::vector<int>       pid(size_t(std::max(0, ns)), -2);   // -2 not looked at, -1 no use, else the part
+            for (const auto& q : D.verts) {
+                const int s = q[3];
+                if (s >= ns) continue;
+                if (pid[size_t(s)] == -2) {
+                    const glm::mat4 P = vc_slot(D.pal_now, s);
+                    const float     d = glm::determinant(glm::mat3{ P });
+                    pid[size_t(s)]    = std::isfinite(d) && std::abs(d) > 1e-6f ? -3 : -1;   // -3: usable, no vertex kept yet
+                    M[size_t(s)]      = vc.Sd * D.b1 * P;
+                }
+                if (pid[size_t(s)] == -1) continue;
+                const glm::vec3 p = glm::vec3{ M[size_t(s)] * glm::vec4{ float(q[0]) * D.scale, float(q[1]) * D.scale, float(q[2]) * D.scale, 1.0f } };
+                if (!(p.x > -0.7f && p.x < 0.7f && p.y > -0.9f && p.y < 0.25f && p.z < 0.0f && p.z > -1.1f)) continue;
+                if (pid[size_t(s)] == -3) {
+                    if (parts.size() >= 65000) continue;
+                    pid[size_t(s)] = int(parts.size());
+                    parts.push_back({ di, s });
+                }
+                cl.p.push_back(p);
+                cl.part.push_back(uint16_t(pid[size_t(s)]));
+            }
+        }
+        cl.nparts = int(parts.size());
+    };
+    // The game's hands in the detection's frame (after build_cloud: its frame).
+    auto hands_now = [&](fc5::vcfit::Hands& h) {
+        for (int s = 0; s < 2; ++s) {
+            h.ok[s] = frame - vc.hand_frame[s] <= 3;
+            h.p[s]  = glm::vec3{ vc.Sd * glm::vec4{ vc.hand_w[s], 1.0f } };
+        }
+        return h.ok[0] || h.ok[1];
+    };
+    // The followed control now, in the detection's frame (after build_cloud): from its bone, or (no bone) from the vehicle's own space.
+    auto key_now = [&](glm::vec3& c, glm::vec3& n) {
+        glm::mat4 M{ 1.0f };
+        if (vc.key.slot >= 0) {
+            if (vc.key_draw < 0 || vc.key_draw >= int(vc.draws.size())) return false;
+            const VcDraw& K = vc.draws[size_t(vc.key_draw)];
+            if (int(K.pal_now.size()) < (vc.key.slot + 1) * 12) return false;
+            M = vc.Sd * K.b1 * vc_slot(K.pal_now, vc.key.slot);
+        } else {
+            if (vc.home < 0) return false;
+            M = vc.Sd * vc.draws[size_t(vc.home)].b1;
+        }
+        c = glm::vec3{ M * glm::vec4{ vc.key.c, 1.0f } };
+        n = glm::normalize(glm::mat3{ M } * vc.key.n);
+        return std::isfinite(c.x + c.y + c.z + n.x + n.y + n.z);
+    };
+    auto say_result = [&](const char* what, const fc5::vcfit::Result& r) {
+        return fmt::format("{}: {}; sure {:.2f} (geometry {:.2f}, where it is {:.2f}, the game's hands {:.2f}, its turn {:.2f}); ({:+.0f}, {:+.0f}, {:+.0f}) cm from the eyes "
+                           "(right, up, back, the vehicle's axes){}",
+                           what, r.how, r.conf, r.geo, r.spatial, r.hands, r.anim, r.c.x / ws * 100.0f, r.c.y / ws * 100.0f, r.c.z / ws * 100.0f,
+                           r.style == fc5::drive::kWheel  ? fmt::format(", rim radius {:.1f} cm, {} rim vertices, widest empty arc {:.0f} deg", r.r / ws * 100.0f, r.nin, r.gap)
+                           : r.style == fc5::drive::kBars ? fmt::format(", half width {:.0f} cm", r.r / ws * 100.0f)
+                                                          : std::string{});
+    };
+    // A shape in the seat's frame taken as the control, kept in the bind pose of the bone that holds it (part: a draw's slot; none: in the
+    // seat's frame, where it was found).
+    auto adopt = [&](const fc5::vcfit::Result& r, int di, int slot, const char* source, int sure) {
+        VcEntry e;
+        e.style = vc.style;
+        e.r     = r.r;
+        e.sure  = sure;
+        e.c     = r.c;
+        e.n     = r.n;
+        if (di >= 0 && slot >= 0) {
+            const VcDraw&   D = vc.draws[size_t(di)];
+            const glm::mat4 X = glm::inverse(vc.Sd * D.b1 * vc_slot(D.pal_now, slot));
+            e.count           = D.count;
+            e.slot            = slot;
+            for (const auto& q : D.verts) e.nverts += q[3] == slot;
+            e.c = glm::vec3{ X * glm::vec4{ r.c, 1.0f } };
+            e.n = glm::normalize(glm::mat3{ X } * r.n);
+        } else if (vc.home >= 0) {
+            // No bone under it (the hands' hold with no part): kept in the vehicle's own space.
+            const glm::mat4 X = glm::inverse(vc.Sd * vc.draws[size_t(vc.home)].b1);
+            e.c               = glm::vec3{ X * glm::vec4{ r.c, 1.0f } };
+            e.n               = glm::normalize(glm::mat3{ X } * r.n);
+        }
+        vc.key         = e;
+        vc.key_draw    = e.slot >= 0 ? di : -1;
+        vc.state       = 2;
+        vc.adopt_frame = frame;
+        vc.source      = source;
+        vc.conf        = r.conf;
+        vc.by_hands    = (r.style == fc5::drive::kBars && r.hands >= 0.99f && r.how[0] == 'w') || (r.style == fc5::drive::kStick && r.hands >= 0.99f) || (sure && vc.by_hands);   // ("where the game's two hands hold")
+        vc.turn_ok = vc.turn_any = false;
+        vc.said_follow = false;
+        vc.out_frame   = -1000;
+        if (e.slot >= 0 && e.nverts > 0 && (sure || r.conf >= 0.75f)) vc_save(e);
+        spdlog::info("[VehHands] vehcontrol: {} ({}){}", say_result(vc_style_name(vc.style), r), source,
+                     e.slot >= 0 ? fmt::format("; its bone: draw {} slot {} ({} vertices){}", e.count, e.slot, e.nverts, sure || r.conf >= 0.75f ? ", saved for this model" : "")
+                                 : std::string{ "; no bone under it: kept where it was found" });
+    };
+
+    // A wheel expected, but the game's two hands hold handlebars (level, 50 cm apart or more) and are not on the wheel found, if any: the
+    // drive is told it is handlebars (a quad the game calls wheeled, its seat not learnt: the drive shows a wheel, and the quad's model
+    // holds a ring that passes for one).
+    auto bars_not_wheel = [&](const fc5::vcfit::Cloud& cl, const fc5::vcfit::Hands& h, const fc5::vcfit::Result& rw) {
+        if (vc.style != fc5::drive::kWheel || vc.told || !h.ok[0] || !h.ok[1] || (rw.ok && rw.hands >= 0.6f)) return false;
+        const auto rb = fc5::vcfit::detect(fc5::drive::kBars, cl, h);
+        if (!rb.ok || rb.hands < 0.99f) return false;
+        vc.told = true;
+        fc5::drive::set_shape_hint(fc5::drive::kBars);
+        spdlog::info("[VehHands] vehcontrol: a wheel expected, but {}: the drive told it is handlebars", say_result("handlebars", rb));
+        return true;
+    };
+
+    // Once per frame.
+    if (vc.cur_frame != frame) {
+        const int        prev = vc.cur_frame;
+        fc5::drive::View cv{};
+        const int        style = fc5::drive::control(cv) ? cv.style : fc5::drive::kNone;
+        vc.cur_frame           = frame;
+        vc.drive_on            = fc5::drive::on();
+        if ((frame & 1) == 0 || frame - vc.show_frame >= 2) {   // drivemodelshow: the same angle for both eyes
+            vc.show_on    = fc5::drive::model_show(vc.show_turn);
+            vc.show_frame = frame;
+        }
+        if (frame - vc.last_frame > 180) vc_reset_drive(frame);   // a new drive
+        if (style != vc.style) {
+            vc_reset_find(frame);
+            vc.style = style;
+            if (style != fc5::drive::kNone) vc_load();
+        }
+        vc.last_frame = frame;
+        {
+            int        drv = -1, vtype = -1;
+            const bool in_anim = fc5::lua::vehicle_state(drv, vtype) == 1 && drv < 0;
+            if (in_anim && !vc.entering) vc.enter_frame = frame;
+            // (at most 900 frames: a seat the game never gives is not waited for)
+            const bool entering = in_anim && frame - vc.enter_frame < 900;
+            if (vc.entering && !entering && vc.state != 2 && (vc.tries > 0 || vc.anim_tries > 0 || vc.state == 3)) {
+                spdlog::info("[VehHands] vehcontrol: the game's entry animation is over ({} frames): the {} looked for again from the seat ({} tries and {} turning-part "
+                             "tries were made during it)", frame - vc.enter_frame, vc_style_name(vc.style), vc.tries, vc.anim_tries);
+                vc_reset_find(frame);
+            }
+            vc.entering = entering;
+        }
+        if (settled && vc.settled_frame == -1000) vc.settled_frame = frame;
+        bool pending = !vc.jobs.empty();
+        for (const auto& D : vc.draws)
+            if (D.frame >= prev - 1 && !D.has_verts) pending = true;
+        if (!pending && !vc.cache.empty()) vc.cache.clear();
+        const bool ready = vc.drive_on && settled && seat_ok && !vc.entering && vc.settled_frame != -1000 && frame - vc.settled_frame >= 2 &&
+                           (!pending || frame - vc.settled_frame > 45);
+
+        // No control known for this vehicle yet (the game has not said its type): a wheel or bars found sure enough is the drive's style.
+        if (ready && vc.style == fc5::drive::kNone && !vc.hinted) {
+            vc.hinted = true;
+            fc5::vcfit::Cloud cl;
+            Parts             parts;
+            fc5::vcfit::Hands h;
+            build_cloud(prev - 1, cl, parts);
+            hands_now(h);
+            const auto rw = fc5::vcfit::detect(fc5::drive::kWheel, cl, h);
+            // (a wheel: its rim whole and clean; the quad's model holds a 22 cm ring too: geometry 0.86, sure 0.69 on the 11 Nov dump)
+            const bool sw = rw.ok && rw.geo >= 0.95f && rw.conf >= 0.75f;
+            const auto rb = sw ? fc5::vcfit::Result{} : fc5::vcfit::detect(fc5::drive::kBars, cl, h);
+            const int  hs = sw ? fc5::drive::kWheel : rb.ok && rb.conf >= 0.7f ? fc5::drive::kBars : fc5::drive::kNone;
+            if (hs != fc5::drive::kNone) fc5::drive::set_shape_hint(hs);
+            spdlog::info("[VehHands] vehcontrol: no control chosen for this vehicle yet; its model shows {} ({} vertices near the driver in {} parts)",
+                         hs == fc5::drive::kNone ? std::string{ "neither a wheel nor handlebars for sure" } : say_result(vc_style_name(hs), hs == fc5::drive::kWheel ? rw : rb),
+                         cl.p.size(), cl.nparts);
+        }
+
+        // 2. At the sit (and again when the game's hands are first seen, and 120 frames on).
+        if (ready && vc.style != fc5::drive::kNone && vc.state == 0) {
+            fc5::vcfit::Hands h;
+            const bool        hands = frame - vc.hand_frame[0] <= 3 || frame - vc.hand_frame[1] <= 3;
+            if (vc.tries == 0 || (vc.tries < 3 && ((hands && !vc.tried_hands) || frame - vc.try_frame > 120))) {
+                vc.tries++;
+                vc.try_frame = frame;
+                if (hands) vc.tried_hands = true;
+                // 0. The table: a draw whose count and vertex count on the slot are a known model's.
+                bool got = false;
+                for (int di = 0; di < int(vc.draws.size()) && !got; ++di) {
+                    const VcDraw& D = vc.draws[size_t(di)];
+                    if (!D.has_verts || D.frame < prev - 1 || !D.seat) continue;
+                    bool any = false;
+                    for (const auto& t : vc.table)
+                        if (t.style == vc.style && t.count == D.count) any = true;
+                    if (!any) continue;
+                    std::map<int, int> hist;
+                    for (const auto& q : D.verts) hist[q[3]]++;
+                    for (const auto& t : vc.table) {
+                        if (t.style != vc.style || t.count != D.count || int(D.pal_now.size()) < (t.slot + 1) * 12 || hist[t.slot] != t.nverts) continue;
+                        // Near the driver's seat (not a parked twin's).
+                        const glm::vec3 cs = glm::vec3{ D.b1 * vc_slot(D.pal_now, t.slot) * glm::vec4{ t.c, 1.0f } } - D.eye;
+                        if (glm::length(cs) > 1.2f) continue;
+                        vc.key         = t;
+                        vc.key_draw    = di;
+                        vc.state       = 2;
+                        vc.adopt_frame = frame;
+                        vc.source      = "the table";
+                        vc.conf        = 1.0f;
+                        vc.turn_ok = vc.turn_any = false;
+                        got = true;
+                        spdlog::info("[VehHands] vehcontrol: this vehicle's {} from fc5vr_vehcontrol.txt (draw {} slot {}, {} vertices on it{})", vc_style_name(vc.style),
+                                     t.count, t.slot, t.nverts, t.sure ? ", seen turning before" : "");
+                        break;
+                    }
+                }
+                if (!got) {
+                    fc5::vcfit::Cloud cl;
+                    Parts             parts;
+                    build_cloud(prev - 1, cl, parts);
+                    hands_now(h);
+                    const auto r = fc5::vcfit::detect(vc.style, cl, h);
+                    if (bars_not_wheel(cl, h, r)) {
+                        // (the drive changes its control: looked for again as handlebars)
+                    } else if (r.ok) {
+                        adopt(r, r.part >= 0 ? parts[size_t(r.part)].first : -1, r.part >= 0 ? parts[size_t(r.part)].second : -1,
+                              hands ? "at the sit, with the game's hands" : "at the sit", 0);
+                    } else {
+                        spdlog::info("[VehHands] vehcontrol: try {} at the sit, {} vertices near the driver in {} parts, the game's hands {}: not found ({})", vc.tries,
+                                     cl.p.size(), cl.nparts, hands ? "seen" : "not seen", say_result(vc_style_name(vc.style), r));
+                        // Handlebars expected (a driver on the vehicle's centre line is taken for a quad's) and none, but a wheel for sure:
+                        // the drive is told (the tractor, 11 Nov: a 16.4 cm wheel, and "no handlebars" in three tries).
+                        // Not before the game's hands are seen or the second try: on a quad they are on the bars, and its model holds a ring too.
+                        if (vc.style == fc5::drive::kBars && (hands || vc.tries >= 2) && !vc.told) {
+                            const auto rw = fc5::vcfit::detect(fc5::drive::kWheel, cl, h);
+                            if (rw.ok && rw.geo >= 0.95f && rw.conf >= 0.75f) {
+                                vc.told = true;
+                                fc5::drive::set_shape_hint(fc5::drive::kWheel);
+                                spdlog::info("[VehHands] vehcontrol: no handlebars but {}: the drive told it is a wheel", say_result("a wheel", rw));
+                            }
+                        }
+                        // jetskibars: a wheel expected on a boat (the game's type 1) and none, but handlebars in its model: a jetski found
+                        // in the world (only one spawned from F11 has its archetype, which gives the drive the bars at once). Author 16 Nov:
+                        //; his 10:28 drive: "rim does not go all round" in three tries, the bars never
+                        // looked for. The 12 Nov lake pass found the same jetski's bars at the sit at geometry 0.83, sure 0.70. The game's
+                        // hands are not required: on the jetski its right hand is off the bars (12 Nov: the right palm 25-72 cm away).
+                        if (vc.style == fc5::drive::kWheel && !vc.told) {
+                            int        jdrv = -1, jtype = -1;
+                            const bool boat = fc5::lua::vehicle_state(jdrv, jtype) == 1 && jtype == 1;
+                            if (boat) {
+                                const auto rb = fc5::vcfit::detect(fc5::drive::kBars, cl, h);
+                                if (rb.ok && rb.geo >= 0.8f && rb.conf >= 0.65f) {
+                                    vc.told = true;
+                                    fc5::drive::set_shape_hint(fc5::drive::kBars);
+                                    spdlog::info("[VehHands] vehcontrol: a boat with no wheel but {}: the drive told it is handlebars (a jetski)", say_result("handlebars", rb));
+                                } else if (vc.tries == 1) {
+                                    spdlog::info("[VehHands] vehcontrol: a boat with no wheel, and no handlebars for sure either ({})", say_result("handlebars", rb));
+                                }
+                            }
+                        }
+                        if (vc.tries >= 2 && !vc.nudged) {
+                            // The animation instead: one quick small turn (driveautoturn), so the part that turns shows at once.
+                            vc.nudged = true;
+                            fc5::steertune::auto_turn(350);
+                            spdlog::info("[VehHands] vehcontrol: a quick small turn sent, to see which part turns");
+                        }
+                    }
+                }
+            }
+        }
+        // The game's hands seen after a find without them: weighed again with them, once. Handlebars also once their turn was seen: the
+        // hands' hold is the answer for them (the jetski, pass 5: a 42 cm part that turns was taken before the hands were seen; they hold
+        // 72 cm apart): looked for with both hands seen, up to 3 times, 45 frames apart.
+        const bool h_r = frame - vc.hand_frame[0] <= 3, h_l = frame - vc.hand_frame[1] <= 3;
+        const bool again_any  = !vc.tried_hands && (h_r || h_l) && vc.key.sure == 0 && vc.source[0] == 'a';
+        const bool again_bars = vc.style == fc5::drive::kBars && !vc.by_hands && h_r && h_l && vc.hold_tries < 3 && frame - vc.hold_frame > 45;
+        // A stick found by its shape: its hold point is the game's own palm once the game's hand is on it, which can be a second or two
+        // after the sit (the JacobSeed plane, 13 Nov: "the hands' palms score 0.25" 150 ms after the sit, on the stick in the dump taken
+        // later; the shape's point there is the bare tube's end, 10 cm under the grip). Looked at up to 4 times, 60 frames apart.
+        const bool again_stick = vc.style == fc5::drive::kStick && !vc.by_hands && (h_r || h_l) && vc.hold_tries < 4 && frame - vc.hold_frame > 60 &&
+                                 !cv.held[0] && !cv.held[1];   // (not under a hand that holds it: the hand would jump)
+        if (ready && vc.state == 2 && frame - vc.out_frame <= 1 && (again_any || again_bars || again_stick)) {
+            if (again_any) vc.tried_hands = true;
+            if (again_bars || again_stick) vc.hold_tries++, vc.hold_frame = frame;
+            fc5::vcfit::Cloud cl;
+            Parts             parts;
+            fc5::vcfit::Hands h;
+            build_cloud(prev - 1, cl, parts);
+            hands_now(h);
+            glm::vec3  kc{ 0.0f }, kn{ 0.0f, 0.0f, 1.0f };
+            const bool have = key_now(kc, kn);
+            const auto r    = fc5::vcfit::detect(vc.style, cl, h);
+            const bool hold = (vc.style == fc5::drive::kBars && r.ok && r.hands >= 0.99f && r.how[0] == 'w') ||   // "where the game's two hands hold"
+                              (vc.style == fc5::drive::kStick && r.ok && r.hands >= 0.99f);                      // the game's hand on the stick
+            if (bars_not_wheel(cl, h, r)) {
+                // (the drive changes its control: looked for again as handlebars)
+            } else if (have && r.ok && (hold ? glm::length(r.c - kc) > 0.03f || std::abs(r.r - vc.key.r) > 0.03f : glm::length(r.c - kc) > 0.04f && r.conf > vc.conf && vc.key.sure == 0)) {
+                spdlog::info("[VehHands] vehcontrol: the game's hands are {:.0f} cm from the {} found without them: taken again with them", glm::length(r.c - kc) / ws * 100.0f,
+                             vc_style_name(vc.style));
+                // Its bone: the part under the hands; none: the bone followed so far.
+                const int sure = vc.key.sure == 1 ? 1 : 0;
+                adopt(r, r.part >= 0 ? parts[size_t(r.part)].first : vc.key_draw, r.part >= 0 ? parts[size_t(r.part)].second : vc.key.slot, "at the sit, with the game's hands", sure);
+            } else if (r.ok) {
+                vc.conf = std::max(vc.conf, r.conf);
+                if (hold) vc.by_hands = true;
+                spdlog::info("[VehHands] vehcontrol: with the game's hands the same {} is found (sure {:.2f}); the hands' palms {} from it", vc_style_name(vc.style), r.conf,
+                             vc.style == fc5::drive::kWheel ? fmt::format("{:.0f} cm (right) and {:.0f} cm (left; -100: not seen)", r.hand_d[0] / ws * 100.0f, r.hand_d[1] / ws * 100.0f)
+                                                            : fmt::format("score {:.2f}", r.hands));
+            }
+            if (again_stick && !hold)
+                spdlog::info("[VehHands] vehcontrol: look {} for the game's hand on the stick: the palms at ({:+.0f}, {:+.0f}, {:+.0f}) cm (right{}) and ({:+.0f}, {:+.0f}, "
+                             "{:+.0f}) cm (left{}) from the eyes (right, up, back, the vehicle's axes): not on it ({})",
+                             vc.hold_tries, h.p[0].x / ws * 100.0f, h.p[0].y / ws * 100.0f, h.p[0].z / ws * 100.0f, h.ok[0] ? "" : ", not seen", h.p[1].x / ws * 100.0f,
+                             h.p[1].y / ws * 100.0f, h.p[1].z / ws * 100.0f, h.ok[1] ? "" : ", not seen", r.how);
+            // Handlebars and no two-hand hold: where the game's hands are, so a pass's log tells why.
+            if (again_bars && !hold)
+                spdlog::info("[VehHands] vehcontrol: look {} for the handlebars' hold: the game's palms at ({:+.0f}, {:+.0f}, {:+.0f}) cm (right) and ({:+.0f}, {:+.0f}, {:+.0f}) cm "
+                             "(left) from the eyes (right, up, back, the vehicle's axes), {:.0f} cm apart: not a hold on handlebars ({}); the handlebars followed {}",
+                             vc.hold_tries, h.p[0].x / ws * 100.0f, h.p[0].y / ws * 100.0f, h.p[0].z / ws * 100.0f, h.p[1].x / ws * 100.0f, h.p[1].y / ws * 100.0f,
+                             h.p[1].z / ws * 100.0f, glm::length(h.p[0] - h.p[1]) / ws * 100.0f, r.how,
+                             have ? fmt::format("at ({:+.0f}, {:+.0f}, {:+.0f}) cm, half width {:.0f} cm", kc.x / ws * 100.0f, kc.y / ws * 100.0f, kc.z / ws * 100.0f, vc.key.r / ws * 100.0f)
+                                  : std::string{ "not placed" });
+        }
+
+        // 3. The animation: the parts that turned in the frame just ended, each seen turning alike the frame before (a rotor never turns twice
+        // alike), the largest turn first. Turns are taken in the vehicle's own space (its draws share one transform, VS b1, and its body's bones
+        // stay put there), not against a draw's slot 0: slot 0 is the first bone the draw's mesh uses, and in the Compact's wheel draw that is
+        // the wheel itself (11 Nov dumps: its rim's 882 vertices on slot 0, the column's on slots 1-3).
+        if (seat_ok && !vc.cands.empty() && vc.cand_frame == prev && vc.style != fc5::drive::kNone &&
+            (vc.state == 0 || (vc.state == 2 && (vc.key.sure == 0 || (vc.key.sure == 1 && !vc.ov_ok && vc.style != fc5::drive::kStick))))) {
+            std::vector<VcState::Best> stable;
+            for (const auto& c : vc.cands)
+                for (const auto& q : vc.prev_cands)
+                    if (q.d == c.d && q.slot == c.slot && q.frame >= prev - 4 && std::abs(q.ang - c.ang) < glm::radians(8.0f) && glm::dot(q.ax_w, c.ax_w) > 0.98f) {
+                        stable.push_back(c);
+                        break;
+                    }
+            vc.prev_cands = vc.cands;
+            vc.cands.clear();
+            std::sort(stable.begin(), stable.end(), [](const VcState::Best& x, const VcState::Best& y) { return x.ang > y.ang; });
+            if (!stable.empty() && (vc.anim_tries == 0 || stable[0].ang > vc.anim_ang + glm::radians(10.0f))) {
+                vc.anim_tries++;
+                vc.anim_ang = stable[0].ang;
+                fc5::vcfit::Cloud cl;
+                Parts             parts;
+                fc5::vcfit::Hands h;
+                build_cloud(prev, cl, parts);
+                hands_now(h);
+                glm::vec3  kc{ 0.0f }, kn{ 0.0f, 0.0f, 1.0f };
+                const bool have_key = vc.state == 2 && key_now(kc, kn);
+                std::vector<int> pn(parts.size(), 0);
+                for (uint16_t k : cl.part) pn[k]++;
+                auto part_draw = [&](int k) { return k >= 0 ? parts[size_t(k)].first : -1; };
+                auto part_slot = [&](int k) { return k >= 0 ? parts[size_t(k)].second : -1; };
+                bool                       done = false;
+                std::string                failed;
+                std::vector<VcState::Best> weighed;
+                for (const auto& b : stable) {
+                    if (done || weighed.size() >= 4 || b.d >= int(vc.draws.size())) break;
+                    bool dup = false;   // turning with a part already weighed
+                    for (const auto& w : weighed)
+                        if (std::abs(w.ang - b.ang) < glm::radians(4.0f) && glm::dot(w.ax_w, b.ax_w) > std::cos(glm::radians(5.0f))) dup = true;
+                    if (dup) continue;
+                    weighed.push_back(b);
+                    // Every slot of the vehicle's draws seen that frame turning about the same axis by the same angle: the same bone.
+                    std::set<std::pair<int, int>> moving;
+                    std::map<int, std::tuple<glm::vec3, glm::vec3, glm::vec3>> axis_of;   // per draw: the turn's axis and a point on it (the vehicle's space), the axis in the world
+                    for (int di = 0; di < int(vc.draws.size()); ++di) {
+                        const VcDraw& E = vc.draws[size_t(di)];
+                        if (E.frame != prev || E.pal_ref.size() < 12 || E.pal_now.size() < 12) continue;
+                        const glm::mat3 Wb{ E.b1 };
+                        const int       ns = int(std::min(E.pal_now.size(), E.pal_ref.size()) / 12);
+                        for (int s = 0; s < ns; ++s) {
+                            const glm::mat4 Psn = vc_slot(E.pal_now, s), Psr = vc_slot(E.pal_ref, s);
+                            if (!vc_rigid(Psn) || !vc_rigid(Psr)) continue;
+                            float     ang = 0.0f;
+                            glm::vec3 ax{ 0.0f }, piv{ 0.0f };
+                            if (!vc_motion(Psn * glm::inverse(Psr), ang, ax, piv)) continue;
+                            if (std::abs(ang - b.ang) > glm::radians(4.0f) || glm::dot(glm::normalize(Wb * ax), b.ax_w) < std::cos(glm::radians(5.0f))) continue;
+                            moving.insert({ di, s });
+                            if (!axis_of.contains(di)) axis_of[di] = { ax, piv, glm::normalize(Wb * ax) };
+                        }
+                    }
+                    // drivemodelshow: the bone's slots and each draw's axis (a positive turn about it: the bone's own, as about n, seat frame),
+                    // to draw the control at the hand's angle (veh_control_show).
+                    auto capture_show = [&](const glm::vec3& n_seat) {
+                        if (vc.style == fc5::drive::kStick) return;
+                        const glm::vec3 n_w = glm::transpose(glm::mat3{ vc.Sd }) * n_seat;
+                        vc.ov_counts.clear();
+                        for (auto& E : vc.draws) {
+                            E.ov = false;
+                            E.ov_slots.clear();
+                        }
+                        for (const auto& [mi, ms] : moving) {
+                            VcDraw&    E  = vc.draws[size_t(mi)];
+                            const auto it = axis_of.find(mi);
+                            if (it == axis_of.end()) continue;
+                            if (!E.ov) {
+                                E.ov     = true;
+                                E.ov_ax  = glm::dot(std::get<2>(it->second), n_w) < 0.0f ? -std::get<0>(it->second) : std::get<0>(it->second);
+                                E.ov_piv = std::get<1>(it->second);
+                                vc.ov_counts.push_back(E.count);
+                            }
+                            E.ov_slots.push_back({ ms, vc_slot(E.pal_now, ms) });
+                        }
+                        vc.ov_turn_c = vc.turn;
+                        vc.ov_ok     = !vc.ov_counts.empty();
+                        spdlog::info("[VehHands] vehcontrol: the {}'s bone is {} slots of {} draws: drawn at the hand's angle while held (drivemodelshow)", vc_style_name(vc.style),
+                                     moving.size(), vc.ov_counts.size());
+                    };
+                    fc5::vcfit::Motion mo;
+                    mo.axis  = glm::normalize(glm::mat3{ vc.Sd } * b.ax_w);
+                    mo.point = glm::vec3{ vc.Sd * glm::vec4{ b.piv_w, 1.0f } };
+                    mo.angle = b.ang;
+                    mo.parts.assign(parts.size(), 0);
+                    int big = -1;   // the turning part with the most vertices near the driver
+                    for (int k = 0; k < int(parts.size()); ++k)
+                        if (moving.contains(parts[size_t(k)])) {
+                            mo.parts[size_t(k)] = 1;
+                            if (big < 0 || pn[size_t(k)] > pn[size_t(big)]) big = k;
+                        }
+                    const auto        r2     = fc5::vcfit::detect(vc.style, cl, h, &mo);
+                    const std::string turned = fmt::format("draw {} slot {} turned {:.0f} deg, {} slots with it", vc.draws[size_t(b.d)].count, b.slot, glm::degrees(b.ang), moving.size());
+                    // A find with no part of its own (the hands' hold, the hub-and-hands wheel): the turning part with the most vertices near
+                    // the driver, else the part that turned.
+                    auto own_draw = [&](const fc5::vcfit::Result& r) { return r.part >= 0 ? part_draw(r.part) : big >= 0 ? part_draw(big) : b.d; };
+                    auto own_slot = [&](const fc5::vcfit::Result& r) { return r.part >= 0 ? part_slot(r.part) : big >= 0 ? part_slot(big) : b.slot; };
+                    if (vc.state == 2) {
+                        done = true;   // (while a control is followed the search only keeps what turns about it: the first is the one)
+                        if (frame - vc.out_frame > 2 || !have_key) break;
+                        // Found at the sit: does its turn agree?
+                        fc5::vcfit::Result cur;
+                        cur.style = vc.style;
+                        cur.c     = kc;
+                        cur.n     = kn;
+                        cur.r     = vc.key.r;
+                        cur.conf  = 1.0f;
+                        cur.anim  = 1.0f;
+                        cur.how   = "found at the sit, its turn agrees";
+                        const glm::vec3 dc     = kc - mo.point;
+                        const float     off    = glm::length(dc - mo.axis * glm::dot(dc, mo.axis));
+                        const bool      key_in = vc.key.slot >= 0 && moving.contains({ vc.key_draw, vc.key.slot });
+                        const bool      coax   = vc.style == fc5::drive::kWheel ? std::abs(glm::dot(kn, mo.axis)) > 0.97f && off < 0.04f
+                                                 : vc.style == fc5::drive::kBars ? key_in || (vc.by_hands && off < 0.20f)
+                                                                                 : key_in;
+                        const bool      agree  = r2.ok && glm::length(r2.c - kc) < (vc.style == fc5::drive::kWheel ? 0.03f : 0.08f);
+                        if ((agree || coax) && vc.key.sure == 1) {
+                            capture_show(kn);   // known from the table: only its slots were still to see
+                        } else if (agree || coax) {
+                            if (vc.style == fc5::drive::kBars) cur.n = mo.axis.y < 0.0f ? -mo.axis : mo.axis;   // the steering axis, now known
+                            // Its bone: the one found at the sit if it turns; else the turning part that holds the shape, or the most vertices,
+                            // or the part that turned.
+                            const int cand = agree && r2.part >= 0 ? r2.part : big;
+                            const int kd   = key_in ? vc.key_draw : cand >= 0 ? part_draw(cand) : b.d;
+                            const int ks   = key_in ? vc.key.slot : cand >= 0 ? part_slot(cand) : b.slot;
+                            spdlog::info("[VehHands] vehcontrol: the {} found at the sit turns with the steering ({}; its centre {:.1f} cm from the turn's axis){}",
+                                         vc_style_name(vc.style), turned, off / ws * 100.0f, key_in ? "" : ": it was on no bone that turns, the one that turns is followed");
+                            adopt(cur, kd, ks, "at the sit, seen turning", 1);
+                            capture_show(cur.n);
+                        } else if (vc.key.sure == 1) {
+                            // (known from the table and another part turned: nothing to do)
+                        } else if (r2.ok) {
+                            spdlog::info("[VehHands] vehcontrol: the {} found at the sit ({:.0f} cm from the part that turns) is not what turns ({})", vc_style_name(vc.style),
+                                         glm::length(r2.c - kc) / ws * 100.0f, turned);
+                            adopt(r2, own_draw(r2), own_slot(r2), "from its turn", 1);
+                            capture_show(r2.n);
+                        } else if (vc.anim_tries <= 3) {
+                            spdlog::info("[VehHands] vehcontrol: a part turned ({}), not the {} found at the sit ({:.0f} cm from its axis) and no {} in it: kept", turned,
+                                         vc_style_name(vc.style), off / ws * 100.0f, vc_style_name(vc.style));
+                            if (vc.anim_tries == 3) vc.key.sure = -1;   // stop looking: kept as found
+                        }
+                    } else if (r2.ok) {
+                        adopt(r2, own_draw(r2), own_slot(r2), "from its turn", 1);
+                        capture_show(r2.n);
+                        done = true;
+                    } else if (failed.empty()) {
+                        failed = fmt::format("{}: {}", turned, say_result("no shape in it", r2));
+                    }
+                }
+                if (!done && vc.state == 0) {
+                    spdlog::info("[VehHands] vehcontrol: {} parts turned and none is the {} (the first: {})", weighed.size(), vc_style_name(vc.style), failed);
+                    if (vc.anim_tries >= 4) {
+                        vc.state = 3;
+                        spdlog::info("[VehHands] vehcontrol: the {} not found in this vehicle's model: this drive as before (the game's hands)", vc_style_name(vc.style));
+                    }
+                }
+            }
+        }
+        // A control with no bone: where it was found, in the vehicle's own space (the driven vehicle's draw, VS b1).
+        if (vc.state == 2 && vc.key.slot < 0 && seat_ok && vc.home >= 0 && vc.home < int(vc.draws.size()) && vc.draws[size_t(vc.home)].frame >= prev - 1) {
+            const glm::mat4& Hb = vc.draws[size_t(vc.home)].b1;
+            vc.c_ref     = B * (glm::vec3{ Hb * glm::vec4{ vc.key.c, 1.0f } } - o);
+            vc.n_ref     = B * glm::normalize(glm::mat3{ Hb } * vc.key.n);
+            vc.G_ref     = glm::translate(glm::mat4{ 1.0f }, vc.c_ref);
+            vc.out_frame = frame;
+            fc5::drive::Model m{};
+            m.style       = vc.style;
+            m.centre      = vc.c_ref / ws;
+            m.n           = vc.n_ref;
+            m.radius      = vc.key.r / ws;
+            m.axis_learnt = true;
+            m.bone        = true;
+            fc5::drive::set_model(m);
+        }
+        // Lost: the followed bone not drawn near the eyes for 4 s: looked for again (a table entry that was another vehicle's: not taken again).
+        if (vc.state == 2 && vc.key.slot >= 0 && frame - std::max(vc.out_frame, vc.adopt_frame) > 360) {
+            spdlog::info("[VehHands] vehcontrol: the {} (draw {} slot {}, {}) not seen near the eyes for 4 s: looked for again", vc_style_name(vc.style), vc.key.count,
+                         vc.key.slot, vc.source);
+            if (vc.source[0] == 't') std::erase_if(vc.table, [&](const VcEntry& t) { return t.style == vc.key.style && t.count == vc.key.count && t.slot == vc.key.slot && t.nverts == vc.key.nverts; });
+            vc_reset_find(frame);
+        }
+    }
+
+    if (!vc.drive_on) return;   // gesture driving off: no control to place
+    // The vertex reads left by draws on a deferred context.
+    if (!deferred && !vc.jobs.empty()) {
+        for (auto& j : vc.jobs) {
+            if (j.d >= 0 && j.d < int(vc.draws.size())) vc_run_job(ctx, j, vc.draws[size_t(j.d)]);
+            if (j.vb) j.vb->Release();
+            if (j.ib) j.ib->Release();
+        }
+        vc.jobs.clear();
+    }
+
+    // This draw: near the eyes, a vehicle material, with a palette copy.
+    const bool searching = settled && seat_ok && vc.style != fc5::drive::kNone &&
+                           (vc.state == 0 || (vc.state == 2 && (vc.key.sure == 0 || (vc.key.sure == 1 && !vc.ov_ok && vc.style != fc5::drive::kStick))));
+    float      b1f[12]{};
+    {
+        ID3D11Buffer* cb = nullptr;
+        ctx->VSGetConstantBuffers(1, 1, &cb);
+        if (!cb) return;
+        std::lock_guard ol{ m_obj_mtx };
+        const auto      it = m_obj_consts.find(cb);
+        cb->Release();
+        if (it == m_obj_consts.end()) return;
+        std::memcpy(b1f, it->second.f, sizeof(b1f));
+    }
+    if (glm::length(glm::vec3{ b1f[3], b1f[7], b1f[11] } - cam) > 3.5f) return;
+    {
+        ID3D11PixelShader* ps = nullptr;
+        ctx->PSGetShader(&ps, nullptr, nullptr);
+        if (!ps) return;
+        bool veh = false;
+        {
+            std::lock_guard p{ m_ps_mtx };
+            veh = m_vehicle_shaders.contains(ps);
+        }
+        ps->Release();
+        if (!veh) return;
+    }
+    // An indirect draw (no count here): its index count, start and base from its arguments, read once a drive for each (buffer, offset).
+    // The van's rim, the heavy truck's and the boats' parts are drawn so (11 Nov: the van's four vehicle draws with no count held what
+    // the detection missed).
+    if (count == 0) {
+        if (m_hud_draw_kind != 5 || !m_hud_draw_args) return;
+        const auto ak = std::make_pair(static_cast<void*>(m_hud_draw_args), m_hud_draw_args_off);
+        auto       it = vc.args.find(ak);
+        if (it == vc.args.end()) {
+            std::array<int32_t, 5> ia{};
+            if (deferred || vc.args.size() >= 256 || !indirect_args(ctx, m_hud_draw_args, m_hud_draw_args_off, ia, true)) return;
+            it = vc.args.emplace(ak, ia).first;
+        }
+        if (it->second[0] <= 0) return;
+        count = UINT(it->second[0]);
+        start = UINT(std::max(0, it->second[2]));
+        base  = INT(it->second[3]);
+    }
+    ID3D11Buffer* vb     = nullptr;
+    UINT          stride = 0, voff = 0;
+    ctx->IAGetVertexBuffers(0, 1, &vb, &stride, &voff);
+    if (vb) vb->Release();   // a key only here (a read takes its own reference)
+    int di = -1;
+    for (int i = 0; i < int(vc.draws.size()); ++i) {
+        const auto& D = vc.draws[size_t(i)];
+        if (D.count == count && D.start == start && D.base == base && D.vb == vb) {
+            di = i;
+            break;
+        }
+    }
+    const bool key_draw = vc.state == 2 && vc.key.slot >= 0 && count == vc.key.count;
+    if (di >= 0) {
+        const VcDraw& D = vc.draws[size_t(di)];
+        // Known and read, and nothing to look for now: only the followed bone's draw goes on.
+        if (!key_draw && D.has_verts && !searching && vc.state == 2) return;
+        if (!key_draw && D.frame == frame && (D.has_verts || D.queued)) return;   // seen this frame
+    }
+    std::vector<float> pal;
+    float              scale = 0.0f;
+    {
+        ID3D11Buffer* cb2 = nullptr;
+        ID3D11Buffer* cb3 = nullptr;
+        ctx->VSGetConstantBuffers(2, 1, &cb2);
+        ctx->VSGetConstantBuffers(3, 1, &cb3);
+        std::lock_guard ol{ m_obj_mtx };
+        if (cb2) {
+            if (auto it = m_obj_consts.find(cb2); it != m_obj_consts.end() && it->second.f[5] > 1e-7f && it->second.f[5] < 1e-2f) scale = it->second.f[5];
+            cb2->Release();
+        }
+        if (cb3) {
+            if (auto it = m_bone_data.find(cb3); it != m_bone_data.end() && it->second.size() >= 24) {
+                // The slots its vertices use only (once read): a palette is 256 slots, a vehicle's draw uses a few dozen.
+                const size_t n = di >= 0 && vc.draws[size_t(di)].has_verts ? std::min(it->second.size(), size_t(std::max(2, vc.draws[size_t(di)].nslot)) * 12) : it->second.size();
+                pal.assign(it->second.begin(), it->second.begin() + n);
+            }
+            cb3->Release();
+        }
+    }
+    if (pal.empty()) return;
+
+    // 4. Following: the bone's palette matrix places the control. Every drawn instance of the key's draw is weighed: the nearest within 1.2 m
+    // of the eyes (not a parked twin).
+    if (key_draw && seat_ok && int(pal.size()) >= (vc.key.slot + 1) * 12) {
+        const glm::mat4 Ps = vc_slot(pal, vc.key.slot);
+        const glm::mat4 W  = from_rows12(b1f) * Ps;
+        const glm::vec3 cw = glm::vec3{ W * glm::vec4{ vc.key.c, 1.0f } };
+        const float     dc = glm::length(cw - cam);
+        const glm::mat3 R{ W };
+        const glm::vec3 gx = glm::normalize(R[0]);
+        glm::vec3       gy = R[1] - gx * glm::dot(R[1], gx);
+        if (dc <= 1.2f && !(vc.out_frame == frame && dc >= vc.out_d) && glm::length(gy) > 1e-6f && std::isfinite(cw.x + gx.x + gy.x)) {
+            gy                 = glm::normalize(gy);
+            const glm::vec3 nw = glm::normalize(R * vc.key.n);
+            vc.G_ref           = glm::mat4{ B * glm::mat3{ gx, gy, glm::cross(gx, gy) } };
+            vc.c_ref           = B * (cw - o);
+            vc.G_ref[3]        = glm::vec4{ vc.c_ref, 1.0f };
+            vc.n_ref           = B * nw;
+            // The bone's turn about its own axis, in the vehicle's space: summed frame to frame (rad, positive: to the left).
+            if (vc.style != fc5::drive::kStick && vc_rigid(Ps)) {
+                const glm::quat q  = glm::quat_cast(glm::mat3{ Ps });
+                const float     tw = 2.0f * std::atan2(glm::dot(glm::vec3{ q.x, q.y, q.z }, vc.key.n), q.w);
+                if (vc.turn_any && vc.out_frame != frame) {
+                    float d = tw - vc.turn_raw;
+                    while (d > 3.14159265f) d -= 6.2831853f;
+                    while (d < -3.14159265f) d += 6.2831853f;
+                    vc.turn += d;
+                }
+                vc.turn_raw = tw;
+                vc.turn_any = true;
+                vc.turn_ok  = true;
+            } else if (vc.out_frame != frame) {
+                vc.turn_ok = false;
+            }
+            vc.out_frame = frame;
+            vc.out_d     = dc;
+            vc.key_b1    = glm::vec3{ b1f[3], b1f[7], b1f[11] };
+            fc5::drive::Model m{};
+            m.style       = vc.style;
+            m.centre      = vc.c_ref / ws;
+            m.n           = vc.n_ref;
+            m.radius      = vc.key.r / ws;
+            m.axis_learnt = true;
+            m.bone        = true;
+            m.turn        = vc.turn;
+            m.turn_ok     = vc.turn_ok;
+            fc5::drive::set_model(m);
+            // Whether the bone itself moves in the vehicle's own space apart from its turn (a body that rolls on its springs under the
+            // vehicle's transform): drivemodelshow draws the bone at the pose it was taken in, turned; a line when its centre is 2 cm more
+            // from where it was first followed than said so far.
+            {
+                const glm::vec3 pv = glm::vec3{ Ps * glm::vec4{ vc.key.c, 1.0f } };
+                if (vc.piv_draw != vc.key_draw || vc.piv_slot != vc.key.slot) {
+                    vc.piv_draw = vc.key_draw;
+                    vc.piv_slot = vc.key.slot;
+                    vc.piv0     = pv;
+                    vc.piv_said = 0.0f;
+                }
+                const float dv = glm::length(pv - vc.piv0);
+                if (vc.style != fc5::drive::kStick && dv > vc.piv_said + 0.02f * ws) {
+                    vc.piv_said = dv;
+                    spdlog::info("[VehHands] vehcontrol: the {}'s bone is {:.1f} cm from where it was first followed, in the vehicle's own space (not its turn: the "
+                                 "vehicle's body moves under its transform)", vc_style_name(vc.style), dv / ws * 100.0f);
+                }
+            }
+            // A stick: how far the game leans its bone from where it was first followed (each change of 1 deg, at most every 10 frames, 150
+            // lines a drive): with a timed left stick (steerstep) it shows where the game's dead zone ends.
+            if (vc.style == fc5::drive::kStick && vc_rigid(Ps)) {
+                if (vc.lean_draw != vc.key_draw || vc.lean_slot != vc.key.slot) {
+                    vc.lean_draw  = vc.key_draw;
+                    vc.lean_slot  = vc.key.slot;
+                    vc.lean_R0    = glm::mat3{ Ps };
+                    vc.lean_said  = 0.0f;
+                    vc.lean_lines = 0;
+                    vc.lean_frame = frame;
+                }
+                const glm::quat q    = glm::quat_cast(glm::mat3{ Ps } * glm::transpose(vc.lean_R0));
+                const float     lean = glm::degrees(2.0f * std::acos(std::clamp(std::abs(q.w), 0.0f, 1.0f)));
+                if (std::abs(lean - vc.lean_said) >= 1.0f && frame - vc.lean_frame >= 10 && vc.lean_lines < 150) {
+                    vc.lean_said  = lean;
+                    vc.lean_frame = frame;
+                    vc.lean_lines++;
+                    spdlog::info("[VehHands] vehcontrol: the stick's bone leans {:.1f} deg from where it was first followed", lean);
+                }
+                // While a steerstep runs, and for 3 s after it: every 9 frames the stick's lean to 0.01 deg, about the vehicle's front and
+                // across axes, and the vehicle's own roll and pitch. On the ground the stick's bone leans about 1 deg for 0.60 of left
+                // stick and sways 1 deg by itself (13 Nov, helidead2b), so 1 deg steps cannot tell where the game starts to answer; the
+                // mean of these lines over a step can, and in a hover the vehicle's roll shows it directly.
+                {
+                    float      sx  = 0.0f;
+                    int        srt = 0;
+                    const bool on  = fc5::steertune::step_value(sx, srt);
+                    if (on) vc.fine_until = frame + 270;
+                    if (frame < vc.fine_until && frame - vc.fine_frame >= 9) {
+                        vc.fine_frame = frame;
+                        glm::vec3 qv{ q.x, q.y, q.z };
+                        if (q.w < 0.0f) qv = -qv;
+                        const float     ql = glm::length(qv);
+                        const glm::vec3 rv = ql > 1e-9f ? qv / ql * glm::degrees(2.0f * std::asin(std::min(1.0f, ql))) : glm::vec3{ 0.0f };
+                        const glm::mat4 Wv = from_rows12(b1f);
+                        const glm::vec3 fw = glm::normalize(glm::vec3{ Wv[1] }), up = glm::normalize(glm::vec3{ Wv[2] });
+                        const glm::vec3 ac = glm::cross(fw, glm::vec3{ 0.0f, 0.0f, 1.0f });   // level, across the vehicle (the world's up is z)
+                        const float     roll  = glm::length(ac) > 1e-4f ? glm::degrees(std::asin(std::clamp(glm::dot(up, glm::normalize(ac)), -1.0f, 1.0f))) : 0.0f;
+                        const float     pitch = glm::degrees(std::asin(std::clamp(fw.z, -1.0f, 1.0f)));
+                        spdlog::info("[VehHands] vehcontrol: steerstep {}: left stick X {:+.2f}, RT {}; the stick's bone leans {:+.2f} deg about the vehicle's front axis, "
+                                     "{:+.2f} about its across axis; the vehicle rolls {:+.2f} deg, pitches {:+.2f} deg",
+                                     on ? "on" : "over", on ? sx : 0.0f, on ? srt : 0, rv.y, rv.x, roll, pitch);
+                    }
+                }
+            }
+            // drivemodelshow. Until the bone's turn has shown all its slots: a wheel's own slot, about the rim's axis.
+            if (!vc.ov_ok && vc.ov_counts.empty() && vc.style == fc5::drive::kWheel && di >= 0 && vc.turn_ok) {
+                VcDraw& E  = vc.draws[size_t(di)];
+                E.ov       = true;
+                E.ov_slots = { { vc.key.slot, Ps } };
+                E.ov_ax    = glm::normalize(glm::mat3{ Ps } * vc.key.n);
+                E.ov_piv   = glm::vec3{ Ps * glm::vec4{ vc.key.c, 1.0f } };
+                vc.ov_turn_c        = vc.turn;
+                vc.ov_counts        = { count };
+            }
+            // The hand rides the bone as it is drawn: at the hand's angle, not the game's.
+            if (vc.show_on && vc.turn_ok && di >= 0 && vc.draws[size_t(di)].ov) {
+                const VcDraw&   E  = vc.draws[size_t(di)];
+                const glm::mat4 Wb = S4 * from_rows12(b1f);
+                const glm::mat4 Rb = glm::translate(glm::mat4{ 1.0f }, E.ov_piv) * glm::mat4_cast(glm::angleAxis(vc.show_turn - vc.turn, E.ov_ax)) *
+                                     glm::translate(glm::mat4{ 1.0f }, -E.ov_piv);
+                vc.G_ref           = Wb * Rb * glm::inverse(Wb) * vc.G_ref;
+            }
+            if (!vc.said_follow) {
+                vc.said_follow = true;
+                spdlog::info("[VehHands] vehcontrol: following the vehicle's own {} ({}): {} ({:+.0f}, {:+.0f}, {:+.0f}) cm from the eyes (right, up, back, the recentred view's axes){}",
+                             vc_style_name(vc.style), vc.source, vc.style == fc5::drive::kStick ? "its top" : "its centre", vc.c_ref.x / ws * 100.0f,
+                             vc.c_ref.y / ws * 100.0f, vc.c_ref.z / ws * 100.0f,
+                             vc.style == fc5::drive::kWheel  ? fmt::format(", rim radius {:.1f} cm, its face tilted {:.0f} deg up", vc.key.r / ws * 100.0f,
+                                                                           glm::degrees(std::asin(std::clamp(vc.n_ref.y, -1.0f, 1.0f))))
+                             : vc.style == fc5::drive::kBars ? fmt::format(", half width {:.0f} cm", vc.key.r / ws * 100.0f)
+                                                             : std::string{});
+            }
+        }
+    }
+    if (di >= 0 && vc.draws[size_t(di)].frame == frame && (vc.draws[size_t(di)].has_verts || vc.draws[size_t(di)].queued)) return;   // seen this frame
+    if (di < 0) {
+        if (vc.draws.size() >= 128) return;
+        VcDraw D;
+        D.count   = count;
+        D.start   = start;
+        D.base    = base;
+        D.vb      = vb;
+        D.pal_ref = pal;
+        vc.draws.push_back(std::move(D));
+        di = int(vc.draws.size()) - 1;
+    }
+    VcDraw& D = vc.draws[size_t(di)];
+    if (D.frame != frame) {
+        D.pal_now = std::move(pal);
+        D.b1      = from_rows12(b1f);
+        D.eye     = o;
+        D.seat    = seat_ok;
+        D.scale   = scale;
+        D.frame   = frame;
+        if (D.pal_ref.size() > D.pal_now.size()) D.pal_ref.resize(D.pal_now.size());
+    }
+
+    // 1. Its vertices, once (6 reads a frame, 200 a drive): now on an immediate context, else at the next immediate draw.
+    if (!D.has_verts && !D.queued && vc.reads < 200) {
+        if (vc.read_frame != frame) vc.read_frame = frame, vc.reads_in_frame = 0;
+        if (vc.reads_in_frame < 6) {
+            ID3D11InputLayout* il = nullptr;
+            ctx->IAGetInputLayout(&il);
+            std::vector<LayoutElem> layout;
+            {
+                std::lock_guard p{ m_ps_mtx };
+                if (auto it = m_layouts.find(il); it != m_layouts.end()) layout = it->second;
+            }
+            if (il) il->Release();
+            int  pos_off = -1, bi_off = -1, w_off = -1;
+            bool w_bgra  = false;
+            for (const auto& e : layout) {
+                if (e.slot != 0 || e.index != 0) continue;
+                if (_stricmp(e.semantic.c_str(), "POSITION") == 0 && e.format == DXGI_FORMAT_R16G16B16A16_SINT) pos_off = int(e.offset);
+                if (_stricmp(e.semantic.c_str(), "BLENDINDICES") == 0) bi_off = int(e.offset);
+                if (_stricmp(e.semantic.c_str(), "BLENDWEIGHT") == 0) w_off = int(e.offset), w_bgra = e.format == DXGI_FORMAT_B8G8R8A8_UNORM;
+            }
+            if (pos_off < 0 || !vb || stride == 0 || stride > 256 || bi_off + 4 > int(stride) || w_off + 4 > int(stride)) {
+                D.has_verts = true;   // not the vehicles' packed position: no vertices to take
+                D.verts.clear();
+            } else {
+                VcJob j;
+                j.d = di;
+                ctx->IAGetVertexBuffers(0, 1, &j.vb, &j.stride, &j.voff);
+                DXGI_FORMAT ib_fmt{};
+                ctx->IAGetIndexBuffer(&j.ib, &ib_fmt, &j.ib_off);
+                j.i32     = ib_fmt == DXGI_FORMAT_R32_UINT;
+                j.count   = count;
+                j.start   = start;
+                j.base    = base;
+                j.pos_off = UINT(pos_off);
+                j.bi_off  = bi_off;
+                j.w_off   = w_off;
+                j.w_bgra  = w_bgra;
+                vc.reads++;
+                vc.reads_in_frame++;
+                if (!j.vb || !j.ib) {
+                    if (j.vb) j.vb->Release();
+                    if (j.ib) j.ib->Release();
+                    D.has_verts = true;
+                } else if (deferred) {
+                    D.queued = true;
+                    vc.jobs.push_back(j);
+                } else {
+                    vc_run_job(ctx, j, D);
+                    j.vb->Release();
+                    j.ib->Release();
+                }
+            }
+        }
+    }
+
+    // 3. The animation's search: each slot's turn since the first sight, in the vehicle's own space, about an axis passing near the eyes.
+    if (searching && D.pal_ref.size() >= 12 && D.pal_now.size() >= 12) {
+        const bool      stick = vc.style == fc5::drive::kStick;
+        const float     thr   = glm::radians(stick ? 3.0f : 5.0f);
+        const float     reach = stick ? 1.2f : 0.6f;   // (the helicopter's cyclic turns about its foot, a metre under the eyes)
+        const glm::mat3 Wb{ D.b1 };
+        const int       ns = int(std::min(D.pal_now.size(), D.pal_ref.size()) / 12);
+        if (vc.cand_frame != frame) {
+            vc.cands.clear();
+            vc.cand_frame = frame;
+        }
+        for (int s = 0; s < ns; ++s) {
+            const glm::mat4 Psn = vc_slot(D.pal_now, s), Psr = vc_slot(D.pal_ref, s);
+            if (!vc_rigid(Psn) || !vc_rigid(Psr)) continue;
+            float     ang = 0.0f;
+            glm::vec3 ax{ 0.0f }, piv{ 0.0f };
+            if (!vc_motion(Psn * glm::inverse(Psr), ang, ax, piv)) continue;
+            if (ang < thr || (stick && ang > glm::radians(45.0f))) continue;
+            const glm::vec3 ax_w  = glm::normalize(Wb * ax);
+            const glm::vec3 piv_w = glm::vec3{ D.b1 * glm::vec4{ piv, 1.0f } };
+            const glm::vec3 dv    = cam - piv_w;
+            const glm::vec3 foot  = dv - ax_w * glm::dot(dv, ax_w);
+            if (glm::length(foot) > reach) continue;
+            if (vc.state == 2) {
+                // A control is followed: only what turns about it counts (the author's first drive, 11 Nov: another part 11 cm from the wheel's
+                // axis turned 18 deg at each sit and hid the wheel's own first turns). Stick: its own bone.
+                if (frame - vc.out_frame > 2) continue;
+                if (stick) {
+                    if (di != vc.key_draw || s != vc.key.slot) continue;
+                } else {
+                    const glm::vec3 as = glm::normalize(B * ax_w);
+                    const glm::vec3 dc = vc.c_ref - B * (cam - foot - o);
+                    const float     of = glm::length(dc - as * glm::dot(dc, as));
+                    if (vc.style == fc5::drive::kWheel ? std::abs(glm::dot(as, vc.n_ref)) < 0.97f || of > 0.04f : of > 0.20f) continue;
+                }
+            }
+            const VcState::Best c{ ang, di, s, frame, ax_w, cam - foot };
+            // The 8 largest turns of the frame.
+            if (vc.cands.size() < 8) {
+                vc.cands.push_back(c);
+            } else {
+                auto lo = std::min_element(vc.cands.begin(), vc.cands.end(), [](const VcState::Best& x, const VcState::Best& y) { return x.ang < y.ang; });
+                if (lo->ang < ang) *lo = c;
+            }
+        }
+    }
+}
+
+// drivemodelshow on|off (saved, default on; FarCry5Drive.h; author 11 Nov 10:00). The game eases its own wheel behind the stick (his drive: 20-30 deg behind the hand while it moved; the
+// game's steering takes 220 ms to half and 750 ms to 90 % at full stick, research\2026-11-07_steerlag). While a hand holds the wheel or bars,
+// every draw of the control's bone is drawn with that bone turned to the hand's angle: its slots' matrices in the draw's palette are
+// replaced by a turn about the bone's axis x the slot's pose when it was taken (veh_control_draw; the vehicle's own space), and the copy bound for this
+// draw (hands_cb_swap; the draw hooks put the game's back). The game's own palette is not changed: the detection and the steering still
+// read the game's turn. Called after world_character_draw, for a draw that is drawn and has no other palette swapped in.
+void FarCry5Stereo::veh_control_show(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base)
+{
+    if (!m_vehcontrol.load() || !m_in_vehicle.load() || !m_veh_driving.load()) return;
+    auto&           vc = g_vc;
+    std::lock_guard _{ vc.mtx };
+    if (!vc.show_on || vc.state != 2 || vc.ov_counts.empty() || m_frame.load() - vc.out_frame > 2) return;
+    if (count == 0) {   // an indirect draw: its arguments as veh_control_draw read them
+        if (m_hud_draw_kind != 5 || !m_hud_draw_args) return;
+        const auto it = vc.args.find(std::make_pair(static_cast<void*>(m_hud_draw_args), m_hud_draw_args_off));
+        if (it == vc.args.end() || it->second[0] <= 0) return;
+        count = UINT(it->second[0]);
+        start = UINT(std::max(0, it->second[2]));
+        base  = INT(it->second[3]);
+    }
+    if (std::find(vc.ov_counts.begin(), vc.ov_counts.end(), count) == vc.ov_counts.end()) return;
+    ID3D11Buffer* vb     = nullptr;
+    UINT          stride = 0, voff = 0;
+    ctx->IAGetVertexBuffers(0, 1, &vb, &stride, &voff);
+    if (vb) vb->Release();
+    for (const VcDraw& D : vc.draws) {
+        if (!D.ov || D.count != count || D.start != start || D.base != base || D.vb != vb) continue;
+        std::vector<float> pal;
+        {
+            ID3D11Buffer* cb1 = nullptr;
+            ID3D11Buffer* cb3 = nullptr;
+            ctx->VSGetConstantBuffers(1, 1, &cb1);
+            ctx->VSGetConstantBuffers(3, 1, &cb3);
+            std::lock_guard ol{ m_obj_mtx };
+            bool            mine = false;
+            if (cb1) {
+                // This vehicle's (a parked twin's wheel is left alone).
+                if (auto it = m_obj_consts.find(cb1); it != m_obj_consts.end())
+                    mine = glm::length(glm::vec3{ it->second.f[3], it->second.f[7], it->second.f[11] } - vc.key_b1) < 1.0f;
+                cb1->Release();
+            }
+            if (cb3) {
+                if (auto it = m_bone_data.find(cb3); mine && it != m_bone_data.end() && it->second.size() >= 3072) pal = it->second;
+                cb3->Release();
+            }
+        }
+        if (pal.size() < 3072) return;
+        const glm::mat4 R = glm::translate(glm::mat4{ 1.0f }, D.ov_piv) * glm::mat4_cast(glm::angleAxis(vc.show_turn - vc.ov_turn_c, D.ov_ax)) *
+                            glm::translate(glm::mat4{ 1.0f }, -D.ov_piv);
+        for (const auto& [sl, rel] : D.ov_slots)
+            if (sl >= 0 && size_t(sl + 1) * 12 <= pal.size()) to_rows12(R * rel, pal.data() + size_t(sl) * 12);
+        if (hands_cb_swap(ctx, pal, false) && !vc.ov_said) {
+            vc.ov_said = true;
+            spdlog::info("[VehHands] vehcontrol: the vehicle's own {} drawn at the hand's angle (drivemodelshow): draw {}, {} slots, {:+.0f} deg from where they were taken{}",
+                         vc_style_name(vc.style), count, D.ov_slots.size(), glm::degrees(vc.show_turn - vc.ov_turn_c),
+                         vc.ov_ok ? "" : " (the rim's own slot until its turn has shown the others)");
+        }
+        return;
     }
 }

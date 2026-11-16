@@ -20,6 +20,8 @@
 #include "FarCry5GameWeapon.h"
 #include "FarCry5ReloadParts.h"
 #include "FarCry5Gesture.h"
+#include "FarCry5BodyIk.h"
+#include "FarCry5PadGlyph.h"
 #include "FarCry5SwitchSpeed.h"
 #include "ModPath.h"
 
@@ -440,21 +442,26 @@ namespace
     constexpr float kHandMagDefault[3]{ 0.0f, 0.07f, -0.01f };
     constexpr float kTravelDefault = 0.05f, kRackDefault = 0.06f;
     constexpr int   kTapDefault    = 250;    // ms: a quick press of B drops the magazine; longer, it is the game's Y (heal)
+    // reloadwellzone2 (author 15 Nov 21:20Z): every
+    // way in, for every weapon, 20 % larger: the well's distance off its axis and below it (and the distances that pull it out again, so the
+    // magazine is not lost sooner than before), the AK's and the wide well's, the belt tray, a launcher's open back and muzzle, a shell into an
+    // open action, a round into a revolver's chamber. The angles and the travel are unchanged. (Until now: the values times 1.0.)
+    constexpr float kMagZoneGrow = 1.2f;
     // The well (2 Nov test: magazines engaged 4.9 cm off the axis and up to 39 deg from it, one already at its seat, so the slide started
     // beside the well or clicked at once): only from below, close to the axis, nearly upright.
-    constexpr float kEngageLat     = 0.05f;  // the magazine's top within this of the well's axis engages it ...
-    constexpr float kEngageBelow   = 0.08f;  // ... from this far below the start of its travel ...
+    constexpr float kEngageLat     = 0.05f * kMagZoneGrow;  // the magazine's top within this of the well's axis engages it ...
+    constexpr float kEngageBelow   = 0.08f * kMagZoneGrow;  // ... from this far below the start of its travel ...
     constexpr float kEngageTop     = 0.6f;   // ... up to this much of the travel in (not at the seat: it must slide in)
     constexpr float kEngageCos     = 0.64f;  // ... standing within 50 deg of the well's axis
-    constexpr float kLeaveLat      = 0.08f;  // pulled this far off the axis (or back below the engage range + 2 cm): out of the well
+    constexpr float kLeaveLat      = 0.08f * kMagZoneGrow;  // pulled this far off the axis (or back below the engage range + 2 cm): out of the well
     // reloadwidewell (author 5 Nov: the flamethrower's zone; 14:05:47: 3.5 s to find it, in at 2 cm off the axis, 31 deg): a big tank and a long rocket are taken further from the axis, further out, at any depth and turned up to 70 deg.
     // reloadwellzone (author 5 Nov): the values above raised (until now 3.5 cm, 6 cm, 40 %, 40 deg, 6 cm), an AK's further: a curved magazine, tilted in.
-    constexpr float kAkEngageLat = 0.075f, kAkEngageBelow = 0.11f, kAkEngageCos = 0.42f, kAkLeaveLat = 0.11f;
+    constexpr float kAkEngageLat = 0.075f * kMagZoneGrow, kAkEngageBelow = 0.11f * kMagZoneGrow, kAkEngageCos = 0.42f, kAkLeaveLat = 0.11f * kMagZoneGrow;
     // reloadbeltzone (author 5 Nov: M249; 16:34:21-50: let go 1, 4, 5 cm from the well and turned 136-153 deg by the game's hold, or 17 cm under it on its axis, never taken, or taken and pulled out):
     // a belt or box is laid in the open tray, not slid along a line: brought this near with the cover open, at any turn, it goes in.
-    constexpr float kBeltLoadZone = 0.20f;
-    constexpr float kDoorLoadZone = 0.25f;   // reloadratdoor: the hand this near the open back, a missile in it: it goes in
-    constexpr float kWideEngageLat = 0.08f, kWideEngageBelow = 0.12f, kWideEngageCos = 0.34f, kWideLeaveLat = 0.12f;
+    constexpr float kBeltLoadZone = 0.20f * kMagZoneGrow;
+    constexpr float kDoorLoadZone = 0.25f * kMagZoneGrow;   // reloadratdoor: the hand this near the open back, a missile in it: it goes in
+    constexpr float kWideEngageLat = 0.08f * kMagZoneGrow, kWideEngageBelow = 0.12f * kMagZoneGrow, kWideEngageCos = 0.34f, kWideLeaveLat = 0.12f * kMagZoneGrow;
     constexpr float kHandleZone    = 0.10f;  // the left grip pressed this close to the charging handle takes it (when it must be racked) ...
     constexpr float kHandleZoneIdle = 0.07f; // ... or this close otherwise (a pull that only moves it), not to take a support grip for it
     constexpr float kSlideZoneIdle  = 0.055f; // a pistol's: the support hand cups the gun just below its slide
@@ -482,6 +489,20 @@ namespace
     // coming back towards the weapon hand (the distance between the controllers), not along the right controller's axis: with two hands the
     // gun points from one hand to the other, and a turn of the right wrist moved the left hand along that axis without any stroke.
     constexpr float kPumpGripZone  = 0.10f;
+    // reloadpumpstroke (9 Nov, a tester on Beta 0.4.6: "The shotgun keeps glitching when you aim because it's stuck in pump mode", "I'm just
+    // slowly raising my hand up and down but keeps getting stuck. Couldn't aim forward"; his log, the M133 29259, 19:50:50-19:51:06): the
+    // left grip on the fore-end took the pump at once, and from then on every slow change of the distance between the hands counted as the
+    // pump coming back. The stroke's start followed the hands in only while they were within 3.1 cm of it, at 0.8 s, so an arm moving in
+    // slowly got past that and left the start behind: the pump read part way back for as long as the hands stayed there, and from 5 % back
+    // the aim was held on the weapon hand alone (12 such spells in 10 s, 1-94 frames each, the hands' line up to 75 deg off the gun). Two of
+    // those slow moves went to the stop: a live shell thrown out each time, and the second left the pump back, the gun open, when he let go.
+    // Now the stroke is only how much the hands closed within the last kPumpWinSecs (a pump is racked in 0.15-0.4 s; aiming moves the hands
+    // a few cm a second), so a slow move never adds up and nothing stays stuck once the hands stop. The aim is held on the weapon hand
+    // only past kPumpAimFrac of the stroke, and after a full pull the pump goes forward once the hands have opened kPumpFwdFrac of the way
+    // they actually closed (it needed them back within 1.6 cm of the farthest apart they had been).
+    constexpr float kPumpWinSecs   = 0.4f;
+    constexpr float kPumpAimFrac   = 0.6f;
+    constexpr float kPumpFwdFrac   = 0.6f;
 
     // manualreload43 (author 3 Nov 14:45): the
     // defaults are the author's saved settings of 3 Nov: reloadmanual, reloadweaponsounds and reloadgamehold on (were off).
@@ -492,6 +513,11 @@ namespace
     std::atomic<float> g_pouch[3]{ kPouchDefault[0], kPouchDefault[1], kPouchDefault[2] };
     std::atomic<float> g_pouch_zone{ kPouchZoneDefault };
     std::atomic<float> g_hand_off[3]{ kHandMagDefault[0], kHandMagDefault[1], kHandMagDefault[2] };
+    // reloadheldmag x y z (saved; author 16 Nov): the held magazine moved from wherever its hold puts it (the fist on its model, the game's hold, reloadhandmag), in
+    // the left hand's axes: right, up, back (m; x mirrored left-handed). Unlike reloadhandmag it applies with every hold, so it moves the
+    // magazine drawn in the hand and where its top is matched against the well.
+    constexpr float    kHeldMagZero[3]{ 0.0f, 0.0f, 0.0f };
+    std::atomic<float> g_held_adj[3]{ 0.0f, 0.0f, 0.0f };
     std::atomic<float> g_travel{ kTravelDefault }, g_rack_len{ kRackDefault };
     std::atomic<bool>  g_model_on{ true };
     std::atomic<bool>  g_model_shown{ false };
@@ -526,9 +552,15 @@ namespace
     // two-handed hold's left hand then follows its controller (FarCry5Stereo.cpp), which is on the pump.
     std::atomic<bool>  g_pump_now{ false };
     std::atomic<bool>  g_pump_grip{ true };    // reloadpumpgrip on|off (saved, default on): above, kPumpGripZone
+    std::atomic<bool>  g_pump_live{ true };    // reloadpumplive on|off (saved, default on; author 9 Nov 20:30): above (pumplive), pump_live
+    std::atomic<bool>  g_pump_stroke{ true };  // reloadpumpstroke on|off (saved, default on; author 9 Nov 20:30): above, kPumpWinSecs
     std::atomic<bool>  g_pump_aim{ false };    // reloadpumpgrip: a stroke under way: the gun keeps its two-handed direction on the weapon hand (FarCry5Stereo.cpp)
     float              g_pump_d0 = 0.0f;       // reloadpumpgrip: the controllers' distance with the pump forward (the stroke's start)
     clock::time_point  g_pump_d_t{};
+    std::deque<std::pair<clock::time_point, float>> g_pump_hist;   // reloadpumpstroke: the controllers' distance over the last kPumpWinSecs
+    float              g_pump_dmin  = 0.0f;    // reloadpumpstroke: the controllers' distance at the deepest point of the pull
+    float              g_pump_peak  = 0.0f;    // reloadpumpstroke: how far the pull under way has gone (of the stroke), for the short-pull line
+    int                g_pump_short_n = 0;     // reloadpumpstroke: short pulls said since the pump was taken
     // manualreload38 (author 3 Nov 11:54): a magazine, shell or round from the hip in the left hand (the pad poll's g_hand_mag, for the
     // render thread's two-handed hold).
     std::atomic<bool>  g_mag_hand_now{ false };
@@ -541,7 +573,7 @@ namespace
     // brings the left controller against the right hand, just behind the open cylinder. So a round is taken by its chamber within 5 cm of
     // its axis and 55 deg, anywhere along its travel, and then drops home by itself in 0.15 s, as a round let fall into an open cylinder.
     std::atomic<bool>  g_round_slide{ true };
-    constexpr float    kRoundEngageLat = 0.05f, kRoundEngageCos = 0.57f, kRoundSlideMs = 150.0f;
+    constexpr float    kRoundEngageLat = 0.05f * kMagZoneGrow, kRoundEngageCos = 0.57f, kRoundSlideMs = 150.0f;
     bool               g_seat_hold  = false;   // the pad poll: the grip held since its shell, round or magazine went in
     bool               g_hand_was   = false;   // the pad poll: g_hand_mag at the last poll
     // bheal on|off (manualreload38; saved, default on; author 3 Nov 11:54): right B never taps the pad's Y (the game's previous weapon).
@@ -599,7 +631,7 @@ namespace
     std::atomic<bool>  g_btn_now{ false };                         // button_reload(), for the render thread
     std::atomic<bool>  g_rec{ false }, g_game_hand{ false };       // reloadrec, reloadgamehand (reloadmatch; tests, not saved)
     std::atomic<bool>  g_hand_game{ true };                        // reloadhandgame (reloadmatch; saved)
-    // reloadnogame (author 4 Nov: the drop played the whole reload's sounds, the revolver's barrel
+    // reloadnogame (author 4 Nov, the revolver's "barrel"
     // out of nowhere, the AR-C's rounds at the well; the switch retired 9 Nov, always on: the ammo ledger's loads need it): where the manual reload tapped the game's reload to fill its clip
     // (hidden, but its sounds, its hands and some of its parts still showed), the clip is filled by the game's own call with no reload. The buttons that learn from the game's reload
     // ("Something wrong") still tap it; a fill that fails falls back to the game's reload by itself (clip_fill_failed / clip_fill_short).
@@ -619,6 +651,14 @@ namespace
     std::atomic<bool>    g_guard_all{ false };
     std::atomic<bool>    g_clip_full_now{ false };   // a magazine gun with its magazine in, racked, its clip at the largest seen
     std::atomic<int64_t> g_step_ms{ -1000000 };   // the last pad poll a manual step was under way (steady clock, ms)
+    // reloadbuttonprompt on|off (saved, default on; author 16 Nov 14:39). His 15:33-15:37 log: each hold of left Y to search a body with the clip full was held back 500 ms, sent 200 ms,
+    // let go again until 1.2 s (the tap cut that keeps a long hold from changing weapon), then sent again: the game's hold ring started, broke,
+    // started over, and he let go and pressed again (15:33:55-15:34:00, three presses; 15:35:06-15:35:09, two). While the game draws a prompt
+    // on its interact button (the pad's X or the E key; FarCry5PadGlyph interact_prompt_within), left Y goes to the game as held, from the
+    // press on (no clip-full hold back) and with no cut: it searches, picks up or opens as on a pad. A press that starts with the left hand at
+    // work in a manual step is still held back reloadbuttonguardms, then not cut. Off: as before.
+    std::atomic<bool>    g_btn_prompt{ true };
+    constexpr uint64_t   kPromptFreshMs = 300;   // the HUD's icons are read every 4th frame: a prompt drawn this recently is still up
     constexpr int64_t    kGuardTailMs = 500;
     constexpr float    kBtnMaxMs   = 8000.0f;   // a button reload followed at most this long (a pump's 8 shells, one at a time)
     constexpr float    kBtnQuietMs = 1500.0f;   // ... and over once its clip has not grown for this long
@@ -698,6 +738,11 @@ namespace
     bool               g_hb_throw = false;      // this press is (or became) the throw
     bool               g_hb_y     = false;      // this press is the pad's Y now (or its minimum hold still runs)
     clock::time_point  g_hb_t0{}, g_hb_y0{};
+    // vehbreload on|off (saved, default on; author 16 Nov 14:39): with bheal on, a quick right B (let go within reloadtap ms: not a
+    // heal, not the throw) is noted here; in a vehicle seat with no manual reload (driving, or a passenger / gun seat with ridegun) and a weapon
+    // in the hands, ModConfig.cpp taps the game's reload (pad X) for it. Off: a quick right B does nothing in a vehicle, as before.
+    std::atomic<bool>  g_veh_b_reload{ true };
+    std::atomic<bool>  g_hb_quick{ false };     // a quick right B was let go since ModConfig last asked (b_quick_taken)
     std::atomic<float> g_drop_floor{ 1.6f };
     std::atomic<uint32_t> g_ejects{ 0 };   // rounds ejected by a pull of the handle (FarCry5ReloadMag.cpp draws each)
     std::atomic<bool>  g_pump_shot{ true };   // reloadpumpshot: a pump shotgun's pump must be worked after each shot
@@ -733,7 +778,7 @@ namespace
     // home by itself (kRatAutoSecs; let go then, it still goes home). Pulled back (kRatPullOut) or off the line (kRatLeaveLat): out again.
     // Off: as before (brought near the back or the seat, it is in at once).
     std::atomic<bool>  g_rat_slide{ true };
-    constexpr float    kRatEntryZone = 0.22f, kRatPush = 0.15f, kRatPullOut = 0.12f, kRatLeaveLat = 0.20f, kRatAutoSecs = 0.30f, kRatEngageCos = 0.17f;
+    constexpr float    kRatEntryZone = 0.22f * kMagZoneGrow, kRatPush = 0.15f, kRatPullOut = 0.12f, kRatLeaveLat = 0.20f * kMagZoneGrow, kRatAutoSecs = 0.30f, kRatEngageCos = 0.17f;
     bool               g_rat_on = false, g_rat_auto = false;   // engaged by reloadratslide; sliding home by itself
     glm::vec3          g_rat_h0{ 0.0f };
     float              g_rat_i0 = 0.0f, g_rat_auto_i0 = 0.0f;
@@ -757,6 +802,20 @@ namespace
     // is pinned where the game's sat. Measured once on the model (ReloadMag): the barrel's back ring gives the bore's centre and the breech
     // face; the grenade is moved so its middle is on the bore and its base at the breech face. Off: where the game's sits (at the next pick-up).
     std::atomic<bool>  g_grenade_seat{ true };
+    // reloadheldfollow on|off (saved, default on; author 15 Nov 22:20, build 0E8620DD): a part the mod places on the gun (the
+    // launcher's round seated or sliding in, a magazine going into the well) in a draw that comes before the gun's own main draw took the body
+    // of the last main draw as it was, a frame or an eye's pass old, so it trailed the gun by the walk's step. On: that body carried into the
+    // pass as the drawn gun is held (on the weapon controller); ReloadMag. Off: as before.
+    std::atomic<bool>  g_held_follow{ true };
+    // reloadballfollow on|off (not saved, default on; author 16 Nov 10:37, build DE0001F3, the M133 modern long 29841; his picture: the yellow ball out past the muzzle while a shell was in the left hand). Since
+    // reloadzonesfollow (8 Nov) the pad poll measures the gun-attached points (well, handle, highlight boxes) and catches the shell on the gun
+    // as DRAWN (Gesture.cpp ri.gun_pos / gun_rot: the gunstock calibration's one-hand turn, two hands, stockeye), but GestureZones still drew
+    // the well's yellow ball, the shell sliding in, the handle's blue ball and the highlight boxes on the raw weapon controller. His M133 is
+    // drawn 31-34 deg and 7-12 cm off its controller ([Handling] 10:35-10:37), so the ball sat that far above and ahead of the loading port,
+    // while the shells caught 10-12 cm off it (the edge of the 12 cm zone). A magazine gun shows its well by the glow on the model (drawn with
+    // the game's gun), so the ball showed it on the pump shotguns, lever actions, revolvers, double barrels and launchers. On: the same turn
+    // and offset (Stereo.h draw_turn) put on that frame's controller pose. Off: on the raw controller, as before.
+    std::atomic<bool>  g_ball_follow{ true };
     // reloadsamegun on|off (saved, default on; author 6 Nov 12:40): the arcade map's RAT4 is seen as
     // 80077 or 69646 (weaponidsplit: its second largest piece changes) and for a frame or so as 28497. Each change reset the reload: after a
     // shot, the clip reloadrocketfill had filled read as a loaded launcher (13:30:30.9 "1 live round(s)"), and the pouch then refused a
@@ -1409,6 +1468,16 @@ namespace
     bool              g_pouch_in = false;     // the free hand in the pouch zone (entry tick)
     int               g_last_clip = -1;
     std::map<uint32_t, int> g_clip_max{ { kArc, 30 } };   // the largest clip seen per weapon (the AR-C's data: 30)
+    // The gun in hand's clip size (13 Nov, the author's 1911 of 8 after a 1911 of 10 under the same reload sig 24417: g_clip_max is per sig, the
+    // largest ever seen, so an 8-round clip never read full): the game's own size of the gun in hand (its weapon vtable +0x48, lua::player_ammo),
+    // else the largest clip seen for the sig.
+    int gun_cap(uint32_t sig)
+    {
+        int c = -1, r = -1, cap = -1;
+        if (fc5::lua::player_ammo(c, r, &cap) && cap > 0) return cap;
+        const auto it = g_clip_max.find(sig);
+        return it != g_clip_max.end() ? it->second : -1;
+    }
     clock::time_point g_drop_t{};
     clock::time_point g_take_t{};
     // A pump shotgun (kTube): the shells loaded by hand in its tube (-1: not read from the game's clip yet) and its chamber (0 empty, 1 a live
@@ -1471,7 +1540,7 @@ namespace
     struct MagLoss { int lost{ 0 }, real{ -1 }; };
     std::map<uint32_t, MagLoss> g_mag_loss;
     glm::vec3         g_act_base{ 0.0f };   // the lever open: the right hand's lowest from the left, since the left took the fore-end
-    constexpr float   kActLoadZone = 0.10f;
+    constexpr float   kActLoadZone = 0.10f * kMagZoneGrow;   // (reloadwellzone2)
     std::atomic<bool> g_shot_mute{ true };   // reloadshotmute on|off (saved, default on): the game's own pump, lever or bolt sounds after a shot not played (the hand's stroke plays them)
     bool              g_lever_hand = false, g_lever_down = false, g_lever_base_ok = false;   // following the hand; past the shell's throw; the rest below has been read
     float             g_lever_f = 0.0f;
@@ -1660,7 +1729,7 @@ bool relearn_armed(uint32_t sig, int item) { return sig != 0 && sig == g_relearn
 bool reload_button_pass(bool down)
 {
     // The game's polls and the virtual pad's updates both come here (ModConfig.cpp): atomics, and each press decided once.
-    static std::atomic<bool>    was{ false }, pass{ false }, held{ false }, said{ false }, tap{ false };
+    static std::atomic<bool>    was{ false }, pass{ false }, held{ false }, said{ false }, tap{ false }, held_step{ false }, prompt{ false };
     static std::atomic<int64_t> t0{ 0 }, sent_t{ 0 };
     const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count();
     if (now < g_btn_test_until.load()) down = true;   // reloadbuttontest (test): left Y held, through the guard as a real press
@@ -1678,23 +1747,40 @@ bool reload_button_pass(bool down)
     if (!down) {
         if (was.exchange(false) && held.load() && !pass.load() && g_log.load())
             spdlog::info("[Reload] reloadbuttonguard: left Y let go after {} ms: not sent to the game", now - t0.load());
-        pass = held = tap = false;
+        if (prompt.load() && g_log.load())
+            spdlog::info("[Reload] reloadbuttonprompt: left Y let go after {} ms (held through to the game's prompt)", now - t0.load());
+        pass = held = tap = held_step = prompt = false;
         note_reload_button(false);
         return false;
     }
+    // reloadbuttonprompt: the game shows a prompt on its interact button now.
+    const bool prompt_up = g_btn_prompt.load() && fc5::padglyph::interact_prompt_within(kPromptFreshMs);
     if (!was.exchange(true)) {
         t0         = now;
         said       = false;
         const bool in_step = now - g_step_ms.load() <= kGuardTailMs;
         const bool full    = g_clip_full_now.load();
-        const bool step    = g_guard_on.load() && g_on.load() && g_in_hand.load() && !g_btn_now.load() && (in_step || g_guard_all.load() || full);
+        const bool step    = g_guard_on.load() && g_on.load() && g_in_hand.load() && !g_btn_now.load() && (in_step || (!prompt_up && (g_guard_all.load() || full)));
         held       = step;
+        held_step  = step && in_step;
         pass       = !step;
-        tap        = g_on.load() && g_in_hand.load();
+        prompt     = prompt_up;
+        tap        = g_on.load() && g_in_hand.load() && !prompt_up;
         sent_t     = now;
         if (step && g_log.load())
             spdlog::info("[Reload] reloadbuttonguard: left Y pressed {}: held back (sent to the game once held {} ms)",
                          in_step ? "with the left hand at work" : full ? "with the clip full" : "with a gun of the manual reload in hand (reloadbuttonguardall)", g_guard_ms.load());
+        if (prompt_up && g_log.load())
+            spdlog::info("[Reload] reloadbuttonprompt: left Y pressed with the game's interact prompt up{}: sent to the game as held, no cut", in_step ? " (left hand at work: after the guard)" : "");
+    } else if (prompt_up && !prompt.exchange(true)) {
+        // The prompt came up during the press (the press started a moment before the body was in view): from now on the game gets it as held.
+        tap = false;
+        if (!pass.load() && !held_step.load()) {
+            pass   = true;
+            sent_t = now;
+        }
+        if (g_log.load())
+            spdlog::info("[Reload] reloadbuttonprompt: the game's interact prompt came up {} ms into the press: left Y sent to the game as held, no cut", now - t0.load());
     }
     if (!pass.load() && now - t0.load() >= g_guard_ms.load()) {
         pass = true;
@@ -1817,8 +1903,9 @@ bool b_heal_y(bool b_down)
         g_hb_t0    = now;
         g_hb_throw = false;
         if (!y_runs) g_hb_y = false;   // a new press during the minimum hold carries it on (no tap in between)
-    } else if (!b_down && g_hb_down && !g_hb_y && !g_hb_throw && g_log.load()) {
-        spdlog::info("[Reload] bheal: quick right B ({:.0f} ms): no weapon switch", ms_since(g_hb_t0, now));
+    } else if (!b_down && g_hb_down && !g_hb_y && !g_hb_throw) {
+        g_hb_quick = true;   // vehbreload: the game's reload in a vehicle (ModConfig.cpp)
+        if (g_log.load()) spdlog::info("[Reload] bheal: quick right B ({:.0f} ms): no weapon switch", ms_since(g_hb_t0, now));
     }
     g_hb_down = b_down;
     if (b_down && !g_hb_throw && !g_hb_y && ms_since(g_hb_t0, now) >= float(g_tap_ms.load())) {
@@ -1835,6 +1922,8 @@ void b_heal_throw()
     std::lock_guard _{ g_heal_mtx };
     g_hb_throw = true;
 }
+bool b_quick_taken() { return g_hb_quick.exchange(false); }
+bool veh_b_reload() { return g_veh_b_reload.load(); }
 bool log_on() { return g_log.load(); }
 float travel_m() { return g_travel.load(); }
 float pouch_zone() { return g_pouch_zone.load(); }
@@ -2016,7 +2105,9 @@ void set_round_lead(uint32_t sig, float m)
 }
 uint32_t reload_sig(uint32_t sig) { return g_same_gun.load() && sig == 69646u ? 80077u : sig; }
 bool grenade_seat() { return g_grenade_seat.load(); }
+bool held_follow() { return g_held_follow.load(); }
 bool shell_hip() { return g_shell_hip.load(); }
+bool ball_follow() { return g_ball_follow.load(); }
 void set_muzzle_depth(uint32_t sig, float m)
 {
     g_muzzle_m   = m;
@@ -2312,8 +2403,8 @@ void update(const In& in_game, Out& out)
     // ... and with the game's clip full, nothing can fill it: at a drop or a reload press they come off the reserve at once.
     auto settle_loss = [&]() {
         const auto it = g_mag_loss.find(in.sig);
-        const auto cm = g_clip_max.find(in.sig);
-        if (!in.ammo_ok || it == g_mag_loss.end() || it->second.lost <= 0 || cm == g_clip_max.end() || it->second.real < cm->second) return;
+        const int  cm = gun_cap(in.sig);
+        if (!in.ammo_ok || it == g_mag_loss.end() || it->second.lost <= 0 || cm <= 0 || it->second.real < cm) return;
         const int n = std::min(it->second.lost, std::max(in.reserve, 0));
         if (n > 0) fc5::lua::reserve_take_request(n);
         if (g_log.load()) spdlog::info("[Reload] reloadrackloss: the game's clip is full ({}): the {} round(s) the rack threw out come off the reserve {}", it->second.real, it->second.lost, in.reserve);
@@ -2488,6 +2579,13 @@ void update(const In& in_game, Out& out)
         const uint64_t wobj = fc5::lua::weapon_object();
         led                 = &g_ledger_st[wobj ? uint32_t(wobj ^ (wobj >> 32)) | 1u : in.sig];
         const int G         = in.clip;
+        // The gun in hand's own clip size (the game's: its weapon vtable +0x48, lua::player_ammo), not g_clip_max: that is per reload sig, the
+        // largest clip ever seen, and pistols share one (author 13 Nov, the 1911 of 8 after a pistol of 10 under sig 24417: the load with the
+        // clip already full of surplus never matched, every reload after a top-up left one real round). g_clip_max only if the game gave none.
+        const int cap_now = gun_cap(in.sig);
+        // A top-up lands within a few updates of its request; a growth seen long after it (the gun put away and drawn again, a pick-up, the
+        // game's own reload) is a load, not a top-up (13 Nov 15:16:21: a top-up asked as the hand switched weapon landed on another gun).
+        if (led->topup && ms_since(led->t, now) > 1500.0f && G > led->g_last) led->topup = false;
         if (led->g_last >= 0 && G > led->g_last) {
             if (led->topup) {
                 led->surplus += G - led->g_last;
@@ -2504,7 +2602,7 @@ void update(const In& in_game, Out& out)
             if (!led->topup) led->fired = 0;   // a load: the count starts again
             led->topup  = false;
             led->absorb = false;
-        } else if (led->absorb && led_mag && G > 0 && g_clip_max.count(in.sig) && G >= g_clip_max[in.sig]) {
+        } else if (led->absorb && led_mag && G > 0 && cap_now > 0 && G >= cap_now) {
             // A load asked with the game's clip already full (of surplus): the reserve gives what the magazine was missing.
             const int n = std::min(led->surplus, std::max(in.reserve, 0));
             if (n > 0) fc5::lua::reserve_take_request(n);
@@ -2672,8 +2770,7 @@ void update(const In& in_game, Out& out)
     // A pump shotgun: a shell to load while the game holds more than is loaded by hand (its clip, filled by its own reload) or has a reserve,
     // and while the tube has room (the largest clip seen).
     const int  by_hand   = std::max(0, g_tube) + (g_chamber == 1 ? 1 : 0);
-    const auto cmax_it   = g_clip_max.find(in.sig);
-    const int  tube_cap  = std::max(cmax_it != g_clip_max.end() ? cmax_it->second : 0, bt && bt->clip > 0 ? bt->clip : 8);
+    const int  tube_cap  = std::max(gun_cap(in.sig), bt && bt->clip > 0 ? bt->clip : 8);
     const bool tube_full = tube && by_hand >= tube_cap;
     // reloadkeepone (manualreload45): a shotgun or revolver keeps one round more in the game's clip than it holds by hand.
     // (8 Nov, author 20:44: the revolver fires all 6 with no game reload, the Sledge played the game's at empty: a break action of two barrels
@@ -2708,8 +2805,8 @@ void update(const In& in_game, Out& out)
         g_btn_t = g_btn_grow_t = now;
         g_btn_clip     = in.ammo_ok ? in.clip : -1;
         // (A press with the magazine out: reloadnogame filled the clip at the drop, so the game has no reload to play: the gun is ready at once, not 3 s later. Run button3.)
-        const auto cm  = g_clip_max.find(in.sig);
-        g_btn_nothing  = in.ammo_ok && cm != g_clip_max.end() && in.clip >= cm->second;
+        const int  cm  = gun_cap(in.sig);
+        g_btn_nothing  = in.ammo_ok && cm > 0 && in.clip >= cm;
     }
     if (g_btn_reload && (g_hand_mag || g_engaged || g_racking || !g_mag_in_gun)) {
         g_btn_reload = false;   // the hands took over again (a magazine dropped or taken, a handle racked)
@@ -2851,8 +2948,8 @@ void update(const In& in_game, Out& out)
             buzz(out, kGun, 0.35f, 0.04f);
             sound(kSndMagOut);
             settle_loss();
-            const auto it   = g_clip_max.find(in.sig);
-            const bool full = in.ammo_ok && it != g_clip_max.end() && in.clip >= it->second && in.clip > 0;
+            const int  capd = gun_cap(in.sig);
+            const bool full = in.ammo_ok && capd > 0 && in.clip >= capd && in.clip > 0;
             if (full || owed) {
                 if (g_log.load()) spdlog::info("[Reload] magazine dropped (weapon {}, clip {} {}, reserve {}): no game reload needed", in.sig, in.clip,
                                                owed ? "loaded by the game's own reload after running dry" : "full", in.reserve);
@@ -2888,8 +2985,8 @@ void update(const In& in_game, Out& out)
         if (g_relearn_items.load() & (1u << kItGrab)) relearn_say(fmt::format("weapon {}: the game's reload from empty done, but its hand on the handle was not seen (see the log)", in.sig));
     }
     if (relearn_wait) {
-        const auto cm   = g_clip_max.find(in.sig);
-        const bool full = in.ammo_ok && cm != g_clip_max.end() && in.clip >= cm->second;
+        const int  cm   = gun_cap(in.sig);
+        const bool full = in.ammo_ok && cm > 0 && in.clip >= cm;
         if (tube || rev) {
             relearn_wait = false;
             relearn_say("only a magazine gun can be learnt again in the game for now (a shotgun's or revolver's reload is learnt in the simulator runs)");
@@ -2918,6 +3015,9 @@ void update(const In& in_game, Out& out)
     }
 
     const bool      track = in.gun_ok && in.hand_ok;
+    // pumplive (author 9 Nov 20:22, after the tester's M133 stuck in pump mode): with a live shell in the chamber the pump is locked, as the action of a real pump gun is until it fires. The left grip
+    // on the fore-end is then only the two-handed hold; the pump is taken again once the shell is fired (or the chamber is empty).
+    const bool      pump_live = g_pump_live.load() && tube && !lever && g_chamber == 1 && !g_act_open;   // reloadpumplive
     const glm::vec3 well  = in.gun_pos + in.gun_rot * mirror_x(g.well, m);
     glm::vec3       axis  = in.gun_rot * mirror_x(g.axis, m);
     axis                  = glm::length(axis) > 1e-4f ? glm::normalize(axis) : glm::vec3{ 0.0f, 1.0f, 0.0f };
@@ -2991,6 +3091,7 @@ void update(const In& in_game, Out& out)
                                       } else if (g_game_hold.load() || learnt_hold) {
                                           hold_mag(in.sig, t);   // reloadgamehold: where the game's hand holds it
                                       }
+                                      t += glm::vec3{ g_held_adj[0].load(), g_held_adj[1].load(), g_held_adj[2].load() };   // reloadheldmag
                                       return glm::vec3{ (m ? -1.0f : 1.0f) * t.x, t.y, t.z };
                                   }();
     if (g_geom_log) {
@@ -3098,7 +3199,7 @@ void update(const In& in_game, Out& out)
             buzz(out, kGun, 0.5f, 0.05f);
             if (g_log.load()) spdlog::info("[Reload] left grip on the cover ({:.2f} m from the tray): the feed cover closed (reloadbeltgrip): rack the charging handle", glm::length(in.hand_pos - well));
           }
-        } else if (!rev && !lever && !norack && !g_hand_mag && track &&
+        } else if (!rev && !lever && !norack && !g_hand_mag && track && !pump_live &&
                    (glm::length(in.hand_pos - (g_act_open ? handle + back * rack_len : handle)) < (g_need_rack || g_bolt_owed || g_act_open ? zone_rack : zone_idle) ||
                     (boltt && g_bolt_open && glm::length(in.hand_pos - (handle + back * (g_rack * rack_len))) < zone_rack) ||   // reloadboltturn: where it was left
                     ((g_need_rack || g_bolt_owed) && rack_line_d < (ms16_h ? kMs16LineZone : kRackLineZone)) ||   // reloadrackzone: anywhere on the glowing part
@@ -3122,8 +3223,12 @@ void update(const In& in_game, Out& out)
                 g_rack_r0   = glm::transpose(in.gun_rot) * (in.hand_pos - back * rack_len - in.gun_pos);
             }
             if (tube) {   // reloadpumpgrip: the stroke from here (left back: already a full stroke)
-                g_pump_d0  = glm::length(in.hand_pos - in.gun_pos) + g_rack * rack_len;
-                g_pump_d_t = now;
+                g_pump_d0      = glm::length(in.hand_pos - in.gun_pos) + g_rack * rack_len;
+                g_pump_d_t     = now;
+                g_pump_dmin    = g_pump_d0 - g_rack * rack_len;   // reloadpumpstroke
+                g_pump_hist.clear();
+                g_pump_peak    = 0.0f;
+                g_pump_short_n = 0;
             }
             if (boltt) {
                 // reloadboltturn: taken again where it was left, it goes on from there (the grab point put where the hand would have taken it locked).
@@ -3147,9 +3252,9 @@ void update(const In& in_game, Out& out)
                                           : !g_mag_fresh ? " (the empty magazine still in: drop it first)" : "");
         } else if (tube && !lever && !g_hand_mag && !g_racking && track && g_log.load()) {
             // reloadpumpgrip: a press with a pump gun that took nothing of the reload's (the two-handed hold, a zone): where it was.
-            spdlog::info("[Reload] left grip pressed {:.2f} m from the pump's centre, {} from its parts' line (zones {:.2f} / {:.2f}{}): not the pump",
+            spdlog::info("[Reload] left grip pressed {:.2f} m from the pump's centre, {} from its parts' line (zones {:.2f} / {:.2f}{}): not the pump{}",
                          glm::length(in.hand_pos - handle), rack_line_d < 1e8f ? fmt::format("{:.2f} m", rack_line_d) : std::string{ "-" }, kPumpZone, kPumpGripZone,
-                         g_pump_grip.load() ? "" : ", reloadpumpgrip off");
+                         g_pump_grip.load() ? "" : ", reloadpumpgrip off", pump_live ? " (pumplive: a live shell chambered, the pump locked until it is fired)" : "");
         }
     }
     // reloadpumpgrip: the fore-end already held (the two-handed hold kept from before the shot): the pump is the hand's without a new press
@@ -3163,6 +3268,10 @@ void update(const In& in_game, Out& out)
         g_rack_r0   = glm::transpose(in.gun_rot) * (in.hand_pos - in.gun_pos);
         g_pump_d0   = glm::length(in.hand_pos - in.gun_pos);
         g_pump_d_t  = now;
+        g_pump_dmin = g_pump_d0;   // reloadpumpstroke
+        g_pump_hist.clear();
+        g_pump_peak    = 0.0f;
+        g_pump_short_n = 0;
         buzz(out, kHand, 0.35f, 0.03f);
         if (g_log.load())
             spdlog::info("[Reload] reloadpumpgrip: pump taken with the grip already held ({:.2f} m from its parts' line; {} shell(s) in the tube, the chamber {})",
@@ -3654,19 +3763,49 @@ void update(const In& in_game, Out& out)
     if (g_racking && track) {
         const glm::vec3 r0 = in.gun_pos + in.gun_rot * g_rack_r0;
         if (tube && !lever && g_pump_grip.load()) {
-            // reloadpumpgrip: the pump's stroke is the left hand coming back towards the weapon hand. With the pump forward the start
-            // follows the hand out at once and in slowly (0.8 s), so arms easing while aiming do not count as a stroke (a stroke takes 0.2-0.4 s).
-            const float d  = glm::length(in.hand_pos - in.gun_pos);
-            const float dt = std::clamp(ms_since(g_pump_d_t, now) / 1000.0f, 0.0f, 0.1f);
-            g_pump_d_t     = now;
-            if (d > g_pump_d0) g_pump_d0 = d;
-            else if (!g_rack_done && g_pump_d0 - d < 0.4f * rack_len) g_pump_d0 += (d - g_pump_d0) * std::min(1.0f, dt / 0.8f);
-            g_rack = std::clamp((g_pump_d0 - d) / rack_len, 0.0f, 1.0f);
+            // reloadpumpgrip: the pump's stroke is the left hand coming back towards the weapon hand.
+            // reloadpumpstroke (above, kPumpWinSecs): with the pump forward, its start is the farthest apart the hands have been in the last
+            // kPumpWinSecs, so arms moving in slowly while aiming never add up to a stroke and nothing is left part way back once they stop.
+            // After a full pull, forward is measured from the deepest point the hands reached.
+            const float d = glm::length(in.hand_pos - in.gun_pos);
+            if (!g_pump_stroke.load()) {
+                // reloadpumpstroke off: as before 9 Nov (the start follows the hands out at once and in slowly, 0.8 s, within 40 % of the stroke).
+                const float dt = std::clamp(ms_since(g_pump_d_t, now) / 1000.0f, 0.0f, 0.1f);
+                g_pump_d_t     = now;
+                if (d > g_pump_d0) g_pump_d0 = d;
+                else if (!g_rack_done && g_pump_d0 - d < 0.4f * rack_len) g_pump_d0 += (d - g_pump_d0) * std::min(1.0f, dt / 0.8f);
+                g_rack = std::clamp((g_pump_d0 - d) / rack_len, 0.0f, 1.0f);
+            } else if (!g_rack_done) {
+                g_pump_d_t = now;
+                g_pump_hist.emplace_back(now, d);
+                while (!g_pump_hist.empty() && ms_since(g_pump_hist.front().first, now) > kPumpWinSecs * 1000.0f) g_pump_hist.pop_front();
+                float ref = d;
+                for (const auto& h : g_pump_hist) ref = std::max(ref, h.second);
+                g_pump_d0   = ref;
+                g_pump_dmin = d;
+                g_rack      = std::clamp((ref - d) / rack_len, 0.0f, 1.0f);
+                // A quick pull that turned back before the stop: said (a few per take), with how far the hands came, for the next log.
+                g_pump_peak = std::max(g_pump_peak, g_rack);
+                if (g_rack < 0.05f) {
+                    if (g_pump_peak >= kPumpAimFrac && g_pump_peak < 0.999f && g_pump_short_n < 8 && g_log.load()) {
+                        g_pump_short_n++;
+                        spdlog::info("[Reload] reloadpumpstroke: the pump pulled {:.1f} cm of the {:.1f} cm to its stop and pushed back: nothing ejected", g_pump_peak * rack_len * 100.0f,
+                                     rack_len * 100.0f);
+                    }
+                    g_pump_peak = 0.0f;
+                }
+            } else {
+                g_pump_d_t        = now;
+                g_pump_dmin       = std::min(g_pump_dmin, d);
+                const float depth = std::max(g_pump_d0 - g_pump_dmin, rack_len);
+                g_rack            = std::clamp(1.0f - (1.0f - kPumpFwd) * (d - g_pump_dmin) / (kPumpFwdFrac * depth), 0.0f, 1.0f);   // kPumpFwd at kPumpFwdFrac back out
+            }
         } else {
             g_rack = std::clamp(glm::dot(in.hand_pos - r0, back) / rack_len, 0.0f, 1.0f);
         }
         const int cm       = int(std::floor(g_rack * rack_len * 100.0f));
-        if (cm > g_rack_cm && !g_rack_done) buzz(out, kHand, 0.14f, 0.012f);
+        const bool pump_slow = tube && !lever && g_pump_grip.load() && g_pump_stroke.load() && g_rack < 0.3f;   // reloadpumpstroke: no ticks for the hands' small moves while aiming
+        if (cm > g_rack_cm && !g_rack_done && !pump_slow) buzz(out, kHand, 0.14f, 0.012f);
         g_rack_cm = cm;
         if (tube && g_rack >= 0.999f && !g_rack_done) {
             // The pump to its stop: the shell in the chamber (fired or not) leaves by the ejection port.
@@ -3684,6 +3823,15 @@ void update(const In& in_game, Out& out)
             g_chamber = 0;
         } else if (tube && g_rack_done && g_rack < kPumpFwd) {
             pump_forward();
+            if (!lever && g_pump_grip.load()) {   // reloadpumpstroke: the next pull measured from where the pump went forward
+                g_pump_hist.clear();
+                g_pump_peak = 0.0f;
+            }
+            if (!lever && g_chamber == 1 && g_pump_live.load()) {   // pumplive (reloadpumplive): a shell chambered: the pump locked, the hand only holds the gun until it fires
+                g_racking = false;
+                g_rack    = 0.0f;
+                if (g_log.load()) spdlog::info("[Reload] pumplive: a live shell chambered: the pump locked until it is fired (the left hand holds the fore-end)");
+            }
         } else if (!tube && g_rack_done && g_rack < 0.35f) {
             // reloadrackagain (author 5 Nov): pushed forward, the grip still held: ready for the next pull.
             g_rack_done = false;
@@ -3733,7 +3881,7 @@ void update(const In& in_game, Out& out)
     // reloadnogame: a fill asked for and the game's calls failed, or the reserve is too low for them: its reload after all, so the gun is never left stuck.
     static bool filling = false;
     const bool fill_short = filling && fc5::lua::clip_fill_short();
-    if (fill_short && in.ammo_ok && g_clip_max.count(in.sig) && in.clip >= g_clip_max[in.sig]) g_game_pending = false;   // the clip full: nothing for the game's reload to do either
+    if (fill_short && in.ammo_ok && gun_cap(in.sig) > 0 && in.clip >= gun_cap(in.sig)) g_game_pending = false;   // the clip full: nothing for the game's reload to do either
     if (filling && (!g_game_pending || fill_short || fc5::lua::clip_fill_failed())) {
         if (g_game_pending) {
             g_tap_real     = true;
@@ -3854,14 +4002,14 @@ void update(const In& in_game, Out& out)
     g_busy_now      = busy;
     g_pending_now   = g_game_pending;
     g_pump_now      = tube && !lever && g_racking;
-    g_pump_aim      = g_pump_grip.load() && tube && !lever && g_racking && (g_rack > 0.05f || g_rack_done);
+    g_pump_aim      = g_pump_grip.load() && tube && !lever && g_racking && (g_rack > (g_pump_stroke.load() ? kPumpAimFrac : 0.05f) || g_rack_done);   // (reloadpumpstroke off: 5 %)
     g_mag_hand_now  = g_hand_mag || g_seat_hold;
     // reloadcasinghide: the fired shell leaves by the hand (the pump, the lever, the bolt), so the game's own casing is not shown.
     g_casing_now    = g_casing_on.load() && ((tube && !bt->semi && g_pump_shot.load()) || boltg);
     // reloadbuttonguard: the left hand at work (not the game's reload from its button; no longer a magazine merely out or a cylinder merely open, author 5 Nov: a press reloads then).
     {
-        const auto cm   = g_clip_max.find(in.sig);
-        g_clip_full_now = !tube && !rev && in.ammo_ok && g_mag_in_gun && !g_need_rack && cm != g_clip_max.end() && in.clip >= cm->second;
+        const int  cm   = gun_cap(in.sig);
+        g_clip_full_now = !tube && !rev && in.ammo_ok && g_mag_in_gun && !g_need_rack && cm > 0 && in.clip >= cm;
     }
     if (!g_btn_reload && (g_hand_mag || g_engaged || g_racking || g_seat_hold || g_lever_cyc || g_lever_hand))
         g_step_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
@@ -3901,7 +4049,8 @@ void update(const In& in_game, Out& out)
     v.hand_mag_off = hoff;
     v.hand_mag_turn = hg_mag && !uses_learnt(in.sig, kItHold) ? hg.mag_turn : glm::mat3{ 1.0f };
     v.hand_mag_game = hg_mag && !uses_learnt(in.sig, kItHold);
-    v.hand_mag_c    = hg.mag_c;
+    // reloadheldmag: the game's hold (hand_mag_game) draws the magazine by its centre, moved as its top is above (hg_on: never left-handed).
+    v.hand_mag_c    = hg.mag_c + (v.hand_mag_game ? glm::vec3{ g_held_adj[0].load(), g_held_adj[1].load(), g_held_adj[2].load() } : glm::vec3{ 0.0f });
     v.slide_lock    = tube && !lever && g_act_open ? rack_len : hg_on && g_need_rack && !tube && !rev ? hg.slide_lock : 0.0f;
     v.tube         = tube;
     if (g_lever_cyc) {
@@ -4093,6 +4242,14 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
     }
     if (cmd == "reloadpouchzone") { g_pouch_zone = std::clamp(arg.empty() ? kPouchZoneDefault : fv, 0.05f, 0.35f); persist = true; return true; }
     if (cmd == "reloadhandmag") { three(g_hand_off, kHandMagDefault, 0.4f); return true; }
+    if (cmd == "reloadheldmag") {
+        // x y z: right, up, forward (m, as F11 shows it; kept as back inside); no argument: back to the hold's own place.
+        three(g_held_adj, kHeldMagZero, 0.15f);
+        g_held_adj[2] = -g_held_adj[2].load();
+        spdlog::info("[Reload] reloadheldmag: the magazine in the left hand {:.1f} cm right, {:.1f} cm up, {:.1f} cm forward of where its hold puts it", g_held_adj[0].load() * 100.0f,
+                     g_held_adj[1].load() * 100.0f, -g_held_adj[2].load() * 100.0f);
+        return true;
+    }
     if (cmd == "reloadtravel") { g_travel = std::clamp(arg.empty() ? kTravelDefault : fv, 0.02f, 0.12f); persist = true; return true; }
     if (cmd == "reloadrack") { g_rack_len = std::clamp(arg.empty() ? kRackDefault : fv, 0.02f, 0.15f); persist = true; return true; }
     if (cmd == "reloadlog") { g_log = arg.empty() || on; return true; }
@@ -4293,6 +4450,19 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
                                                                             : "off: the M79's shot is followed by the game's own reload, as before (the RPG-7 and RAT4 still filled at once)");
         return true;
     }
+    if (cmd == "reloadballfollow") {
+        g_ball_follow = arg.empty() || on;
+        spdlog::info("[Reload] reloadballfollow {}", g_ball_follow.load() ? "on: the well's ball, the shell going in and the handle's ball drawn on the gun as drawn (its turn off the controller)"
+                                                                          : "off: drawn on the raw weapon controller, as before (off the gun when it is drawn turned)");
+        return true;
+    }
+    if (cmd == "reloadheldfollow") {
+        g_held_follow = arg.empty() || on;
+        persist       = true;
+        spdlog::info("[Reload] reloadheldfollow {}", g_held_follow.load() ? "on: a round or magazine drawn before the gun takes the gun's place of this pass (it no longer trails the gun when walking)"
+                                                                          : "off: a round or magazine drawn before the gun takes the gun's last drawn place, as before");
+        return true;
+    }
     if (cmd == "reloadgrenadeseat") {
         g_grenade_seat = arg.empty() || on;
         persist        = true;
@@ -4319,6 +4489,13 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
         persist     = true;
         spdlog::info("[Reload] reloadbeltgrip {}", g_belt_grip.load() ? "on: a belt-fed gun: quick right B drops the belt and lifts the cover, left grip lays the new belt, left grip on it closes the cover, left grip racks the handle"
                                                                       : "off: quick right B closes the cover; the handle racked only after running dry");
+        return true;
+    }
+    if (cmd == "vehbreload") {
+        g_veh_b_reload = arg.empty() || on;
+        persist        = true;
+        spdlog::info("[Reload] vehbreload {}", g_veh_b_reload.load() ? "on: in a vehicle (no manual reload there), a quick right B with a weapon in the hands is the game's reload (pad X tapped)"
+                                                                      : "off: a quick right B does nothing in a vehicle");
         return true;
     }
     if (cmd == "bheal") {
@@ -4445,7 +4622,7 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
     if (cmd == "reloadhighlight") {
         g_hl_on = arg.empty() || on;
         persist = true;
-        spdlog::info("[Reload] reloadhighlight {}", g_hl_on.load() ? "on: the gun's part to work next glows (the empty magazine, the well, the handle or pump)" : "off");
+        spdlog::info("[Reload] reloadhighlight {}", g_hl_on.load() ? "on: the gun's part to work next glows (the empty magazine, the well, the handle or pump)" : "off: no hints (no glow, boxes, or the well's and handle's balls)");
         return true;
     }
     if (cmd == "reloadhlwhen") {
@@ -4575,6 +4752,13 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
         persist     = true;
         spdlog::info("[Reload] reloadbuttonguardall {}", g_guard_all.load() ? "on: with a gun of the manual reload in hand, left Y reaches the game only once held reloadbuttonguardms"
                                                                             : "off: only during a manual step (reloadbuttonguard)");
+        return true;
+    }
+    if (cmd == "reloadbuttonprompt") {
+        g_btn_prompt = arg.empty() || on;
+        persist      = true;
+        spdlog::info("[Reload] reloadbuttonprompt {}", g_btn_prompt.load() ? "on: while the game shows a prompt on its interact button, left Y goes to it as held (no hold back for a full clip, no cut)"
+                                                                           : "off: left Y through reloadbuttonguard and the tap cut, prompt or not");
         return true;
     }
     if (cmd == "reloadbuttontest") {   // reloadbuttontest <ms> (test): left Y held this long, through reloadbuttonguard as a real press (padtap goes round the guard)
@@ -4751,6 +4935,20 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
                                                                       : "off: the pump taken only near its centre on a new press, pulled along the right controller (as before)");
         return true;
     }
+    if (cmd == "reloadpumplive") {
+        g_pump_live = arg.empty() || on;
+        persist     = true;
+        spdlog::info("[Reload] reloadpumplive {}", g_pump_live.load() ? "on: with a live shell in the chamber a pump shotgun's pump is locked (the left grip only holds the gun) until the shell is fired"
+                                                                      : "off: the pump can be worked with a live shell in the chamber (it is thrown out)");
+        return true;
+    }
+    if (cmd == "reloadpumpstroke") {
+        g_pump_stroke = arg.empty() || on;
+        persist       = true;
+        spdlog::info("[Reload] reloadpumpstroke {}", g_pump_stroke.load() ? "on: a pump stroke counts only from the hands closing within 0.4 s, so slow aiming moves never work or hold the pump"
+                                                                          : "off: the stroke measured from the farthest apart the hands have been (as before 9 Nov)");
+        return true;
+    }
     if (cmd == "reloadpumpshot") {
         g_pump_shot = arg.empty() || on;
         persist     = true;
@@ -4852,27 +5050,59 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
     return false;
 }
 
-void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, uint32_t sig)
+// F11 Main and Gestures > Manual reload (author 16 Nov 09:56Z).
+void draw_hint_choice(std::string& cmds, const std::function<void(const char*)>& hint)
+{
+    bool hlt = g_hl_on.load();
+    if (ImGui::Checkbox("Show reload hints: the part of the gun to work next lights up##reloadhighlight", &hlt)) cmds += hlt ? "reloadhighlight on\n" : "reloadhighlight off\n";
+    hint("Lights up the part of the gun to work next during a reload: the empty magazine, the magazine well or the charging handle.");
+}
+
+void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, uint32_t sig, bool debug)
 {
     bool v = g_on.load();
     if (ImGui::Checkbox("Manual reload: quick B drops the magazine, take the next from your left hip##reloadmanual", &v)) cmds += v ? "reloadmanual on\n" : "reloadmanual off\n";
-    hint("With a ticked weapon in your hands (the AR-C is ticked already): a quick press of right B drops the magazine. Held longer, right B heals (Debug > Buttons: Right B). "
-         "With no ticked weapon in hand a quick B does nothing (switch weapons at your shoulders). "
-         "A magazine always sits on your left hip: left grip there takes it. Bring it under the gun, where the yellow ball shows the magazine well, and push it "
-         "up: it slides in with a tick every centimetre and clicks home. If you had fired every round, rack the charging handle too: left grip on the "
-         "blue ball at the back of the gun (its T handle; a pistol: the back of its slide), pull back until it clicks. You can pull the handle at any time: it moves, but only chambers a "
-         "round after a fresh magazine once the gun ran empty. The gun does not fire until all that is done and the game has refilled the clip. "
-         "On by default (3 Nov). Off: the game reloads as before. Command reloadmanual on/off.");
-    bool hlt = g_hl_on.load();
-    if (ImGui::Checkbox("Show hints: the part to work next lights up##reloadhighlight", &hlt)) cmds += hlt ? "reloadhighlight on\n" : "reloadhighlight off\n";
-    hint("On (default, author 3 Nov): a glowing box round the gun's part to work next, measured on the gun's model: orange the empty magazine "
-         "(drop it), yellow the magazine well while a magazine is in your left hand, blue the charging handle, slide or pump when it must be worked. "
-         "Seen through the hands and the gun. The balls stay as before. Command reloadhighlight on/off.");
+    hint("Reload by hand: a quick right B drops the magazine, take a new one from your left hip and push it in. Off: the game reloads by itself. Command reloadmanual.");
+    draw_hint_choice(cmds, hint);   // also in F11 Main
     bool rb = g_btn_on.load();
     if (ImGui::Checkbox("Keep the automatic reload button (left Y reloads as in the game)##reloadbutton", &rb)) cmds += rb ? "reloadbutton on\n" : "reloadbutton off\n";
-    hint("On (default, author 3 Nov): the reload button (left Y) reloads as in the game, its animation shown, with the manual reload on: whatever "
-         "the hands were doing is dropped and the weapon counts as loaded from the game's clip. The game's own reloads at an empty clip stay held "
-         "back (Debug > Gun: 'Empty magazine: the game does not reload by itself'). Off: the button is the game's and the manual reload does not follow it. Command reloadbutton on/off.");
+    hint("The reload button (left Y) still reloads automatically, as in the game. Command reloadbutton.");
+    // Magazine position (author 16 Nov 15:39: the hip magazine's place with the body worn as sliders): right under the three switches, shown at every menu level.
+    // On the hip: with the body worn (bodyik and bodyikworn on) the magazine sits on the drawn body and bodyikwornmag moves it (on foot);
+    // otherwise reloadpouch places it from the eyes. In the hand: reloadheldmag moves it from whatever hold places it.
+    {
+        ImGui::Dummy(ImVec2{ 0.0f, 4.0f });
+        ImGui::TextUnformatted("Magazine position");
+        ImGui::Indent(16.0f);
+        const fc5::bodyik::Opts bo   = fc5::bodyik::opts();
+        const bool              worn = fc5::bodyik::on() && bo.worn;
+        if (worn) {
+            const glm::vec3 a = bo.worn_adj[fc5::bodyik::kWornMag];
+            float           w[3]{ a.x * 100.0f, a.y * 100.0f, a.z * 100.0f };
+            if (ImGui::SliderFloat3("On the hip: right, forward, up (cm)##bodyikwornmagtop", w, -30.0f, 30.0f, "%.1f"))
+                cmds += fmt::format("bodyikwornmag {:.3f} {:.3f} {:.3f}\n", w[0] * 0.01f, w[1] * 0.01f, w[2] * 0.01f);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reset##bodyikwornmagtop")) cmds += "bodyikwornmag\n";
+            hint("Moves the spare magazine on your drawn body. Command bodyikwornmag.");
+        } else {
+            float p[3]{ g_pouch[0].load(), g_pouch[1].load(), g_pouch[2].load() };
+            if (ImGui::SliderFloat3("On the hip: right, down, forward from the eyes (m)##reloadpouchtop", p, -0.8f, 0.9f, "%.2f"))
+                cmds += fmt::format("reloadpouch {:.2f} {:.2f} {:.2f}\n", p[0], p[1], p[2]);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reset##reloadpouchtop")) cmds += "reloadpouch\n";
+            hint("Where the spare magazine waits on your hip. Command reloadpouch.");
+        }
+        float z = g_pouch_zone.load();
+        if (ImGui::SliderFloat("Hip grab zone (m)##reloadpouchzone", &z, 0.06f, 0.30f, "%.2f")) cmds += fmt::format("reloadpouchzone {:.2f}\n", z);
+        hint("How close your hand must be to the hip magazine to take it. Command reloadpouchzone.");
+        float h[3]{ g_held_adj[0].load() * 100.0f, g_held_adj[1].load() * 100.0f, -g_held_adj[2].load() * 100.0f };
+        if (ImGui::SliderFloat3("In the left hand: right, up, forward (cm)##reloadheldmag", h, -15.0f, 15.0f, "%.1f"))
+            cmds += fmt::format("reloadheldmag {:.3f} {:.3f} {:.3f}\n", h[0] * 0.01f, h[1] * 0.01f, h[2] * 0.01f);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Reset##reloadheldmag")) cmds += "reloadheldmag\n";
+        hint("Moves the magazine in your hand once taken. Command reloadheldmag.");
+        ImGui::Unindent(16.0f);
+    }
     // F11 release clean-up, Gestures > Manual reload, no longer experimental (author 6 Nov 14:06): every other switch, slider and the
     // gun-in-hand panel in Debug, in the subsections that open on a click, closed at first. Debug starts with the hint style and reloadhlwhen.
     // Buttons (right B heal, the accidental-reload guard) shows with the manual reload off too, as these switches did; the rest needs it on.
@@ -4884,13 +5114,14 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
         ImGui::Indent(16.0f);
         return true;
     };
+    if (!debug) return;   // the Debug fold-out shows at the Debug menu level only (author 13 Nov)
     ImGui::Dummy(ImVec2{ 0.0f, 4.0f });
     if (!ImGui::CollapsingHeader("Debug##rldebug")) return;
     ImGui::Indent(16.0f);
     struct DebugIndent {
         ~DebugIndent() { ImGui::Unindent(16.0f); }
     } debug_indent;
-    if (hlt) {
+    if (g_hl_on.load()) {   // the hint style only matters with the hints on (hlt moved into draw_hint_choice)
         int style = g_hint_glow.load() ? 0 : 1;
         ImGui::Indent();
         ImGui::TextUnformatted("Hint style:");
@@ -4898,11 +5129,7 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
         if (ImGui::RadioButton("Glow on the gun's own parts##reloadhintstyle", &style, 0)) cmds += "reloadhintstyle glow\n";
         ImGui::SameLine();
         if (ImGui::RadioButton("Boxes (before)##reloadhintstyle", &style, 1)) cmds += "reloadhintstyle boxes\n";
-        hint("Glow (default, author 5 Nov): the part itself lights up on the gun's model, with a soft halo and a bright outline: orange the empty magazine "
-             "(drop it), mint the magazine on your hip (take it), a yellow ghost of the magazine seated in the gun while one is in your hand (where it goes; "
-             "brighter once close enough), blue the charging handle, slide, pump or lever (also, dimmer, where its blue ball showed: your hand near it, during a reload), "
-             "blue a revolver's cylinder when it is run dry and while it is open. Where your hand covers it, faint moving lines show it through. "
-             "A part the glow cannot draw keeps its box. Boxes: the boxes and the yellow and blue balls, as before. Command reloadhintstyle glow/boxes.");
+        hint("Glow: the part itself lights up. Boxes: boxes and balls show the parts. Command reloadhintstyle.");
         // reloadhlwhen (author 6 Nov 14:10), with the hint style: Manual reload > Debug, shown with the hints on.
         int hw = g_hl_when.load() >= 2 ? 2 : 0;
         ImGui::TextUnformatted("Highlights show:");
@@ -4910,50 +5137,52 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
         if (ImGui::RadioButton("When needed##reloadhlwhen", &hw, 0)) cmds += "reloadhlwhen reload\n";
         ImGui::SameLine();
         if (ImGui::RadioButton("Always (before)##reloadhlwhen", &hw, 2)) cmds += "reloadhlwhen always\n";
-        hint("When needed (default, author 6 Nov): the gun's parts glow (or their boxes and the handle's blue ball show) only when it cannot fire "
-             "without you: run out of rounds, a reload begun (B dropped the magazine, a magazine, shell or round taken from the hip, a feed cover, "
-             "cylinder or action opened) until it is ready again, or an action to work before the next shot (a pump shotgun's pump, a bolt or lever "
-             "after a shot, a handle to rack). Always: as before, also the handle, dimmer, whenever your free hand is near it (holding a machine gun "
-             "by its fore-end while firing). Command reloadhlwhen reload/always.");
+        hint("When needed: hints show only when the gun can't fire without you. Always: also whenever your hand is near the handle. Command reloadhlwhen.");
         ImGui::Unindent();
+    }
+    // The hip magazine's place from the eyes: at the top (Magazine position) unless the body is worn; then here, for a vehicle (16 Nov).
+    if (fc5::bodyik::on() && fc5::bodyik::opts().worn) {
+        float p[3]{ g_pouch[0].load(), g_pouch[1].load(), g_pouch[2].load() };
+        if (ImGui::SliderFloat3("Pouch: right, down, forward from the eyes (m)##reloadpouch", p, -0.8f, 0.9f, "%.2f")) cmds += fmt::format("reloadpouch {:.2f} {:.2f} {:.2f}\n", p[0], p[1], p[2]);
+        hint("Where the spare magazine sits in a vehicle (on foot it's on the body).");
     }
     if (sub("Buttons##rlsub")) {
         bool bh = g_b_heal.load();
         if (ImGui::Checkbox("Right B: hold to heal, no weapon switch##bheal", &bh)) cmds += bh ? "bheal on\n" : "bheal off\n";
-        hint("On (default, author 3 Nov): a quick right B switches no weapon (switch at your shoulders); with manual reload it still drops the "
-             "magazine. Held past the quick press (Quick B press below, default 250 ms), right B heals as before. With the left grip it throws. "
-             "Off: right B is the game's previous weapon as before (held: heal). Command bheal on/off.");
+        hint("A quick right B no longer switches weapon; hold it to heal. Command bheal.");
+        if (bh) {
+            bool vb = g_veh_b_reload.load();
+            if (ImGui::Checkbox("In a vehicle: quick right B reloads##vehbreload", &vb)) cmds += vb ? "vehbreload on\n" : "vehbreload off\n";
+            hint("In a vehicle, a quick right B reloads. Command vehbreload.");
+        }
         bool bg = g_guard_on.load();
         if (ImGui::Checkbox("No accidental reload: hold the button during a manual step##reloadbuttonguard", &bg)) cmds += bg ? "reloadbuttonguard on\n" : "reloadbuttonguard off\n";
-        hint("On (default, author 3 Nov): while the left hand is at work (a magazine, shell or round in it or going in, the handle or pump held, the "
-             "magazine out, the cylinder or cover open, and half a second after), a press of the reload button (left Y) reaches the game only once held "
-             "for the time below. A thumb brushing it does nothing; hold it to reload. At any other time a press works at once. Off: every press goes "
-             "to the game. Commands reloadbuttonguard on/off, reloadbuttonguardms N.");
+        hint("During a manual reload, the reload button must be held to work, so brushing it does nothing. Command reloadbuttonguard.");
         if (bg) {
             bool ga = g_guard_all.load();
             if (ImGui::Checkbox("... at all times with the gun in hand, not only during a manual step##reloadbuttonguardall", &ga))
                 cmds += ga ? "reloadbuttonguardall on\n" : "reloadbuttonguardall off\n";
-            hint("On (default, 4 Nov): whenever a gun of the manual reload is in your hand, a short press of the reload button (left Y) does nothing; "
-                 "hold it for the time below to reload, or to pick something up. The author's log of 4 Nov had 12 presses in 80 s outside any manual step, "
-                 "each one playing the game's full reload. Off: only during a manual step, as on 3 Nov. Command reloadbuttonguardall on/off.");
+            hint("With a manual-reload gun in hand, the reload button always needs a hold, so a quick press does nothing. Command reloadbuttonguardall.");
             int gm = g_guard_ms.load();
             if (ImGui::SliderInt("During a manual step: hold the reload button at least (ms)##reloadbuttonguardms", &gm, 150, 1500)) cmds += fmt::format("reloadbuttonguardms {}\n", gm);
         }
+        bool bp = g_btn_prompt.load();
+        if (ImGui::Checkbox("Looting: hold the reload button through when the game shows its prompt##reloadbuttonprompt", &bp))
+            cmds += bp ? "reloadbuttonprompt on\n" : "reloadbuttonprompt off\n";
+        hint("When the game shows a prompt on the reload button (search, pick up, open), the button works exactly as you hold it. Command reloadbuttonprompt.");
         int tap = g_tap_ms.load();
         if (ImGui::SliderInt("Quick B press: shorter than (ms)##reloadtap", &tap, 100, 600)) cmds += fmt::format("reloadtap {}\n", tap);
-        hint("Released sooner than this, right B drops the magazine; held longer, it is the game's B (heal) from that moment.");
+        hint("A right B press shorter than this drops the magazine; a longer one heals.");
         if (bh) {
             int hm = g_heal_ms.load();
             if (ImGui::SliderInt("Heal: hold the game's button at least (ms)##bhealms", &hm, 300, 2000)) cmds += fmt::format("bhealms {}\n", hm);
-            hint("A held right B is sent to the game for at least this long, so the game always sees a hold (heal) and never a tap (previous weapon). "
-                 "Raise it if a short hold still switches weapon. Command bhealms N.");
+            hint("Shortest hold sent to the game for right B, so it always heals and never switches weapon. Command bhealms.");
         }
         int k = g_key.load();
         if (ImGui::RadioButton("Game's reload: keyboard R##reloadkeyr", k == 0)) cmds += "reloadkey r\n";
         ImGui::SameLine();
         if (ImGui::RadioButton("pad X##reloadkeyx", k == 1)) cmds += "reloadkey x\n";
-        hint("How the mod starts the game's own reload at the drop (the game counts the ammo). R (default) cannot pick anything up; X is the pad's reload, but "
-             "also its interact button.");
+        hint("Which key starts the game's own reload when you drop the magazine. R can't pick anything up by mistake.");
         ImGui::Unindent(16.0f);
     }
     if (!v) {
@@ -5118,11 +5347,7 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
             relearn_say(fmt::format("weapon {}: {} forgotten: the game's reload of this gun will start (fire one shot first if the clip is full)", sig, kItName[i]));
         }
         if (!msg.empty()) ImGui::TextWrapped("%s", msg.c_str());
-        hint("Each part of the reload for the gun in your hands: correct when the mod has it (built in, saved or learnt from the game's own reload), "
-             "unknown when it is guessed or measured later, a problem when there is none or you marked it. 'Something wrong' marks it (saved, so the "
-             "next fix knows) and, for the magazine, the hand holding it, the hand on the handle and the sounds, forgets what was learnt and learns it "
-             "again from the game's own reload of this gun: the reload starts by itself (after one shot if the clip is full); for the hand on the handle "
-             "fire the gun empty. Commands reloadproblem, reloadlearntuse.");
+        hint("Shows how well each reload part is known for the gun in your hands. 'Something wrong' marks a part to be learnt again.");
         ImGui::Unindent(16.0f);
     }
     if (sig != 0) {
@@ -5149,27 +5374,26 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
             if (ImGui::Checkbox("Launcher taken in hand empty: its round shown at the hip at once##reloadlauncherfill", &lf)) cmds += lf ? "reloadlauncherfill on\n" : "reloadlauncherfill off\n";
             bool hl = g_hip_loaded.load();
             if (ImGui::Checkbox("Spare round at the hip with the launcher loaded too##reloadhiploaded", &hl)) cmds += hl ? "reloadhiploaded on\n" : "reloadhiploaded off\n";
-            hint("On: picked up loaded, or just fired and not yet opened, a launcher with rounds in reserve shows the next one at your left hip. Command reloadhiploaded on/off.");
+            hint("A launcher that is already loaded still shows a spare round at your hip. Command reloadhiploaded.");
             if (rs.brk && !rs.door) {
                 bool gf = g_grenade_fill.load();
                 if (ImGui::Checkbox("Grenade launcher: no game reload after a shot##reloadgrenadefill", &gf)) cmds += gf ? "reloadgrenadefill on\n" : "reloadgrenadefill off\n";
-                hint("On: after a shot the game plays no reload or hand animation; open it, take a grenade from your hip and load it by hand. Command reloadgrenadefill on/off.");
+                hint("After a grenade launcher shot, the game doesn't reload it; you load it by hand. Command reloadgrenadefill.");
                 bool gs = g_grenade_seat.load();
                 if (ImGui::Checkbox("Grenade launcher: grenade seated in the barrel##reloadgrenadeseat", &gs)) cmds += gs ? "reloadgrenadeseat on\n" : "reloadgrenadeseat off\n";
-                hint("On: the grenade on the gun sits in the bore, its base at the breech (measured on the model). Takes effect at the next pick-up. Command reloadgrenadeseat on/off.");
+                hint("The grenade sits inside the launcher's barrel. Command reloadgrenadeseat.");
             }
             if (rs.door) {
                 bool sg = g_same_gun.load();
                 if (ImGui::Checkbox("RAT4: its changing ids are one weapon##reloadsamegun", &sg)) cmds += sg ? "reloadsamegun on\n" : "reloadsamegun off\n";
-                hint("On: the RAT4 seen under another id (28497, 80077, 69646) keeps its reload instead of starting again loaded. Command reloadsamegun on/off.");
+                hint("The RAT4 keeps its reload state when the game changes its id. Command reloadsamegun.");
             }
         }
         // reloadshellhip (a double barrel: the Sledge, the sawed-off)
         if (revolver_parts(sig, rs) && rs.brk && !rs.rigid_rounds) {
             bool sh = g_shell_hip.load();
             if (ImGui::Checkbox("Double barrel: spare shell centred on the hip zone##reloadshellhip", &sh)) cmds += sh ? "reloadshellhip on\n" : "reloadshellhip off\n";
-            hint("On: the shell at your left hip sits in the middle of the place the left grip takes it from. Off: as before, its nose 3 cm above that "
-                 "place and the shell behind it. Command reloadshellhip on/off.");
+            hint("The spare shell sits in the middle of the hip grab zone. Command reloadshellhip.");
         }
         if (revolver_parts(sig, rs) && rs.noopen)
             hint(fmt::format("The {} (id {}): after a shot, take a rocket from your left hip (it stands up there), hold it pointing the way the launcher "
@@ -5236,8 +5460,7 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
                              ot.name, sig, ot.norack ? " (an energy weapon's cell, a launcher's round, a canister)" : "",
                              ot.norack ? " Nothing to rack." : " After running dry, rack the handle or slide (learnt from the game's reload from empty, else the blue ball).").c_str());
         else
-            hint("The mod knows weapons by an id, not by name. Magazine-fed guns only (rifles, SMGs, pistols); this one has no built-in parts: its magazine is learnt at "
-                 "the game's first reload of it (keep the gun still for 3 s).");
+            hint("This gun has no built-in reload parts: its magazine is learnt the first time the game reloads it (hold the gun still for 3 s).");
     } else {
         ImGui::TextDisabled("No weapon in your hands now.");
     }
@@ -5253,67 +5476,47 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
             bool on_t = g_type_on[t].load();
             if (ImGui::Checkbox(fmt::format("{}##{}", kTypeName[t], kTypeCmd[t]).c_str(), &on_t)) cmds += fmt::format("{} {}\n", kTypeCmd[t], on_t ? "on" : "off");
         }
-        hint("On (default, 3 Nov): every weapon of that kind reloads by hand, ticked above or not. Off: only the ticked ones. The flamethrower: a quick "
-             "B drops its canister, the next from the hip clicks in. The M79: a quick B breaks it open, a grenade from the hip goes into the breech, a "
-             "quick B closes it. The RPG-7: a rocket from the hip goes in at the muzzle, tail first. Lever actions: shells from the hip, a quick B works "
-             "the lever. Double barrels: a quick B opens them, a shell per barrel, a quick B closes. The M60: a quick B lifts the cover, a belt from the "
-             "hip, a quick B closes; the M249: its box swapped. Bolt actions (the .308): the bolt worked with the left hand after every shot. Magazine "
-             "guns, pump shotguns and revolvers as before, every one of them. Every other gun (3 Nov evening): the M712, the Mark IV, the Lost on Mars "
-             "weapons (an energy cell swapped), the arcade map's unnamed guns: a magazine learnt at its first reload. Commands reloadflame, reloadgl, "
-             "reloadrocket, reloadlever, reloadbreak, reloadbelt, reloadbolt, reloadmag, reloadpump, reloadrevolver, reloadother on/off.");
+        hint("Every weapon of this kind reloads by hand. Off: only the ticked ones.");
         ImGui::Unindent(16.0f);
     }
     if (sub("Hip and left hand##rlsub")) {
         bool hs = g_hand_snap.load();
         if (ImGui::Checkbox("Hand stays on the magazine and the handle##reloadhandsnap", &hs)) cmds += hs ? "reloadhandsnap on\n" : "reloadhandsnap off\n";
-        hint("On (default, author 3 Nov): while a magazine slides into the well your drawn left hand holds it there, on the well's line; while you pull "
-             "the charging handle, slide or pump, the hand stays on it and moves exactly with it. It eases in and out in about a tenth of a second. "
-             "Your real hand may be a few centimetres off; the drawn one is not. Off: the hand is drawn at your controller. Command reloadhandsnap on/off.");
+        hint("Your drawn hand stays on the magazine and the handle while you work them. Command reloadhandsnap.");
+        bool hf = g_held_follow.load();
+        if (ImGui::Checkbox("Rockets, grenades and magazines stay in the gun when walking##reloadheldfollow", &hf)) cmds += hf ? "reloadheldfollow on\n" : "reloadheldfollow off\n";
+        hint("Rockets, grenades and magazines stay in the gun while you walk. Command reloadheldfollow.");
+        bool bf = g_ball_follow.load();
+        if (ImGui::Checkbox("Loading port and handle balls on the gun as drawn##reloadballfollow", &bf)) cmds += bf ? "reloadballfollow on\n" : "reloadballfollow off\n";
+        hint("The loading point and handle markers follow the gun as drawn. Command reloadballfollow.");
         bool rp = g_round_pinch.load();
         if (ImGui::Checkbox("Rounds and shells between thumb and index##reloadroundpinch", &rp)) cmds += rp ? "reloadroundpinch on\n" : "reloadroundpinch off\n";
-        hint("On (default, author 3 Nov): a revolver round or a shotgun shell taken from the hip is pinched between your thumb and index tips, "
-             "its base at the pinch, a few centimetres in front of your fist. Off: held in the fist. Command reloadroundpinch on/off.");
+        hint("Rounds and shells are held between thumb and index. Command reloadroundpinch.");
         bool mpalm = g_mag_palm.load();
         if (ImGui::Checkbox("Magazine in the whole hand##reloadmagpalm", &mpalm)) cmds += mpalm ? "reloadmagpalm on\n" : "reloadmagpalm off\n";
-        hint("On (default, author 3 Nov): a magazine taken from the hip sits in your fist at the middle of its length (7 cm below its top at most), "
-             "measured on the gun's own magazine. Off: the hand offset below, or the game's own hold (at the magazine's bottom) with the game hold on. "
-             "Command reloadmagpalm on/off.");
+        hint("A magazine sits in your whole hand, at the middle of its length. Command reloadmagpalm.");
         bool ml = g_mag_lower.load();
         if (ImGui::Checkbox("Magazine held in the fist, round its lower half##reloadmaglower", &ml)) cmds += ml ? "reloadmaglower on\n" : "reloadmaglower off\n";
-        hint("On (default): a magazine gun's magazine sits in the fist, round the middle of its lower half, the fingers closed round it. Off: as the game's own hand holds it, or from under. Boxes, belts, shells and rounds "
-             "keep their own holds. Command reloadmaglower on/off.");
+        hint("The magazine sits in your fist, round its lower half. Command reloadmaglower.");
         if (mpalm && !g_mag_lower.load()) {   // (it acts only there: with reloadmaglower on a handgun's magazine sits round its lower half)
             bool mfist = g_mag_fist.load();
             if (ImGui::Checkbox("A handgun's magazine in the middle of the fist##reloadmagfist", &mfist)) cmds += mfist ? "reloadmagfist on\n" : "reloadmagfist off\n";
-            hint("On (default, 4 Nov, not yet seen in the headset): a handgun's magazine sits in the middle of your fist sideways. Your fist's middle is beside "
-                 "the controller, toward the other hand, as far as the gun's grip is beside the other controller (4 to 6 cm). Off: on the controller's line, "
-                 "as before, where it sat beside the fist (the P08's along the outside of the hand). Command reloadmagfist on/off.");
+            hint("A handgun's magazine sits in the middle of your fist. Command reloadmagfist.");
         }
         bool hgm = g_hand_game.load();
         if (ImGui::Checkbox("A handgun's hand and magazine as in the game's own reload##reloadhandgame", &hgm)) cmds += hgm ? "reloadhandgame on\n" : "reloadhandgame off\n";
-        hint("On (default, author 4 Nov): recorded from the game's own reload, gun by gun: the magazine sits in your hand as the game holds it, your hand goes on the slide as the game's does, "
-             "and an empty gun's slide stays back until you rack it. Off: the magazine in the fist and the slide grip below. Command reloadhandgame on/off.");
+        hint("A handgun's magazine and slide are held as in the game's own reload. Command reloadhandgame.");
         bool hg = g_hand_grab.load();
         if (ImGui::Checkbox("Hand grabs the handle, slide or pump as in the game's reload##reloadhandgrab", &hg)) cmds += hg ? "reloadhandgrab on\n" : "reloadhandgrab off\n";
-        hint("On (default, author 3 Nov): with the box above, wherever you take the charging handle, slide or pump, the drawn hand goes to the same place "
-             "on it: where the game's own hand holds it in its reload (learnt from a game reload from empty, built in for the AR-C, a handgun's slide "
-             "grip below for a handgun, else the AR-C's grip on this gun's handle; a pump in the fist). Off: the hand stays where you took it. Command reloadhandgrab on/off.");
+        hint("Your hand goes to the same place on the handle, slide or pump as the game's hand. Command reloadhandgrab.");
         if (hg) {   // (reloadhandgrab's grip for a handgun: nothing to set with it off)
             float sg[3]{ g_slide_grab[0].load(), g_slide_grab[1].load(), g_slide_grab[2].load() };
             if (ImGui::DragFloat3("A handgun's slide grip (m)##reloadslidegrab", sg, 0.001f, -0.12f, 0.12f, "%.3f"))
                 cmds += fmt::format("reloadslidegrab {:.3f} {:.3f} {:.3f}\n", sg[0], sg[1], sg[2]);
             ImGui::SameLine();
             if (ImGui::SmallButton("Default##reloadslidegrab")) cmds += "reloadslidegrab default\n";
-            hint("A handgun's slide with no grip learnt from the game or built in (4 Nov, not yet seen in the headset): where its rear is from your "
-                 "left controller, in the gun's axes (x right, y up, z back, m). The default (0.044 -0.005 -0.010) puts the fist round the rear of "
-                 "the slide from above; until now pistols borrowed the AR-C's grip, which left the hand open in the air above and behind the slide. "
-                 "Raise the second number to lower the hand, lower the third to move it back. Command reloadslidegrab x y z, or reloadslidegrab default.");
+            hint("Where your hand grabs a handgun's slide when none is learnt.");
         }
-        float z = g_pouch_zone.load();
-        if (ImGui::SliderFloat("Hip pouch zone (m)##reloadpouchzone", &z, 0.06f, 0.30f, "%.2f")) cmds += fmt::format("reloadpouchzone {:.2f}\n", z);
-        float p[3]{ g_pouch[0].load(), g_pouch[1].load(), g_pouch[2].load() };
-        if (ImGui::SliderFloat3("Pouch: right, down, forward from the eyes (m)##reloadpouch", p, -0.8f, 0.9f, "%.2f")) cmds += fmt::format("reloadpouch {:.2f} {:.2f} {:.2f}\n", p[0], p[1], p[2]);
-        hint("Where the magazine waits (default the front of the left hip: 0.22 m to the left, 0.60 m below the eyes). It turns with your body, not your head.");
         bool gh = g_game_hold.load();
         if (ImGui::Checkbox("Follow the game's reload: its hand's hold, the AK's magazine rocked in##reloadgamehold", &gh)) cmds += gh ? "reloadgamehold on\n" : "reloadgamehold off\n";
         {
@@ -5321,31 +5524,21 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
             if (sig != 0 && hold_mag(sig, t)) ImGui::Text("This weapon, learnt from the game's reload: %.3f %.3f %.3f", t.x, t.y, t.z);
             else ImGui::TextUnformatted("This weapon: not learnt yet (the game's own reload, seen once, learns it)");
         }
-        hint("On by default (3 Nov). The hold below is used only with 'Magazine in the whole hand' off (that switch places the magazine from its model). "
-             "Off: the magazine's top sits at the place below for every weapon and goes straight in. On: for each weapon whose own game "
-             "reload has been seen (a game reload with this gun in hand, once), the magazine sits in your left hand where the game's hand holds its "
-             "spare one; and an AK's magazine goes in as the game puts it in, its front hooked into the well first, tilted 20 degrees, rocked up "
-             "into line as you push it home (before 3 Nov a separate 'AK magazine rocked in' slider).");
+        hint("Holds the magazine as the game's own hand does, for guns whose game reload has been seen.");
         // reloadhandmag: the place for every weapon (gamehold off), or for those whose game reload was not seen yet.
         float h[3]{ g_hand_off[0].load(), g_hand_off[1].load(), g_hand_off[2].load() };
         if (ImGui::SliderFloat3("Magazine's top in the left hand: right, up, back (m)##reloadhandmag", h, -0.2f, 0.2f, "%.3f"))
             cmds += fmt::format("reloadhandmag {:.3f} {:.3f} {:.3f}\n", h[0], h[1], h[2]);
-        hint("Where the magazine's top sits in your left hand when it does not follow the game's hand (the box above off, or a weapon whose game reload was not seen yet).");
+        hint("Where the magazine's top sits in your left hand, when not set by the options above.");
         ImGui::Unindent(16.0f);
     }
     if (sub("Gun: magazine, handle, pump##rlsub")) {
         bool ns = g_no_stuck.load();
         if (ImGui::Checkbox("Never left unable to fire##reloadnostuck", &ns)) cmds += ns ? "reloadnostuck on\n" : "reloadnostuck off\n";
-        hint("On (default, author 3 Nov): a weapon the manual reload holds as empty (a shotgun, a revolver, a double barrel, the M79, the RPG-7, a handle "
-             "or bolt to work) while the game still has rounds in its clip is loaded from the game's clip: at once if nothing can go in by hand (its "
-             "well or muzzle not measured yet), else after 6 s with nothing done towards the reload. Off: it stays held until loaded by hand. "
-             "Command reloadnostuck on/off.");
+        hint("If the game still has rounds, a gun waiting for a manual reload is loaded from them after 6 s, so you're never stuck. Command reloadnostuck.");
         bool nsw = g_no_switch.load();
         if (ImGui::Checkbox("Out of ammo: the game does not switch weapon by itself (pump and lever shotguns)##noautoswitch", &nsw)) cmds += nsw ? "noautoswitch on\n" : "noautoswitch off\n";
-        hint("On (default, author 7 Nov): a pump or lever shotgun with no spare ammo left keeps its last shell unfired (the wrist shows 0), so the game "
-             "never sees it empty and does not put another weapon in your hands; pick up ammo and it fires again. Off: the last shell fires and the game "
-             "switches weapon by itself. (Magazine guns, revolvers and double barrels never let the game's clip reach 0: every round fires and the "
-             "game reloads nothing by itself, since 9 Nov.) Command noautoswitch on/off.");
+        hint("A pump or lever shotgun out of spare ammo keeps its last shell, so the game doesn't switch weapon by itself. Command noautosw.");
         {
             bool ao = g_act_on.load();
             if (ImGui::Checkbox("Lever and pump: stay open once thrown, shells go in from near the port##reloadactionopen", &ao)) cmds += ao ? "reloadactionopen on\n" : "reloadactionopen off\n";
@@ -5357,14 +5550,10 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
             if (ImGui::Checkbox("Pump, lever, bolt: the game's cycle after a shot does not move the weapon hand##reloadhandhold", &hh)) cmds += hh ? "reloadhandhold on\n" : "reloadhandhold off\n";
             bool bt2 = g_bolt_turn.load();
             if (ImGui::Checkbox("Bolt actions: the bolt turned up, pulled back, pushed forward, turned down##reloadboltturn", &bt2)) cmds += bt2 ? "reloadboltturn on\n" : "reloadboltturn off\n";
-            hint("On (default, author 6 Nov): grip the bolt (either hand), raise the hand to turn it up, pull it back to its stop (the fired case flies out), push it forward "
-                 "(a round goes in), lower the hand to turn it down: locked, it fires. The bolt follows the hand at every step; let go anywhere and it stays there. "
-                 "Off: pulled straight back and let go. Commands reloadboltturn on/off, reloadboltdeg N, reloadboltlift M.");
+            hint("Work a bolt action fully: turn it up, pull back, push forward, turn down. Off: just pull straight back. Command reloadboltturn.");
             bool bp2 = g_bolt_parts.load();
             if (ImGui::Checkbox("Bolt actions: the bolt stop and bolt cover kept still after a shot##reloadboltparts", &bp2)) cmds += bp2 ? "reloadboltparts on\n" : "reloadboltparts off\n";
-            hint("On (default, author 6 Nov 13:55, 'the bolt action had some slight movements'): the parts beside the bolt (the .308's bolt stop, the HTI .50's "
-                 "bolt cover) stay where they sit at rest, as the bolt does; the game's own cycle after each shot no longer moves them. Off: they move with it. "
-                 "Command reloadboltparts on/off.");
+            hint("Keeps the parts beside the bolt still after a shot. Command reloadboltparts.");
             if (bt2) {
                 float bd = g_bolt_deg.load();
                 if (ImGui::SliderFloat("Bolt turn (deg; negative turns it the other way)##reloadboltdeg", &bd, -120.0f, 120.0f, "%.0f")) cmds += fmt::format("reloadboltdeg {:.0f}\n", bd);
@@ -5375,44 +5564,40 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
         {
             bool lh = g_lever_hand_on.load();
             if (ImGui::Checkbox("Lever actions: work the lever with the right hand##reloadleverhand", &lh)) cmds += lh ? "reloadleverhand on\n" : "reloadleverhand off\n";
-            hint("On (default): with the left grip holding the fore-end, drop the right hand about 5 cm and bring it back: the lever follows it. Only when the chamber needs it. Quick right B still works it. "
-                 "Command reloadleverhand on/off.");
+            hint("Work a lever action by dropping your right hand and bringing it back. Command reloadleverhand.");
         }
         float tr = g_travel.load(), rk = g_rack_len.load();
         if (ImGui::SliderFloat("Magazine travel into the well (m)##reloadtravel", &tr, 0.02f, 0.10f, "%.3f")) cmds += fmt::format("reloadtravel {:.3f}\n", tr);
         if (ImGui::SliderFloat("Charging handle pull (m)##reloadrack", &rk, 0.02f, 0.12f, "%.3f")) cmds += fmt::format("reloadrack {:.3f}\n", rk);
-        hint("A pistol's magazine goes 1.6 times the travel into its grip, and its slide comes back 0.75 times the pull (8 and 4.5 cm at the defaults).");
+        hint("How far you pull the charging handle.");
         bool ps = g_pump_shot.load();
         if (ImGui::Checkbox("Pump shotguns: work the pump after each shot##reloadpumpshot", &ps)) cmds += ps ? "reloadpumpshot on\n" : "reloadpumpshot off\n";
-        hint("On (default): after each shot a pump shotgun (the M133s, when ticked) does not fire again until you pull its pump back to the stop (the fired "
-             "shell flies out) and push it forward. The SPAS-12 fires again by itself, as in the game. Off: the next shell is chambered by itself; the pump is needed only after loading an empty gun. Shells "
-             "always go in one at a time from the left hip.");
+        hint("A pump shotgun needs the pump worked after each shot. Off: it chambers the next shell by itself.");
         bool pg = g_pump_grip.load();
         if (ImGui::Checkbox("Pump shotguns: take the pump anywhere on the fore-end, grip held or not##reloadpumpgrip", &pg)) cmds += pg ? "reloadpumpgrip on\n" : "reloadpumpgrip off\n";
-        hint("On (default, author 7 Nov: the M133's pump did not work): the left grip on the fore-end takes the pump wherever you hold it along the gun, "
-             "and if you keep holding the fore-end after a shot, just pull it back and push it forward, no new press. The stroke is your left hand "
-             "coming back towards your right one, and while it moves the gun keeps its aim on your right hand (it no longer swings with the left). "
-             "Off: as before (a new press near the pump's middle, pulled along the right controller). Command reloadpumpgrip on/off.");
+        hint("Grab the pump anywhere on the fore-end, and keep holding it between shots. Command reloadpumpgrip.");
+        bool pl = g_pump_live.load();
+        if (ImGui::Checkbox("Pump shotguns: pump locked while a live shell is chambered##reloadpumplive", &pl)) cmds += pl ? "reloadpumplive on\n" : "reloadpumplive off\n";
+        hint("The pump is locked until the loaded shell is fired, so a live shell is never thrown out. Command reloadpumplive.");
+        bool pk = g_pump_stroke.load();
+        if (ImGui::Checkbox("Pump shotguns: only a quick pull works the pump##reloadpumpstroke", &pk)) cmds += pk ? "reloadpumpstroke on\n" : "reloadpumpstroke off\n";
+        hint("Only a quick pull works the pump, so moving the gun slowly never does. Command reloadpumpstroke.");
         bool ch = g_casing_on.load();
         if (ImGui::Checkbox("One shell only: hide the game's casing when the hand ejects##reloadcasinghide", &ch)) cmds += ch ? "reloadcasinghide on\n" : "reloadcasinghide off\n";
-        hint("On (default, author 3 Nov): with a pump or lever shotgun worked after each shot (above), or a bolt action, the game's own spent casing "
-             "is hidden while it is in hand, so only the shell thrown out by your pump, lever or bolt is seen (the game throws one too as it cycles "
-             "the gun by itself). Other casings are hidden too while that gun is in hand. Off: both. Command reloadcasinghide on/off.");
+        hint("Hides the game's own casing, so only the one your hand ejects is seen. Command reloadcasinghide.");
         bool rd = g_rev_dump.load();
         if (ImGui::Checkbox("Revolver: fired cases drop out as it opens##reloadrevdump", &rd)) cmds += rd ? "reloadrevdump on\n" : "reloadrevdump off\n";
-        hint("On (default): the fired cases leave the cylinder as soon as it is swung open, so only the live rounds stay in it. Off: they stay until "
-             "you tip the muzzle up (more than 37 degrees above level).");
+        hint("A revolver's fired cases drop out as soon as it opens.");
         bool rsl = g_round_slide.load();
         if (ImGui::Checkbox("Revolver: a round near its chamber drops in by itself##reloadroundslide", &rsl)) cmds += rsl ? "reloadroundslide on\n" : "reloadroundslide off\n";
         bool sh = g_seat_hold_on.load();
         if (ImGui::Checkbox("No grip on the gun until a new press once a shell or magazine is in##reloadseathold", &sh)) cmds += sh ? "reloadseathold on\n" : "reloadseathold off\n";
         bool df = g_drop_fall.load();
         if (ImGui::Checkbox("The dropped magazine falls to the ground##reloaddrop", &df)) cmds += df ? "reloaddrop on\n" : "reloaddrop off\n";
-        hint("On (default): a quick B lets the game's magazine fall from the gun, tumbling, to the ground, where it lies 20 s. Off: it vanishes.");
+        hint("A dropped magazine falls to the ground and lies there for 20 s. Off: it vanishes.");
         float fl = g_drop_floor.load();
         if (ImGui::SliderFloat("Ground below the game's eyes (m)##reloaddropfloor", &fl, 0.5f, 2.2f, "%.2f")) cmds += fmt::format("reloaddropfloor {:.2f}\n", fl);
-        hint("Where the dropped magazine lands: this far below the game's eyes when it was dropped (1.6 standing). Raise it if it sinks into the ground, lower it if it "
-             "floats.");
+        hint("Where the dropped magazine lands. Raise it if it sinks into the ground, lower it if it floats.");
         // The weapon in hand's magazine and "Learn it again" (the author uses it when the wrong part drops; manual reload thread 12:45).
         if (listed) {
             const std::string mt = mag_text(sig);
@@ -5444,21 +5629,15 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
     if (sub("Sounds##rlsub")) {
         bool ws = g_wsnd.load();
         if (ImGui::Checkbox("The game's own reload sounds, per weapon##reloadweaponsounds", &ws)) cmds += ws ? "reloadweaponsounds on\n" : "reloadweaponsounds off\n";
-        hint("On: the magazine (or shell, or round) going out and in and the bolt (or pump) use this weapon's own sounds from the game, taken from its "
-             "reload on the arcade map. Which of its sounds is which is a guess until heard: below, play each and pick. On by default (3 Nov). Off: no reload sounds "
-             "(the mod has no sounds of its own since 3 Nov).");
+        hint("Manual reloads play this weapon's own reload sounds from the game. Off: no reload sounds.");
         bool sf = g_snd_fill.load();
         if (ImGui::Checkbox("A handgun with no sounds of its own uses the 1911's##reloadsoundfill", &sf)) cmds += sf ? "reloadsoundfill on\n" : "reloadsoundfill off\n";
-        hint("On (default, author 3 Nov): a handgun with no game sounds of its own (the P08) plays the 1911's. A revolver or other gun with none "
-             "(the .44 Magnum) stays silent until its sounds are learnt from the game. Off: such a handgun is silent. Command reloadsoundfill on/off.");
+        hint("A handgun with no sounds of its own uses the 1911's. Command reloadsoundfill.");
         // reloadsoundseq (manualreload42): the four sequences of the weapon in hand, each played, and the three cuts between them.
         {
             bool sq = g_seq_on.load();
             if (ImGui::Checkbox("The game's own sounds in four sequences (out, in, bolt back, bolt forward)##reloadsoundseq", &sq)) cmds += sq ? "reloadsoundseq on\n" : "reloadsoundseq off\n";
-            hint("On (default, author 3 Nov): with the game's own sounds ticked above, each manual step plays its part of the game's own reload, "
-                 "with the game's spacing, instead of one sound: magazine out, magazine in, bolt back (and the case), bolt forward. Built in for every "
-                 "weapon of the sound run (a pump's or lever's back and forward, a shell in, a break action opened and closed). A pick below for this "
-                 "weapon alone comes first; a pick for the whole category does not. Off: one sound per step as before. Command reloadsoundseq on/off.");
+            hint("Each step of a manual reload plays its own part of the game's reload sound. Command reloadsoundseq.");
             bool          borrowed = false;
             const SeqSnd* sqs      = listed ? seq_for(sig, &borrowed) : nullptr;
             if (sq && sqs && borrowed) ImGui::TextDisabled("This handgun has no sequence of its own: the 1911's (reloadsoundfill). Cuts changed here change the 1911's.");
@@ -5489,7 +5668,7 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
                     if (mp.empty()) line += " none";
                     cmds += line + "\n";
                 }
-                hint("Each sound goes to the step whose part of the timeline holds it. Move a cut, then press Play to hear the step. Saved per weapon.");
+                hint("Where each sound is cut between the reload steps. Move a cut, then press Play to hear it.");
                 if (changed) {
                     std::lock_guard _{ g_seq_mtx };
                     auto mp       = g_seq_cut;
@@ -5525,8 +5704,7 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
                         if (ImGui::Selectable(fmt::format("{}##sndtgt{}", kCatName[c], c).c_str(), g_snd_target == c)) g_snd_target = c;
                     ImGui::EndCombo();
                 }
-                hint("The category the sounds you pick below are given to. This weapon's own by default; choose another to give it this weapon's sounds "
-                     "(for example a shotgun's pump for every rifle's bolt). Not saved: back to the held weapon's own when the game restarts.");
+                hint("Which weapon category the sounds you pick below go to.");
             }
             const uint32_t tgt_cat = sc ? (g_snd_target > 0 ? uint32_t(g_snd_target) : own_cat) : 0;
             const uint32_t key     = sc ? tgt_cat : sig;   // where a pick goes: the category's number, or the weapon's id
@@ -5627,41 +5805,31 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
     if (sub("Tests and per-weapon tuning##rlsub")) {
         bool pa = g_pouch_anchor.load();
         if (ImGui::Checkbox("Hip magazine still when the gun turns##reloadpouchanchor", &pa)) cmds += pa ? "reloadpouchanchor on\n" : "reloadpouchanchor off\n";
-        hint("On (default, author 3 Nov): the hip's magazine is placed where your eyes are, as the gun and the hands are, so turning the gun no longer "
-             "slides it a few centimetres (the game's camera swings on its neck as the gun turns). Off: as before.");
+        hint("The hip magazine stays still when the gun turns.");
         bool pn = g_pouch_neck.load();
         if (ImGui::Checkbox("Hip magazine fixed to the body, not the head (test)##reloadpouchneck", &pn)) cmds += pn ? "reloadpouchneck on\n" : "reloadpouchneck off\n";
-        hint("On: the hip's magazine hangs from your neck instead of your eyes, so bending the head to look at it does not move it, and it turns with your "
-             "body only once your head has turned more than 60 degrees (35 off), so a glance down to the left does not swing it. Off (default): as before.");
+        hint("For testing: the hip magazine hangs from your neck, so looking down at it doesn't move it.");
         bool md = g_model_on.load();
         if (ImGui::Checkbox("Use the game's own magazine##reloadmagmodel", &md)) cmds += md ? "reloadmagmodel on\n" : "reloadmagmodel off\n";
-        hint("On (default): the game's own magazine waits on your hip, leaves the gun at the drop, sits in your left hand once taken and slides into the well, "
-             "and the gun's own charging handle moves when you pull it. The AR-C's and the pistols' magazines are built in; for other weapons it is learnt at the first time the game "
-             "reloads them (keep the gun still for 3 s). Until then a drawn magazine stands in.");
+        hint("Uses the game's own magazine model, and the gun's own charging handle moves when you pull it.");
         bool pt = g_parts_table.load();
         if (ImGui::Checkbox("Guns not built in: parts from the game's files (test)##reloadpartstable", &pt)) cmds += pt ? "reloadpartstable on\n" : "reloadpartstable off\n";
-        hint("On: a gun the mod has no row for (another skin or attachment, a DLC gun) takes its magazine, rounds, charging handle and casing port from a "
-             "table made from the game's files, so it reloads by hand at once, before the game's own reload is ever seen. Magazine guns and pump shotguns; "
-             "tick the gun itself above as before. Off (default): its magazine is learnt at its first game reload.");
+        hint("For testing: guns the mod doesn't know take their reload parts from a table made from the game's files.");
         bool sl = g_snd_learn.load();
         if (ImGui::Checkbox("Learn each weapon's sounds from the game's reload (test)##reloadsoundlearn", &sl)) cmds += sl ? "reloadsoundlearn on\n" : "reloadsoundlearn off\n";
-        hint("On: at each of the game's own reloads, the magazine's and the bolt's moves are followed and each is given the game's sound played at that moment; "
-             "kept per weapon and used (after your picks, before the guesses). The log says what was matched. Off (default): picks and guesses only.");
+        hint("For testing: learns each weapon's sounds from the game's own reload.");
         bool rc = g_rec.load();
         if (ImGui::Checkbox("Record reloads, frame by frame, to fc5vr_reloadrec.csv (test)##reloadrec", &rc)) cmds += rc ? "reloadrec on\n" : "reloadrec off\n";
-        hint("On: every frame of the game's own reload and of your manual steps is written to bin\\fc5vr_reloadrec.csv: the left hand, the magazine, the slide and the fingers "
-             "against the gun, and the game's sounds, to compare the two. Not saved. Command reloadrec on/off.");
+        hint("For testing: records each reload frame by frame to a file. Command reloadrec.");
         bool gh = g_game_hand.load();
         if (ImGui::Checkbox("Reload button: show the game's own left hand (test)##reloadgamehand", &gh)) cmds += gh ? "reloadgamehand on\n" : "reloadgamehand off\n";
-        hint("On: while the game's reload runs from the reload button, the left hand is drawn where the game's animation has it on the gun, not at your controller. "
-             "Not saved. Command reloadgamehand on/off.");
+        hint("For testing: during the button reload, shows the game's own left hand. Command reloadgamehand.");
         if (listed) {
             const Geom g = geom(sig);
             ImGui::Text("Well (%s): %.3f %.3f %.3f, handle %.3f %.3f %.3f (weapon hand's controller: right, up, back)", g.measured ? "measured on the game's magazine" : "default",
                         g.well.x, g.well.y, g.well.z, g.handle.x, g.handle.y, g.handle.z);
             if (ImGui::Button("Set the well: hold a magazine where it sits seated, then click##reloadwellhere")) cmds += "reloadwellhere\n";
-            hint("With a magazine in your left hand, hold it where it would sit fully in the gun (upright as it goes in) and click: the well point and its axis are taken "
-                 "from your hands for this weapon. Point the controller's ray at the button and click with the right trigger.");
+            hint("Hold a magazine where it sits fully in the gun and click, to set where the magazine goes for this weapon.");
             if (ImGui::Button("Set the charging handle: hold the left controller on it, then click##reloadhandlehere")) cmds += "reloadhandlehere\n";
             {
                 uint32_t hc = 0, hb = 0;
@@ -5677,8 +5845,7 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
                 else
                     ImGui::TextDisabled("The gun's charging handle part: not found yet (the part nearest the blue ball moves)");
                 if (ImGui::Button("Try the next part as the charging handle##reloadhandlenext")) g_handle_next++;
-                hint("If pulling the handle moves the wrong part of the gun (or none), click this, then pull again: the next part of the gun nearest the blue "
-                     "ball is taken (each click the next). The choice is saved. It is also found by itself when the game reloads from empty.");
+                hint("If pulling the handle moves the wrong part, click this and pull again to try the next part.");
             }
         } else {
             ImGui::TextDisabled("Hold a weapon ticked above to see and set its magazine well and charging handle.");

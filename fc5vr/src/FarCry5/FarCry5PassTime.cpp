@@ -289,6 +289,14 @@ namespace fc5::passtime
         stamp(ctx, intern(fmt::format("{} {}", call_name(g_call), g_bind_key)));
     }
 
+    void mark(ID3D11DeviceContext* ctx, const char* label)
+    {
+        if (g_cur < 0 || !ctx || !label) return;
+        g_in_cs   = false;
+        g_last_cs = nullptr;
+        stamp(ctx, intern(fmt::format("{} {}", call_name(g_call), label)));
+    }
+
     void poll(ID3D11DeviceContext* ctx)
     {
         if (!g_ready || !ctx || g_target <= 0) return;

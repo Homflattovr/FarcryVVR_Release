@@ -46,11 +46,14 @@
 #include "FarCry5Gesture.h"
 #include "FarCry5GameRay.h"
 #include "FarCry5Spawn.h"
+#include "FarCry5SkinTable.h"
+#include "FarCry5WeaponTable.h"
 #include "FarCry5GameSound.h"
 #include "FarCry5Tobii.h"
 
 #include <windows.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -205,12 +208,20 @@ namespace fc5::lua
         };
         constexpr int          kWatchN = int(sizeof(kWatch) / sizeof(kWatch[0]));
         safetyhook::InlineHook g_watch_hooks[kWatchN]{};
+        bool                   g_cinewatch_tried = false;
+        int                    g_cinewatch_ok    = 0;
         std::atomic<uint64_t>  g_watch_calls{ 0 };
         safetyhook::InlineHook g_bars_hook{};
         std::atomic<int>       g_bars{ -1 };   // the last DisplayCinematicBlackBars (+0x1476B40, bool), -1 none yet
+        // Cutscenes: the calls that start (1) or stop (2) a cinematic sequence, counted always (FarCry5Stereo::update_cinematic).
+        constexpr int kWatchKind[]{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 0, 0 };
+        static_assert(int(sizeof(kWatchKind) / sizeof(kWatchKind[0])) == kWatchN, "one kind per watched binding");
+        std::atomic<uint64_t>  g_cine_starts{ 0 }, g_cine_stops{ 0 };
 
         template <int N> int __fastcall hk_script(void* L)
         {
+            if constexpr (kWatchKind[N] == 1) g_cine_starts.fetch_add(1, std::memory_order_relaxed);
+            if constexpr (kWatchKind[N] == 2) g_cine_stops.fetch_add(1, std::memory_order_relaxed);
             if (g_gs_on.load(std::memory_order_relaxed)) {
                 g_watch_calls++;
                 spdlog::info("[GameState] script calls {}", kWatch[N].name);
@@ -221,6 +232,15 @@ namespace fc5::lua
         template <int... I> void watch_install(std::integer_sequence<int, I...>, uint8_t* base, int& ok)
         {
             ((g_watch_hooks[I] = safetyhook::create_inline(reinterpret_cast<void*>(base + kWatch[I].rva), reinterpret_cast<void*>(&hk_script<I>)), ok += bool(g_watch_hooks[I])), ...);
+        }
+
+        // The watched bindings, installed once (by cine_watch or gamestate, whichever asks first).
+        void watch_hooks_install()
+        {
+            if (g_cinewatch_tried) return;
+            g_cinewatch_tried = true;
+            watch_install(std::make_integer_sequence<int, kWatchN>{}, g_base, g_cinewatch_ok);
+            spdlog::info("[Cinematic] the game's cinematic and camera script functions: {} of {} watched (cutscenes start and stop with them)", g_cinewatch_ok, kWatchN);
         }
 
         void __fastcall hk_bars(uint8_t on)
@@ -664,6 +684,87 @@ namespace fc5::lua
             g_carry_t = now_ms();
         }
 
+        // firstguntip (FarCry5FirstGun.cpp; author 16 Nov 15:05): every gun of the weapon table
+        // (selWeaponClass 1 pistol to 7 launcher) asked against the player's inventory the way slotcarried asks (vtable +0x130: an entry when carried),
+        // every 250 ms on the script thread while watched. The first read after the watch starts (or is reset) is the baseline; a gun carried at a
+        // later read and not at the one before is a new gun (a loot, a pick-up, a purchase or a reward).
+        constexpr int          kGunMax = 320;
+        uint64_t               g_gun_items[kGunMax]{};
+        int                    g_gun_n = 0;            // built at the first watch (render thread, before g_gun_on)
+        uint8_t                g_gun_had[kGunMax]{};   // script thread
+        bool                   g_gun_base = false;     // script thread
+        std::atomic<bool>      g_gun_on{ false }, g_gun_reset{ false };
+        std::atomic<int64_t>   g_gun_ask_t{ 0 };
+        std::atomic<uint64_t>  g_gun_new{ 0 };         // the last new gun's item
+        std::atomic<uint32_t>  g_gun_new_n{ 0 };       // new guns seen (grows)
+        std::atomic<int>       g_gun_count{ -1 };      // guns carried at the last read (-1 none yet)
+
+        int gun_read(uint64_t me, uint8_t* out)
+        {
+            __try {
+                uint8_t* h = nullptr;
+                reinterpret_cast<AmLookupFn>(g_base + 0xB27D60)(*reinterpret_cast<void**>(g_base + 0x4FAC1E0), &h, me);
+                if (!h) return 0;
+                int      r   = 0;
+                uint8_t* ent = *reinterpret_cast<uint8_t**>(h + 0x10);
+                if (ent) {
+                    uint8_t* inv  = nullptr;
+                    uint8_t* comp = *reinterpret_cast<uint8_t**>(ent + 0xC8);
+                    if (comp) {
+                        inv = reinterpret_cast<AmInvFn>(g_base + 0xF48EE0)(comp, ent + 0xA8, 0);
+                    } else {
+                        uint32_t key = *reinterpret_cast<uint32_t*>(reinterpret_cast<AmKeyFn>(g_base + 0xF64790)() + 0x18);
+                        inv          = reinterpret_cast<AmFindFn>(g_base + 0xCCD250)(ent, &key);
+                    }
+                    if (inv) {
+                        CarryFn fn = (*reinterpret_cast<CarryFn**>(inv))[0x130 / 8];
+                        for (int i = 0; i < g_gun_n; ++i) out[i] = fn(inv, g_gun_items[i]) != nullptr ? 1 : 0;
+                        r = 1;
+                    }
+                }
+                if (h != g_base + 0x4CB9E70 && InterlockedDecrement(reinterpret_cast<volatile LONG*>(h + 8)) == 0) reinterpret_cast<AmReleaseFn>(g_base + 0x26E320)(h);
+                return r;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return -1;
+            }
+        }
+
+        void gun_tick()
+        {
+            g_gun_ask_t = now_ms();
+            if (!g_local_id) return;
+            uint64_t       tmp = 0;
+            uint64_t*      idp = g_local_id(&tmp);
+            const uint64_t me  = idp ? *idp : 0;
+            if (me == 0 || me == ~0ull) return;
+            uint8_t now[kGunMax]{};
+            const int r = gun_read(me, now);
+            if (r < 0) {
+                g_carry_failed = true;
+                g_gun_on       = false;
+                spdlog::error("[FirstGun] a fault asking the inventory for the guns: slotcarried and the loot watch turned off");
+                return;
+            }
+            if (r == 0) return;
+            if (g_gun_reset.exchange(false)) g_gun_base = false;
+            int n = 0;
+            for (int i = 0; i < g_gun_n; ++i) n += now[i];
+            if (!g_gun_base) {
+                spdlog::info("[FirstGun] loot watch: {} of {} guns carried (the baseline)", n, g_gun_n);
+            } else {
+                for (int i = 0; i < g_gun_n; ++i)
+                    if (now[i] && !g_gun_had[i]) {
+                        const auto* w = fc5::weapons::find(g_gun_items[i]);
+                        spdlog::info("[FirstGun] loot watch: a new gun carried: {:x} {} ({} guns carried)", g_gun_items[i], w && w->name ? w->name : "?", n);
+                        g_gun_new = g_gun_items[i];
+                        g_gun_new_n++;
+                    }
+            }
+            std::memcpy(g_gun_had, now, sizeof(g_gun_had));
+            g_gun_base  = true;
+            g_gun_count = n;
+        }
+
         // gamedraw <item hex> | gameholster (tests, 3 Nov; research\2026-11-02_throwables.md): the game's own weapon change, with no pad. DrawWeapon's local path (+0x19C7CD0, from the binding's native +0x2F6F8F0),
         // for the player: with +0x1BB5140 (the component +0xEE40F0 (comp, entity + 0xA8, 0)) true, inventory vtable +0x3E8 (inventory, item), else +0x398 (inventory, item, true). With no name it draws slot 5, then 6.
         // gameholster: Holster's native (+0x2FA6CD0: bool (pawn id*), the game's put-away). On the script thread; a fault turns them off.
@@ -754,7 +855,7 @@ namespace fc5::lua
         using SpItemFn      = uint8_t(__fastcall*)(uint64_t* id, uint64_t item);
         using SpPosFn       = void(__fastcall*)(uint64_t* id, float* out);
         using SpSpawnFn     = uint64_t*(__fastcall*)(uint64_t* out, uint64_t archetype, float x, float y, float z, float ax, float ay, float az);
-        struct SpReq { uint64_t item, archetype; float fx, fy; float dist = 1.5f; bool veh = false, get_in = false; float yaw_add = 0.0f; };   // veh, dist, get_in: vehiclespawn; yaw_add: spawnyaw
+        struct SpReq { uint64_t item, archetype; float fx, fy; float dist = 1.5f; bool veh = false, get_in = false; float yaw_add = 0.0f; bool clear = false; };   // veh, dist, get_in: vehiclespawn; yaw_add: spawnyaw
         std::mutex            g_sp_mx;
         SpReq                 g_sp{};
         std::string           g_sp_status;
@@ -919,9 +1020,59 @@ namespace fc5::lua
         {
             float p[3]{};
             if (!sp_pos(me, p)) { sp_fail("the player's position"); return; }
-            const float x = p[0] + q.fx * q.dist, y = p[1] + q.fy * q.dist;
+            float x = p[0] + q.fx * q.dist, y = p[1] + q.fy * q.dist;
+            // clear: a flat empty patch instead. Each candidate centre (behind the player first, then round to ahead; 12, 22 and 34 m past the
+            // footprint) has ground rays cast a metre apart over the vehicle's footprint (half size 0.6 x its usual distance, 3.5 to 8 m), from
+            // 6 m above the player's feet (8 m long: a table, a crate, a vehicle, a wall or a roof is hit above the ground). Flat and empty:
+            // every ray hits, within 25 cm (plus 8 % of slope) of the centre's height, and within 25 cm of the plane through them all.
+            if (q.clear) {
+                const float R = std::clamp(q.dist * 0.6f, 3.5f, 8.0f);
+                const int   n = int(std::ceil(R));   // rays at -n..n metres
+                int         rays = 0;
+                auto        empty = [&](float cx, float cy) {
+                    float zc = 0.0f;
+                    rays++;
+                    if (!fc5::gameray::ground_z(cx, cy, p[2] + 6.0f, zc)) return false;
+                    double sz = 0.0, sxz = 0.0, syz = 0.0, sxx = 0.0;
+                    std::vector<std::array<float, 3>> pts;
+                    for (int i = -n; i <= n; ++i)
+                        for (int j = -n; j <= n; ++j) {
+                            float zz = 0.0f;
+                            rays++;
+                            if (!fc5::gameray::ground_z(cx + float(i), cy + float(j), p[2] + 6.0f, zz)) return false;
+                            if (std::abs(zz - zc) > 0.25f + 0.08f * std::sqrt(float(i * i + j * j))) return false;
+                            pts.push_back({ float(i), float(j), zz });
+                            sz += zz;
+                            sxz += double(i) * zz;
+                            syz += double(j) * zz;
+                            sxx += double(i) * double(i);
+                        }
+                    const double c = sz / double(pts.size()), a = sxx > 0.0 ? sxz / sxx : 0.0, b = sxx > 0.0 ? syz / sxx : 0.0;   // (the grid is symmetric)
+                    for (const auto& s : pts)
+                        if (std::abs(double(s[2]) - (c + a * s[0] + b * s[1])) > 0.25) return false;
+                    return true;
+                };
+                static const float kTurn[12]{ 180.0f, 150.0f, -150.0f, 120.0f, -120.0f, 90.0f, -90.0f, 60.0f, -60.0f, 30.0f, -30.0f, 0.0f };
+                static const float kFar[3]{ 12.0f, 22.0f, 34.0f };
+                bool               found = false;
+                for (int f = 0; f < 3 && !found; ++f)
+                    for (int t = 0; t < 12 && !found; ++t) {
+                        const float a  = kTurn[t] / 57.29578f, ca = std::cos(a), sa = std::sin(a);
+                        const float dx = q.fx * ca - q.fy * sa, dy = q.fx * sa + q.fy * ca, away = R + kFar[f];
+                        const float cx = p[0] + dx * away, cy = p[1] + dy * away;
+                        if (!empty(cx, cy)) continue;
+                        found = true;
+                        x     = cx;
+                        y     = cy;
+                        spdlog::info("[Spawn] vehicle {:x}: a flat empty patch of {:.0f} x {:.0f} m found {:.0f} m away, {:+.0f} deg from where you face ({} ground rays cast)", q.archetype,
+                                     2.0f * R, 2.0f * R, away, kTurn[t], rays);
+                    }
+                if (!found)
+                    spdlog::info("[Spawn] vehicle {:x}: *** no flat empty patch of {:.0f} x {:.0f} m within {:.0f} m ({} ground rays cast): placed ahead as usual, it may land on something", q.archetype,
+                                 2.0f * R, 2.0f * R, R + 34.0f, rays);
+            }
             float       z = p[2];
-            const bool  ground = fc5::gameray::ground_z(x, y, p[2] + 3.0f, z);   // (8 m down from 3 m above the player's feet)
+            const bool  ground = fc5::gameray::ground_z(x, y, p[2] + (q.clear ? 6.0f : 3.0f), z);   // (8 m down from 3 m above the player's feet; clear: from 6 m)
             // The entity's forward (+y) turned onto the player's (fx, fy), counter-clockwise from above: a guess at the game's convention, the log says what it got.
             const float yaw = std::atan2(-q.fx, q.fy) * 57.29578f;
             uint64_t    id  = 0;
@@ -1072,6 +1223,45 @@ namespace fc5::lua
                             dropped = fmt::format("{:x} kept: {}", cur, pick ? "the game made no entity for it" : "it has no world entity");
                         }
                     }
+                    // melee fix 1 (spawnhand, the 12 Nov run on lodge-night: Bat, Pipe_01 and Shovel_Short "added, but the game holds <a gun> after 5
+                    // tries" while the save carried its own Pipe_02; Shovel_Long and Hoe_Long, carried beside that pipe, came to the hand): a
+                    // one-handed melee weapon is taken to need the game's one melee place. Another one-handed melee weapon the inventory holds
+                    // (not the one in the hand, dropped above) is dropped the same way first: its world entity placed, then the item removed.
+                    // Not proven in the game yet: the "after 5 tries" line below now says whether the inventory has the item.
+                    auto one_melee = [](uint64_t item) {
+                        for (const auto& e : fc5::weapons::kTable)
+                            if (e.item == item) return e.holster == 5 && std::strstr(e.name, "/OneHanded/") != nullptr;
+                        return false;
+                    };
+                    if (g_carry_ok && !g_carry_failed.load() && one_melee(q.item)) {
+                        uint64_t items[kCarry]{};
+                        int      ans[kCarry]{}, n = 0;
+                        bool     bad = false;
+                        auto     flush = [&]() {
+                            if (n > 0 && carry_read(me, items, ans) > 0) {
+                                for (int i = 0; i < n && !bad; ++i) {
+                                    if (!ans[i]) continue;
+                                    const uint64_t pick = fc5::spawn::pickup_of(items[i]);
+                                    uint64_t       id   = 0;
+                                    if (pick != 0 && !sp_place(me, pick, q.fx, q.fy, 0.9f, id)) { bad = true; break; }
+                                    if (id != 0) {
+                                        if (!sp_item_count(0x2FB3740, me, items[i], -1)) { bad = true; break; }
+                                        dropped += fmt::format("; the melee weapon carried, {:x}, dropped too", items[i]);
+                                    }
+                                }
+                            }
+                            n = 0;
+                            std::fill(std::begin(items), std::end(items), 0ull);
+                        };
+                        for (const auto& e : fc5::weapons::kTable) {
+                            if (bad) break;
+                            if (e.item == q.item || e.item == cur || !one_melee(e.item)) continue;
+                            items[n++] = e.item;
+                            if (n == kCarry) flush();
+                        }
+                        if (!bad) flush();
+                        if (bad) { sp_fail("the melee place's swap"); return; }
+                    }
                     if (!sp_item_count(0x2F90900, me, q.item, 1)) { sp_fail("AddItem"); return; }
                     if (!sp_refill(me, q.item)) { sp_fail("the clip's refill"); return; }
                     const int r = draw_item(me, q.item);
@@ -1091,7 +1281,15 @@ namespace fc5::lua
                 sp_say(fmt::format("item {:x} in the hand", want));
                 g_sp_want = 0;
             } else if (++g_sp_tries > 4) {
-                sp_say(fmt::format("item {:x} added, but the game holds {:x} after 5 tries", want, cur));
+                // (melee fix 1: is it in the inventory at all?)
+                std::string have;
+                if (g_carry_ok && !g_carry_failed.load()) {
+                    uint64_t it[kCarry]{};
+                    int      an[kCarry]{};
+                    it[0] = want;
+                    if (carry_read(me, it, an) > 0) have = an[0] ? ": the inventory has it, the game does not draw it" : ": the inventory has no entry for it (AddItem did not take)";
+                }
+                sp_say(fmt::format("item {:x} added, but the game holds {:x} after 5 tries{}", want, cur, have));
                 g_sp_want = 0;
             } else {
                 const int r = draw_item(me, want);
@@ -1530,6 +1728,53 @@ namespace fc5::lua
                          pz, list);
         }
 
+        // melee fix 4 (the author's crash 12 Nov 21:06:36: the game's own int3 at FC_m64+0x36e0b15, 0.55 s after a 200 damage stim took the ray's entity
+        // 1d39cb8a65c08661 from 100 to -100; on 27 Oct the same id read -99900, not a pawn). On the script thread only. The stim goes only to an entity
+        // that reads a living pawn's health now (above 0, below 100000) and has not read 0 or below, or not a pawn, in the last 5 s (g_bad); the damage
+        // sent is at most that health (it ends at 0, not far below); a target taken to 0 or below is remembered (g_bad) and marks g_killed_t (the
+        // game's melee press for that contact is dropped, FarCry5Melee.cpp). Each refusal logs one line a second at most.
+        struct BadId { uint64_t id{ 0 }; int64_t t{ 0 }; };
+        std::array<BadId, 16> g_bad{};
+        int                   g_bad_at = 0;
+        std::atomic<int64_t>  g_killed_t{ 0 };
+        int64_t               g_refuse_said = 0;
+        void mark_bad(uint64_t id)
+        {
+            g_bad[g_bad_at] = BadId{ id, now_ms() };
+            g_bad_at        = (g_bad_at + 1) % int(g_bad.size());
+        }
+        bool bad_recent(uint64_t id)
+        {
+            for (const auto& b : g_bad)
+                if (b.id == id && now_ms() - b.t < 5000) return true;
+            return false;
+        }
+        bool stim_guarded(uint64_t target, uint64_t player, float& h0, float& h1, float& sent)
+        {
+            h0 = g_health ? g_health(&target) : -1.0f;
+            const bool living = std::isfinite(h0) && h0 > 0.0f && h0 < 100000.0f;
+            if (!living || bad_recent(target) || target == player || target == 0 || target == ~0ull) {
+                if (!living) mark_bad(target);
+                if (now_ms() - g_refuse_said > 1000) {
+                    g_refuse_said = now_ms();
+                    spdlog::info("[Melee] meleedamage: entity {:x} {}: no damage sent", target,
+                                 !living ? fmt::format("reads health {:.1f} (dead, or not a pawn)", h0) : target == player ? std::string{ "is the player" } : std::string{ "read dead or not a pawn in the last 5 s" });
+                }
+                return false;
+            }
+            sent = std::min(g_dmg_amount.load(), h0);
+            g_stim(&target, player, sent);
+            h1 = g_health ? g_health(&target) : -1.0f;
+            g_dmg_sent++;
+            g_after_id   = target;
+            g_after_tick = g_tick_n.load();
+            g_after_h0   = h0;
+            if (!(h1 > 0.0f)) {
+                mark_bad(target);
+                g_killed_t = now_ms();
+            }
+            return true;
+        }
         // On the game's script thread: the recorded entity nearest the body's root (across the ground within 0.7 m, its root within
         // 1.2 m up or down), not the player; then the damage stim from the player to it.
         void damage_tick()
@@ -1547,14 +1792,9 @@ namespace fc5::lua
                     spdlog::info("[Melee] meleedamage (find only): entity {:x}, {} ms after the hit", target, ms);
                     return;
                 }
-                const float h0 = g_health ? g_health(&target) : -1.0f;
-                g_stim(&target, player, g_dmg_amount.load());
-                const float h1 = g_health ? g_health(&target) : -1.0f;
-                g_dmg_sent++;
-                g_after_id   = target;
-                g_after_tick = g_tick_n.load();
-                g_after_h0   = h0;
-                spdlog::info("[Melee] meleedamage: {:.0f} damage sent to entity {:x} from the player {:x} ({} ms after the hit); its health {:.1f} -> {:.1f}", g_dmg_amount.load(), target, player, ms, h0, h1);
+                float h0 = 0.0f, h1 = 0.0f, sent = 0.0f;
+                if (!stim_guarded(target, player, h0, h1, sent)) return;
+                spdlog::info("[Melee] meleedamage: {:.0f} damage sent to entity {:x} from the player {:x} ({} ms after the hit); its health {:.1f} -> {:.1f}", sent, target, player, ms, h0, h1);
                 return;
             }
             const float    bx = g_dmg_x.load(), by = g_dmg_y.load(), bz = g_dmg_z.load();
@@ -1586,15 +1826,10 @@ namespace fc5::lua
                 return;
             }
             uint64_t    target = best;
-            const float h0     = g_health ? g_health(&target) : -1.0f;
-            g_stim(&target, player, g_dmg_amount.load());
-            const float h1 = g_health ? g_health(&target) : -1.0f;
-            g_dmg_sent++;
-            g_after_id   = best;
-            g_after_tick = g_tick_n.load();
-            g_after_h0   = h0;
+            float h0 = 0.0f, h1 = 0.0f, sent = 0.0f;
+            if (!stim_guarded(target, player, h0, h1, sent)) return;
             spdlog::info("[Melee] meleedamage: {:.0f} damage sent to entity {:x} from the player {:x} ({:.2f} m from the body's root, {} ms after the hit); its health {:.1f} -> {:.1f}",
-                         g_dmg_amount.load(), best, player, best_d, ms, h0, h1);
+                         sent, best, player, best_d, ms, h0, h1);
         }
 
         uint8_t* rel_target(uint8_t* at)   // E8 / E9 rel32
@@ -1602,10 +1837,232 @@ namespace fc5::lua
             return at + 5 + *reinterpret_cast<int32_t*>(at + 1);
         }
 
+        // playerskin (author 15 Nov 13:51Z, 14:40Z "Test many skins to make sure hands and body
+        // work correctly"; research\2026-11-15_playerskin\README.md). The game's Lua natives, read statically from this build (15 Nov, dumpbin):
+        //   EquipWolfskinItem          +0x2F9AD80 (uint64_t* id, uint64_t item): the item looked up with +0x1ADFE60 (null: nothing done)
+        //   HasCustomizationEquipped   +0x2FA5C10 (uint64_t id BY VALUE, uint64_t item) -> bool (its own lookup, +0x1E867B0)
+        //   IsWearingWolfskinItem      +0x2FAA910 (uint64_t* id, uint64_t item) -> bool
+        //   ForceCharacterCustomization +0x2F9C450 (uint64_t* id): +0x0EECD50(comp, 0x37); run R2 (15 Nov): the game pauses and opens its wardrobe menu
+        //   OpenAvatarCreationMenu's binding +0x2F826F0 (never reads its Lua state: native +0x15F8520(*(+0x5055150), 0, 0x7B, 1, 1) when that is set)
+        using SkEquipFn = void(__fastcall*)(uint64_t* id, uint64_t item);
+        using SkHasFn   = bool(__fastcall*)(uint64_t id, uint64_t item);
+        using SkWearFn  = bool(__fastcall*)(uint64_t* id, uint64_t item);
+        using SkForceFn = void(__fastcall*)(uint64_t* id);
+        using SkMenuFn  = int(__fastcall*)(void* lua);
+        struct SkReq { int kind; uint64_t id; bool force; std::string name; };   // kind 0 equip, 1 force, 2 worn, 3 menu
+        std::mutex            g_sk_mx;
+        std::vector<SkReq>    g_sk_q;
+        std::string           g_sk_status;
+        std::atomic<bool>     g_sk_due{ false }, g_sk_failed{ false };
+        bool                  g_sk_tried = false, g_sk_ok = false, g_sk_menu_ok = false;
+        int                   g_sk_worn_at = -1;                    // skinworn: the next table row (-1: not running)
+        int                   g_sk_worn_n[4]{};                     // ... true answers: has shop, has desc, wearing shop, wearing desc
+        uint64_t              g_sk_check_id = 0;                    // skinequip: the item asked again 60 updates later
+        uint32_t              g_sk_check_tick = 0;
+        std::string           g_sk_check_name;
+
+        void sk_say(const std::string& s)
+        {
+            spdlog::info("[Skin] {}", s);
+            std::lock_guard _{ g_sk_mx };
+            g_sk_status = s;
+        }
+
+        // Each call alone under SEH (no C++ objects here). -1: a fault.
+        int sk_equip_g(uint64_t me, uint64_t item)
+        {
+            __try {
+                uint64_t id = me;
+                reinterpret_cast<SkEquipFn>(g_base + 0x2F9AD80)(&id, item);
+                return 1;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+        }
+        int sk_force_g(uint64_t me)
+        {
+            __try {
+                uint64_t id = me;
+                reinterpret_cast<SkForceFn>(g_base + 0x2F9C450)(&id);
+                return 1;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+        }
+        int sk_has_g(uint64_t me, uint64_t item)
+        {
+            if (item == 0) return 0;
+            __try {
+                return reinterpret_cast<SkHasFn>(g_base + 0x2FA5C10)(me, item) ? 1 : 0;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+        }
+        int sk_wear_g(uint64_t me, uint64_t item)
+        {
+            if (item == 0) return 0;
+            __try {
+                uint64_t id = me;
+                return reinterpret_cast<SkWearFn>(g_base + 0x2FAA910)(&id, item) ? 1 : 0;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+        }
+        int sk_menu_g()
+        {
+            __try {
+                reinterpret_cast<SkMenuFn>(g_base + 0x2F826F0)(nullptr);
+                return 1;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+        }
+
+        const char* sk_name_of(uint64_t id)
+        {
+            for (const auto& e : fc5::skin::kSkins)
+                if (e.shop == id || e.desc == id || e.other == id) return e.name;
+            return "not in the table";
+        }
+
+        void sk_fault(const char* what)
+        {
+            g_sk_failed = true;
+            {
+                std::lock_guard _{ g_sk_mx };
+                g_sk_q.clear();
+            }
+            g_sk_worn_at = -1;
+            sk_say(fmt::format("a fault in {}: the skin commands are off until the game restarts", what));
+        }
+
+        void skin_tick()
+        {
+            if (!g_local_id || g_sk_failed.load()) { g_sk_due = false; return; }
+            uint64_t       tmp = 0;
+            uint64_t*      idp = g_local_id(&tmp);
+            const uint64_t me  = idp ? *idp : 0;
+            if (me == 0 || me == ~0ull) return;   // no player yet: asked again at the next update
+            std::vector<SkReq> q;
+            {
+                std::lock_guard _{ g_sk_mx };
+                q.swap(g_sk_q);
+            }
+            for (const auto& r : q) {
+                if (r.kind == 0) {
+                    const int h0 = sk_has_g(me, r.id), w0 = sk_wear_g(me, r.id);
+                    if (sk_equip_g(me, r.id) < 0) { sk_fault("EquipWolfskinItem"); return; }
+                    const int f = r.force ? sk_force_g(me) : 0;
+                    if (f < 0) { sk_fault("ForceCharacterCustomization"); return; }
+                    const int h1 = sk_has_g(me, r.id), w1 = sk_wear_g(me, r.id);
+                    sk_say(fmt::format("skinequip {:x} ({}): EquipWolfskinItem called{}; HasCustomizationEquipped {} -> {}, IsWearingWolfskinItem {} -> {}", r.id, r.name,
+                                       r.force ? ", then ForceCharacterCustomization" : "", h0, h1, w0, w1));
+                    g_sk_check_id   = r.id;
+                    g_sk_check_tick = g_tick_n.load();
+                    g_sk_check_name = r.name;
+                } else if (r.kind == 1) {
+                    if (sk_force_g(me) < 0) { sk_fault("ForceCharacterCustomization"); return; }
+                    sk_say("skinwardrobe: ForceCharacterCustomization called for the player (the game opens its wardrobe menu)");
+                } else if (r.kind == 2) {
+                    g_sk_worn_at = 0;
+                    for (int& n : g_sk_worn_n) n = 0;
+                    spdlog::info("[Skin] skinworn: asking the game about {} look items for the player {:x}", std::size(fc5::skin::kSkins), me);
+                } else if (r.kind == 3) {
+                    if (!g_sk_menu_ok) { sk_say("skinmenu: not called (unexpected code at OpenAvatarCreationMenu)"); continue; }
+                    const void* inst = *reinterpret_cast<void* const*>(g_base + 0x5055150);
+                    if (!inst) { sk_say("skinmenu: the game's menu manager is not set: nothing opened"); continue; }
+                    if (sk_menu_g() < 0) { sk_fault("OpenAvatarCreationMenu"); return; }
+                    sk_say(fmt::format("skinmenu: OpenAvatarCreationMenu called (menu manager {})", inst));
+                }
+            }
+            // skinworn: 64 rows per update.
+            constexpr int kRows = int(std::size(fc5::skin::kSkins));
+            if (g_sk_worn_at >= 0) {
+                const int end = std::min(kRows, g_sk_worn_at + 64);
+                for (int i = g_sk_worn_at; i < end; ++i) {
+                    const auto& e = fc5::skin::kSkins[i];
+                    const int a = sk_has_g(me, e.shop), b = sk_has_g(me, e.desc), c = sk_wear_g(me, e.shop), d = sk_wear_g(me, e.desc);
+                    if (a < 0 || b < 0 || c < 0 || d < 0) { sk_fault(fmt::format("skinworn at {}", e.name).c_str()); return; }
+                    g_sk_worn_n[0] += a; g_sk_worn_n[1] += b; g_sk_worn_n[2] += c; g_sk_worn_n[3] += d;
+                    if (a || b || c || d)
+                        spdlog::info("[Skin] worn: {} {} ({}, {}): has shop {:x} {}, has desc {:x} {}, wearing shop {}, wearing desc {}", e.slot, e.name, e.gender, e.premium ? "premium" : "standard",
+                                     e.shop, a, e.desc, b, c, d);
+                }
+                g_sk_worn_at = end;
+                if (end >= kRows) {
+                    g_sk_worn_at = -1;
+                    sk_say(fmt::format("skinworn: {} items asked; true: HasCustomizationEquipped shop id {}, desc id {}; IsWearingWolfskinItem shop id {}, desc id {}", kRows,
+                                       g_sk_worn_n[0], g_sk_worn_n[1], g_sk_worn_n[2], g_sk_worn_n[3]));
+                }
+            }
+            if (g_sk_check_id && g_tick_n.load() - g_sk_check_tick >= 60) {
+                const int h = sk_has_g(me, g_sk_check_id), w = sk_wear_g(me, g_sk_check_id);
+                spdlog::info("[Skin] skinequip {:x} ({}) 60 updates later: HasCustomizationEquipped {}, IsWearingWolfskinItem {}", g_sk_check_id, g_sk_check_name, h, w);
+                g_sk_check_id = 0;
+            }
+            std::lock_guard _{ g_sk_mx };
+            g_sk_due = !g_sk_q.empty() || g_sk_worn_at >= 0 || g_sk_check_id != 0;
+        }
+
+        // firstgunpause (FarCry5FirstGun.cpp): the native behind the Lua function PauseGame (+0x2FAC5C0, called by its binding +0x2F52770 with
+        // the script's bool in cl): (bool) -> the game's pause manager ([+0x5055150], nothing done while it is null) and a jmp into protected
+        // code with (manager, bool, 1). Read statically from this build's FC_m64.dll (16 Nov), not run yet. Made on the game's script thread:
+        // at the next game update (game_tick) or the next script string the game runs (hk_exec), whichever comes first; the resume also from
+        // the render thread if neither comes within 1 s of the ask (the game update may stop while the game is paused), so a pause the mod
+        // made always ends.
+        using PauseFn = void(__fastcall*)(uint8_t pause);
+        PauseFn                g_pause_fn      = nullptr;
+        uint8_t**              g_pause_byte_g  = nullptr;   // IsGamePaused's global (*(+0x4EB59F8) + 0x68)
+        bool                   g_pause_tried   = false;     // render thread
+        std::atomic<int>       g_pause_want{ -1 };          // -1 nothing asked, 1 pause, 0 resume
+        std::atomic<bool>      g_pause_mod{ false };        // the game paused by the mod (a resume owed)
+        std::atomic<int64_t>   g_pause_ask_ms{ 0 };
+        std::atomic<uint64_t>  g_pause_calls{ 0 };
+        std::mutex             g_pause_mx;                  // one call at a time (script thread, or the render thread's fallback)
+
+        int pause_byte_read()
+        {
+            if (!g_pause_byte_g) return -1;
+            __try {
+                const uint8_t* g = *g_pause_byte_g;
+                return g ? g[0x68] : -1;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return -2;
+            }
+        }
+
+        bool pause_call_seh(uint8_t v)
+        {
+            __try {
+                g_pause_fn(v);
+                return true;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return false;
+            }
+        }
+
+        // The asked pause or resume, made now (where: for the log).
+        void pause_apply(const char* where)
+        {
+            const int want = g_pause_want.load();
+            if (want < 0 || !g_pause_fn) return;
+            std::lock_guard _{ g_pause_mx };
+            if (g_pause_want.load() != want) return;
+            if ((want == 1) == g_pause_mod.load()) {   // already so
+                g_pause_want = -1;
+                return;
+            }
+            const int  before = pause_byte_read();
+            const bool ok     = pause_call_seh(want == 1 ? 1 : 0);
+            const int  after  = pause_byte_read();
+            g_pause_calls++;
+            g_pause_want = -1;
+            if (!ok) {
+                g_pause_fn  = nullptr;
+                g_pause_mod = false;
+                spdlog::error("[FirstGun] PauseGame({}) faulted ({}): the game is not paused by the mod any more (controls held only)", want == 1, where);
+                return;
+            }
+            g_pause_mod = want == 1;
+            spdlog::info("[FirstGun] PauseGame({}) called {} {:.0f} ms after the ask; IsGamePaused's byte {} -> {}", want == 1, where,
+                         double(now_ms() - g_pause_ask_ms.load()), before, after);
+        }
+
         bool __fastcall hk_exec(void* self, const char* code, bool raw)
         {
             g_game_tid = GetCurrentThreadId();
             g_game_calls++;
+            pause_apply("on the script thread (a script string)");
             return g_hook.call<bool>(self, code, raw);
         }
 
@@ -1614,6 +2071,7 @@ namespace fc5::lua
         {
             g_tick_tid = GetCurrentThreadId();
             g_tick_n.fetch_add(1, std::memory_order_relaxed);
+            if (g_pause_want.load() >= 0 && g_game_tid.load() == GetCurrentThreadId()) pause_apply("at the game update");   // firstgunpause (in menus too)
             if (g_after_id && g_in_play.load() && g_tick_n.load() - g_after_tick >= 30 && g_game_tid.load() == GetCurrentThreadId()) {
                 uint64_t id = g_after_id;
                 g_after_id  = 0;
@@ -1631,8 +2089,10 @@ namespace fc5::lua
             const bool am_due  = g_am_on.load() && (g_am_fast.load() || now_ms() - g_am_ask_t >= 100);     // reloadmanual (every update while the clip is low)
             const bool bm_due  = g_bmb_on.load() && now_ms() - g_bmb_t >= 100;      // bonemapbody
             const bool carry_due = carry_on() && now_ms() - g_carry_ask_t.load() >= 150;   // slotcarried
+            const bool sk_due  = g_sk_due.load();                                     // playerskin
+            const bool gun_due = g_gun_on.load() && now_ms() - g_gun_ask_t.load() >= 250;   // firstguntip's loot watch
             if (!g_in_play.load() || (!g_fov_pending.load() && !g_dmg_pending.load() && !g_probe_pending.load() && !g_self_pending.load() && !veh_due && !gs_due && !snd_due && !thr_due && !drw_due && !ray_due && !eq_due && !am_due &&
-                                      !bm_due && !sp_due && !fill_due && !carry_due)) return;
+                                      !bm_due && !sp_due && !fill_due && !carry_due && !sk_due && !gun_due)) return;
             const unsigned long script_tid = g_game_tid.load();
             if (script_tid == 0 || script_tid != GetCurrentThreadId()) {
                 static int told = 0;
@@ -1661,6 +2121,8 @@ namespace fc5::lua
             if (am_due) am_tick();                     // reloadmanual
             if (bm_due) bmb_tick();                    // bonemapbody
             if (carry_due) carry_tick();               // slotcarried
+            if (sk_due) skin_tick();                   // playerskin
+            if (gun_due) gun_tick();                   // firstguntip's loot watch
             if (g_dmg_pending.load()) damage_tick();   // meleedamage
             if (g_probe_pending.load()) probe_tick();
             if (g_self_pending.exchange(false) && g_stim && g_local_id) {
@@ -1773,6 +2235,8 @@ namespace fc5::lua
         return g_watch_ok;
     }
 
+    bool damage_killed_recent(int64_t ms) { const int64_t k = g_killed_t.load(); return k != 0 && now_ms() - k < ms; }
+
     void queue_damage_id(uint64_t id, float amount, bool send)
     {
         if (!g_watch.load()) return;
@@ -1810,6 +2274,58 @@ namespace fc5::lua
         g_probe_y       = y;
         g_probe_z       = z;
         g_probe_pending = true;
+    }
+
+    uint64_t entity_at_root_seh(float x, float y, float z, float& health, float& dist, char* buf, size_t nbuf);   // melee fix 14b (below): ~0: a fault
+
+    uint64_t entity_at_root(float x, float y, float z, float& health, float& dist, std::string& why)
+    {
+        health = -1.0f;
+        dist   = 0.0f;
+        if (!g_watch.load() || !g_pos) { why = "the game's entity lookup is not watched (no entities recorded)"; return 0; }
+        char           buf[240]{};
+        const uint64_t r = entity_at_root_seh(x, y, z, health, dist, buf, sizeof(buf));
+        if (r == ~0ull) why = "a fault reading the recorded entities";
+        else if (r == 0) why = buf;
+        return r == ~0ull ? 0 : r;
+    }
+
+    uint64_t entity_at_root_seh(float x, float y, float z, float& health, float& dist, char* buf, size_t nbuf)
+    {
+        __try {
+            uint64_t       tmp    = 0;
+            uint64_t*      idp    = g_local_id ? g_local_id(&tmp) : nullptr;
+            const uint64_t player = idp ? *idp : 0;
+            const uint32_t now    = g_tick_n.load();
+            uint64_t       best   = 0;
+            float          best_d = 0.7f, best_h = -1.0f, near_d = 1e9f;
+            int            looked = 0, dead = 0;
+            for (int k = 0; k < kIds; ++k) {
+                uint64_t id = g_ids[k].load(std::memory_order_relaxed);
+                if (id == 0 || id == player || now - g_id_tick[k].load(std::memory_order_relaxed) > 120) continue;
+                looked++;
+                uint64_t    a = id;
+                const float ex = g_pos(&a, 0), ey = g_pos(&a, 1), ez = g_pos(&a, 2);
+                const float dh = std::sqrt((ex - x) * (ex - x) + (ey - y) * (ey - y));
+                if (std::abs(ez - z) >= 1.2f) continue;
+                near_d = std::min(near_d, dh);
+                if (dh >= best_d) continue;
+                uint64_t    hb = id;
+                const float h  = g_health ? g_health(&hb) : -1.0f;
+                if (!(std::isfinite(h) && h > 0.0f && h < 100000.0f)) { dead++; continue; }
+                best = id; best_d = dh; best_h = h;
+            }
+            if (!best) {
+                std::snprintf(buf, nbuf, "none of the %d entities recorded in the last 120 updates is a living pawn within 0.7 m of the body's root (nearest %.2f m; %d near but dead or not a pawn)",
+                              looked, double(near_d < 1e8f ? near_d : 99.0f), dead);
+                return 0;
+            }
+            health = best_h;
+            dist   = best_d;
+            return best;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return ~0ull;
+        }
     }
 
     std::string damage_status()
@@ -1905,6 +2421,28 @@ namespace fc5::lua
         return -1;
     }
 
+    void gun_watch(bool on)
+    {
+        if (!on) {
+            if (g_gun_on.exchange(false)) g_gun_reset = true;
+            return;
+        }
+        if (g_gun_on.load() || !carry_usable()) return;
+        if (g_gun_n == 0) {
+            for (const auto& w : fc5::weapons::kTable)
+                if (w.cls >= 1 && w.cls <= 7 && g_gun_n < kGunMax) g_gun_items[g_gun_n++] = w.item;
+            spdlog::info("[FirstGun] loot watch: {} guns of the weapon table (selWeaponClass 1-7) asked against the inventory every 250 ms in play", g_gun_n);
+        }
+        g_gun_reset = true;
+        g_gun_on    = true;
+    }
+
+    uint32_t gun_new_count(uint64_t* item)
+    {
+        if (item) *item = g_gun_new.load();
+        return g_gun_new_n.load();
+    }
+
     void clip_fill_request(int mode) { g_fill_mode = mode; g_fill_short = false; g_fill_req = true; }
     uint64_t weapon_object() { return (g_am_on.load() && now_ms() - g_am_t.load() < 1000) ? g_am_obj.load() : 0; }
     void reserve_take_request(int n) { g_take_req += n; }
@@ -1966,13 +2504,13 @@ namespace fc5::lua
                           g_vs_seat_ok ? "" : "no seating", g_vs_remove_ok ? "" : (g_vs_seat_ok ? "no removal" : ", no removal"));
     }
 
-    void vehicle_request(uint64_t archetype, float fx, float fy, float dist, bool get_in)
+    void vehicle_request(uint64_t archetype, float fx, float fy, float dist, bool get_in, bool clear)
     {
         if (!sp_usable()) return;
         vs_check();
         {
             std::lock_guard _{ g_sp_mx };
-            g_sp = SpReq{ 0, archetype, fx, fy, dist, true, get_in };
+            g_sp = SpReq{ 0, archetype, fx, fy, dist, true, get_in, 0.0f, clear };
         }
         g_sp_pending = true;
     }
@@ -1999,6 +2537,69 @@ namespace fc5::lua
         std::lock_guard _{ g_sp_mx };
         return g_sp_status;
     }
+
+    // playerskin: the game's calls checked once (first bytes of each native, the menu binding's call target).
+    static bool sk_usable()
+    {
+        if (!g_ready) { sk_say("not asked: the game's scripts are not ready"); return false; }
+        if (!g_sk_tried) {
+            g_sk_tried = true;
+            static const uint8_t kEquip[]{ 0x48, 0x8B, 0xC4, 0x55, 0x53, 0x48, 0x8D, 0x68, 0xA1, 0x48, 0x81, 0xEC, 0xF8, 0x00, 0x00, 0x00 };
+            static const uint8_t kForce[]{ 0x48, 0x89, 0x5C, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x09, 0xE8 };
+            static const uint8_t kHas[]{ 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9 };
+            static const uint8_t kWear[]{ 0x40, 0x53, 0x57, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x09, 0x48, 0x89, 0x6C, 0x24, 0x48, 0x48, 0x8B, 0xEA };
+            static const uint8_t kMenu[]{ 0x48, 0x83, 0xEC, 0x38, 0x48, 0x8B, 0x0D };
+            static const uint8_t kMenuNative[]{ 0x44, 0x89, 0x44, 0x24, 0x18, 0x55, 0x53, 0x56, 0x41, 0x54, 0x41, 0x55 };
+            g_sk_ok = std::memcmp(g_base + 0x2F9AD80, kEquip, sizeof(kEquip)) == 0 && std::memcmp(g_base + 0x2F9C450, kForce, sizeof(kForce)) == 0 &&
+                      std::memcmp(g_base + 0x2FA5C10, kHas, sizeof(kHas)) == 0 && std::memcmp(g_base + 0x2FAA910, kWear, sizeof(kWear)) == 0 &&
+                      g_base[0x1ADFE60] == 0xE9 && g_base[0x1E867B0] == 0xE9;
+            // the binding: mov rcx,[rip+x] -> +0x5055150, then the call at +0x1E -> the native
+            g_sk_menu_ok = std::memcmp(g_base + 0x2F826F0, kMenu, sizeof(kMenu)) == 0 && g_base + 0x2F826F0 + 11 + *reinterpret_cast<int32_t*>(g_base + 0x2F826F0 + 7) == g_base + 0x5055150 &&
+                           g_base[0x2F8270E] == 0xE8 && rel_target(g_base + 0x2F8270E) == g_base + 0x15F8520 && std::memcmp(g_base + 0x15F8520, kMenuNative, sizeof(kMenuNative)) == 0;
+            spdlog::info("[Skin] the game's look calls: Equip/Force/Has/IsWearing {}, OpenAvatarCreationMenu {}; {} look items in the table", g_sk_ok ? "as read" : "UNEXPECTED CODE: not used",
+                         g_sk_menu_ok ? "as read" : "UNEXPECTED CODE: not used", std::size(fc5::skin::kSkins));
+        }
+        if (g_sk_failed.load()) { sk_say("off: an earlier fault"); return false; }
+        return true;
+    }
+
+    static void sk_push(SkReq r)
+    {
+        std::lock_guard _{ g_sk_mx };
+        g_sk_q.push_back(std::move(r));
+        g_sk_due = true;
+    }
+
+    void skin_equip(uint64_t id, bool force, const char* name)
+    {
+        if (!sk_usable()) return;
+        if (!g_sk_ok) { sk_say("not used: this game's code is not what it was read from"); return; }
+        sk_push(SkReq{ 0, id, force, name && *name ? std::string{ name } : std::string{ sk_name_of(id) } });
+    }
+    void skin_force()
+    {
+        if (!sk_usable()) return;
+        if (!g_sk_ok) { sk_say("not used: this game's code is not what it was read from"); return; }
+        sk_push(SkReq{ 1, 0, true, {} });
+    }
+    void skin_worn()
+    {
+        if (!sk_usable()) return;
+        if (!g_sk_ok) { sk_say("not used: this game's code is not what it was read from"); return; }
+        sk_push(SkReq{ 2, 0, false, {} });
+    }
+    void skin_menu()
+    {
+        if (!sk_usable()) return;
+        sk_push(SkReq{ 3, 0, false, {} });
+    }
+    std::string skin_status()
+    {
+        std::lock_guard _{ g_sk_mx };
+        return g_sk_status;
+    }
+
+    bool spawn_drawing() { return g_sp_pending.load() || g_sp_want.load() != 0; }
 
     uint64_t selected_throwable()
     {
@@ -2218,14 +2819,25 @@ namespace fc5::lua
                 spdlog::error("[GameState] gamestate: unexpected code ({}{}): not used", bad.empty() ? "" : "changed:", bad.empty() ? " GetPawnVehicle" : bad);
             }
         }
-        if (g_gs_ok && !g_watch_hooks[0] && !g_bars_hook) {
-            int hooked = 0;
-            watch_install(std::make_integer_sequence<int, kWatchN>{}, g_base, hooked);
+        static bool bars_tried = false;
+        if (g_gs_ok && !bars_tried) {
+            bars_tried = true;
+            watch_hooks_install();
             if (g_base[0x1476B40] == 0xE9) g_bars_hook = safetyhook::create_inline(reinterpret_cast<void*>(g_base + 0x1476B40), reinterpret_cast<void*>(&hk_bars));
-            spdlog::info("[GameState] gamestate: {} of {} cinematic and camera script functions watched, black bars {}", hooked, kWatchN, g_bars_hook ? "watched" : "not watched");
+            spdlog::info("[GameState] gamestate: {} of {} cinematic and camera script functions watched, black bars {}", g_cinewatch_ok, kWatchN, g_bars_hook ? "watched" : "not watched");
         }
         g_gs_on = g_gs_ok;
     }
+
+    bool cine_watch()
+    {
+        if (!g_ready) return false;
+        watch_hooks_install();
+        return g_cinewatch_ok > 0;
+    }
+
+    uint64_t cine_starts() { return g_cine_starts.load(std::memory_order_relaxed); }
+    uint64_t cine_stops() { return g_cine_stops.load(std::memory_order_relaxed); }
 
     void gamestate_frame(bool mod_menu, bool mod_cine, bool mod_vehicle)
     {
@@ -2319,5 +2931,48 @@ namespace fc5::lua
     {
         return fmt::format("{}; game script thread {} ({} script calls seen), game update thread {}, SetPlayerFOV calls {}",
                            g_ready ? "ready" : (g_tried ? "not usable" : "not looked for yet"), g_game_tid.load(), g_game_calls.load(), g_tick_tid.load(), g_fov_calls.load());
+    }
+
+    // firstgunpause (FarCry5FirstGun.cpp): see PauseFn above.
+    bool pause_ready()
+    {
+        if (!g_ready) return false;
+        if (!g_pause_tried) {
+            g_pause_tried = true;
+            static const uint8_t kPauseSig[]{ 0x0F, 0xB6, 0xD1, 0x48, 0x8B, 0x0D, 0x86, 0x8B, 0x0A, 0x02, 0x48, 0x85, 0xC9, 0x74, 0x08, 0x41, 0xB0, 0x01, 0xE9 };
+            static const uint8_t kPausedSig[]{ 0x48, 0x8B, 0x05, 0x71, 0xD4, 0xF0, 0x01, 0x0F, 0xB6, 0x40, 0x68, 0xC3 };   // IsGamePaused's native (+0x2FA8580)
+            const bool ok  = std::memcmp(g_base + 0x2FAC5C0, kPauseSig, sizeof(kPauseSig)) == 0;
+            const bool ok2 = std::memcmp(g_base + 0x2FA8580, kPausedSig, sizeof(kPausedSig)) == 0;
+            if (ok) g_pause_fn = reinterpret_cast<PauseFn>(g_base + 0x2FAC5C0);
+            if (ok2) g_pause_byte_g = reinterpret_cast<uint8_t**>(g_base + 0x4EB59F8);
+            if (ok)
+                spdlog::info("[FirstGun] PauseGame's native at FC_m64.dll+0x2fac5c0 checked{}", ok2 ? "; IsGamePaused's byte read beside it" : " (IsGamePaused's code changed: its byte not read)");
+            else
+                spdlog::error("[FirstGun] unexpected code at PauseGame's native (FC_m64.dll+0x2fac5c0): the game is not paused (controls held only)");
+        }
+        return g_pause_fn != nullptr;
+    }
+
+    void pause_request(bool pause)
+    {
+        if (!pause_ready()) return;
+        if (pause == g_pause_mod.load() && g_pause_want.load() < 0) return;
+        g_pause_ask_ms = now_ms();
+        g_pause_want   = pause ? 1 : 0;
+    }
+
+    bool paused_by_mod() { return g_pause_mod.load() || g_pause_want.load() == 1; }
+
+    int pause_byte() { return pause_byte_read(); }
+
+    void pause_frame()
+    {
+        // The resume not made on the script thread within 1 s (no game update and no script string while paused): made here.
+        if (g_pause_want.load() == 0 && g_pause_mod.load() && now_ms() - g_pause_ask_ms.load() >= 1000) pause_apply("from the render thread (no game update or script call for 1 s)");
+        // A pause not made within 3 s (the script thread not known yet): given up, the controls stay held.
+        if (g_pause_want.load() == 1 && !g_pause_mod.load() && now_ms() - g_pause_ask_ms.load() >= 3000) {
+            g_pause_want = -1;
+            spdlog::info("[FirstGun] PauseGame not made within 3 s (game update thread {}, script thread {}): the game is not paused, the controls are held", g_tick_tid.load(), g_game_tid.load());
+        }
     }
 }

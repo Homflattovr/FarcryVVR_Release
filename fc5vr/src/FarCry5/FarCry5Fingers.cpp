@@ -24,6 +24,7 @@
 // the grip, lifted off it stands up (thumbs up). fingerfist scales the four fingers' full bends (default 1).
 #include "FarCry5Fingers.h"
 #include "FarCry5BoneNames.h"
+#include "FarCry5BodyIk.h"
 #include "ModPath.h"
 #include "FarCry5ReloadFingers.h"
 #include "FarCry5Reload.h"
@@ -52,11 +53,12 @@ namespace
 {
     std::atomic<bool>  g_on{ true };
     std::atomic<bool>  g_holds{ true };   // fingerholds
-    std::atomic<bool>  g_game{ false };   // fingergame
+    std::atomic<bool>  g_game{ true };    // fingergame (on since 13 Nov: always, it was on in every release through FarCry5Defaults.h)
     std::atomic<float> g_fist{ 1.0f };
     std::atomic<bool>  g_log{ false };
     std::atomic<bool>  g_reset{ false };
     std::atomic<int>   g_known{ 0 }, g_unknown{ 0 };
+    std::vector<glm::vec4> g_rest_centres;   // note_rest_centres (the draw thread)
 
     constexpr const char* kFinger[5] = { "Thumb", "Index", "Middle", "Ring", "Pinky" };
     // Full bend (rad at curl 1) of each finger's three joints (Chasm's CURL); the thumb's are fitted below.
@@ -250,6 +252,10 @@ namespace
         for (int b = 0; b < (int)cent.size() && b < 256; ++b)
             if (cent[b].x > 0.0f) { key_w += int64_t(b) * 7919 + int64_t(cent[b].x * 10.0f); ++used; }
         const auto key = std::make_tuple(count, used, key_w);
+        // handroles changes what an unknown draw gets: start again when it is switched.
+        static bool roles_was = false;
+        const bool  roles_on  = fc5::bodyik::hand_roles_on();
+        if (roles_on != roles_was) { g_match.clear(); roles_was = roles_on; }
         if (auto it = g_match.find(key); it != g_match.end()) return it->second;
         if (g_match.size() > 64) g_match.clear();
         Match& m = g_match[key];
@@ -283,6 +289,43 @@ namespace
             if (const float cm = fit(d); cm < best_cm) { best_cm = cm; m.draw = d; best_n = kMesh[D.mesh]; }
         }
         if (m.draw >= 0 && best_cm > 5.0f) m.draw = -1;
+        // handroles: a draw the tables do not know by its count gets its fingers from the rest skeleton (fc5::bodyik::hand_roles: the
+        // nearest finger bone of each slot's vertex centre; research\2026-11-11_bodyik\README.md), the same roles as a named draw.
+        bool by_roles = false;
+        // Only for a mesh handroles took (the caller gave its true centres, note_rest_centres): cent holds only the hand's slots, with the weights
+        // as the hands' code pairs them. A mesh left to the old rules (the bare arms, whose indirect draw of 14400 indices is not known by its
+        // count) goes on to the search by shape, exactly as with handroles off.
+        if (m.draw < 0 && roles_on && g_rest_centres.size() >= 256) {
+            const std::vector<glm::vec4>& src = g_rest_centres;
+            std::vector<glm::vec4> cm(std::min<size_t>(src.size(), 256));
+            for (size_t s = 0; s < cm.size(); ++s) cm[s] = glm::vec4{ src[s].x, src[s].y * scale, src[s].z * scale, src[s].w * scale };
+            const fc5::bodyik::HandRoles hr = fc5::bodyik::hand_roles(cm.data(), int(cm.size()));
+            for (int side = 0; side < 2; ++side) {
+                Side& sd = m.side[side];
+                if (!hand(side).ok || !hr.hand[side] || hr.palm[side] < 0) continue;
+                int named = 0;
+                for (int s = 0; s < int(cm.size()); ++s) {
+                    const fc5::bodyik::HandSlot& h = hr.slot[s];
+                    if (h.side != side || s == hr.palm[side]) continue;
+                    Slot sl{};
+                    sl.slot   = s;
+                    sl.finger = h.finger;
+                    sl.seg    = h.seg;
+                    if (h.kind == fc5::bodyik::kHandOnPalm) { sl.kind = kOnPalm; sl.seg = 0; }
+                    else if (h.kind == fc5::bodyik::kHandOnBone) { sl.kind = kOnBone; sl.main = h.main; named++; }
+                    else if (h.kind == fc5::bodyik::kHandOnJoint) sl.kind = kOnJoint;
+                    else continue;
+                    sd.slots.push_back(sl);
+                }
+                sd.palm = hr.palm[side];
+                sd.ok   = named >= 5;
+                if (sd.ok)
+                    spdlog::info("[Hands] handroles: draw {} ({} slots used) is not in the tables: {} hand from the skeleton, palm slot {}, {} finger slots ({} on a finger bone)",
+                                 count, used, side == 0 ? "right" : "left", sd.palm, sd.slots.size(), named);
+                else { sd.slots.clear(); sd.palm = -1; }
+            }
+            if (m.side[0].ok || m.side[1].ok) { by_roles = true; m.draw = kDrawN; g_known++; }
+        }
         // Else by shape alone: every hand, arm and outfit draw in the tables, the nearest within 4 cm. The author's bare arms (2 Nov
         // 15:17) come as indirect draws of 14400 indices with 66 and 67 slots used: the count is not the model's (16632).
         bool by_shape = false;
@@ -299,7 +342,9 @@ namespace
             }
         }
         m.cm = best_cm;
-        if (m.draw >= 0) {
+        if (by_roles) {
+            // the roles are set above
+        } else if (m.draw >= 0) {
             const Draw& D = kDraws[m.draw];
             for (int side = 0; side < 2; ++side) {
                 Side& sd = m.side[side];
@@ -607,6 +652,12 @@ void note_game_palm(const std::vector<float>& bones, const std::vector<glm::vec4
         }
 }
 
+void note_rest_centres(const std::vector<glm::vec4>* rc)
+{
+    if (rc && rc->size() >= 256) g_rest_centres = *rc;
+    else g_rest_centres.clear();
+}
+
 void note_free_ctrl(int side, const glm::mat4& ctrl)
 {
     if (side < 0 || side > 1) return;
@@ -805,29 +856,12 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
 
 void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint)
 {
-    bool v = g_on.load();
-    if (ImGui::Checkbox("Fingers posed by bone name (fist, pointing, thumb)##fingernames", &v)) cmds += v ? "fingernames on\n" : "fingernames off\n";
-    hint("On (default, 2 Nov): with the hand open, pointing or closed, each finger bends at its own three joints like a real hand, "
-         "the thumb folds across the fingers, and the fingers close together in a fist. The bones are known by the names in the game's "
-         "models, so no finger takes another's bones. Off: the 19-20 Oct pose (the fingers found from the hand's shape, closed as the "
-         "game holds the weapon).");
-    if (!v) return;
     float f = g_fist.load();
     if (ImGui::SliderFloat("Fist: how far the fingers close##fingerfist", &f, 0.5f, 1.2f, "%.2f")) cmds += fmt::format("fingerfist {:.2f}\n", f);
-    hint("1 (default): a full fist. Lower if the fingertips go into the palm, higher if the fist looks loose.");
-    bool hv = g_holds.load();
-    if (ImGui::Checkbox("Fingers round what the hand holds (bow string, arrow, magazine, charging handle)##fingerholds", &hv))
-        cmds += hv ? "fingerholds on\n" : "fingerholds off\n";
-    hint("On (default, 2 Nov): the hand on the bow's string pinches it between the thumb and the side of the curled index, as it does "
-         "an arrow taken from the quiver; the free hand's fingers wrap round the magazine it holds or slides into the well (closer "
-         "round a pistol's), hook the charging handle while racking, or grip a pistol's slide. Off: the controller's grip, trigger "
-         "and thumb pose the fingers as when the hand is empty.");
-    bool gv = g_game.load();
-    if (ImGui::Checkbox("Magazine grip learnt from the game's own reload (test)##fingergame", &gv)) cmds += gv ? "fingergame on\n" : "fingergame off\n";
-    hint("Off (default). On: at the game's own reload of each weapon (the clip run dry, or tapped by the manual reload), the fingers of "
-         "the game's hand round its spare magazine (and on its charging handle, when the reload's learning sees it pulled) are learnt, and "
-         "your free hand takes that grip when it holds that weapon's magazine or racks it (instead of the fixed shapes). Learnt grips are "
-         "kept in fc5vr_fingerposes.txt.");
+    hint("How far the fingers close in a fist. Lower it if the fingertips go into the palm.");
+    // fingernames, fingerholds and fingergame are always on since 13 Nov (author 19:44Z, Motion control > Hands, body and arms): no rows;
+    // typed they still act for a session, never saved.
+    const bool gv = g_game.load();
     if (gv) {
         size_t n = 0;
         {

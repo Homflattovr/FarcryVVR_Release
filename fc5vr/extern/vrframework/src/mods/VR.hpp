@@ -242,6 +242,9 @@ public:
         return m_openvr != nullptr && m_openvr->loaded;
     }
 
+    // Far Cry 5 (menufade, builder 14 Nov): the menu backdrop (D3D11Component.cpp, a free function) reads the OpenXR runtime.
+    std::shared_ptr<runtimes::OpenXR>& fc5_openxr() { return m_openxr; }
+
     bool is_openxr_loaded() const {
         return m_openxr != nullptr && m_openxr->loaded;
     }
@@ -640,6 +643,17 @@ public:
     float m_fc5_view_pose[2][7]{};
     float m_fc5_view_fov[2][4]{};
     ID3D11Texture2D* m_fc5_eye_override{nullptr};
+    // Far Cry 5 menus in VR (FarCry5Stereo, menuscreen off, menufade): the menu screen is drawn into the 3D view (as menuproj) over the
+    // last play image of each eye, kept frozen in the room (D3D11Component fc5_backdrop_keep). Set by the mod every present:
+    // m_fc5_menu_hold = this present has no player camera yet (a menu coming): the frozen image instead of the game's picture;
+    // m_fc5_backdrop_keep = this present's eye images are play (kept every 4th headset frame); the panel's opacity, the frozen
+    // image's brightness (0 = black around the panel, as before) and the whole picture's brightness (1 = untouched).
+    std::atomic<bool>  m_fc5_menu_vr{false};
+    std::atomic<bool>  m_fc5_menu_hold{false};
+    std::atomic<bool>  m_fc5_backdrop_keep{false};
+    std::atomic<float> m_fc5_menu_panel{1.0f};
+    std::atomic<float> m_fc5_menu_world{0.0f};
+    std::atomic<float> m_fc5_menu_fade{1.0f};
     // Far Cry 5 pipeline review: P2 = no blocking 5 s eye probe; P7 = no back-buffer copy into the eye texture when the eye image replaces it.
     std::atomic<bool> m_fc5_no_eye_probe{true};
     std::atomic<bool> m_fc5_skip_bb_copy{true};

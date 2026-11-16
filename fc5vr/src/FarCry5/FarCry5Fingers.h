@@ -56,6 +56,8 @@ namespace fc5::fingers
     // reloadrec (FarCry5Reload.h): the free hand's controller as the mod drew it, the palm's middle in rest pose space, and each finger joint's
     // bend (deg; thumb, index, middle, ring, little; 3 joints each): the game's before the mod moves the hand, or as drawn after it posed the fingers.
     void note_free_ctrl(int side, const glm::mat4& ctrl);
+    // handroles: the mesh's slot centres with the weights on their own bones (GloveMesh::rc) for the hand draw being posed; nullptr: none.
+    void note_rest_centres(const std::vector<glm::vec4>* rc);
     bool free_ctrl(int side, glm::mat4& ctrl, glm::vec3& palm_rest);
     void track_bends(bool on);
     void note_drawn_bends(const std::vector<float>& bones, const std::vector<glm::vec4>& cent, uint32_t count, int side, float scale);

@@ -1,3 +1,4 @@
+#include <atomic>
 #include <unordered_map>
 #include <vector>
 
@@ -12,8 +13,25 @@ using namespace std;
 
 static WindowsMessageHook* g_windows_message_hook{ nullptr };
 std::recursive_mutex g_proc_mutex{};
+// Messages that reached window_proc, by any route (the hook monitor's test reads it).
+static std::atomic<uint32_t> g_window_proc_calls{ 0 };
+// The window procedure that was the window's own while a message reached ours: another module's, put on top of ours, that passes
+// messages down to us (the OFXR frame bridge layer subclasses the game's window after us).
+static std::atomic<LONG_PTR> g_called_under{ 0 };
+// A hook removed while another module's procedure sat on top of ours: ours is still in the window's chain, with this as the procedure
+// below it.
+static HWND    g_buried_wnd{ nullptr };
+static WNDPROC g_buried_original{ nullptr };
+
+uint32_t WindowsMessageHook::calls() {
+    return g_window_proc_calls.load(std::memory_order_relaxed);
+}
 
 LRESULT WINAPI window_proc(HWND wnd, UINT message, WPARAM w_param, LPARAM l_param) {
+    g_window_proc_calls.fetch_add(1, std::memory_order_relaxed);
+    if (const LONG_PTR top = GetWindowLongPtr(wnd, GWLP_WNDPROC); top != (LONG_PTR)&window_proc && top != 0) {
+        g_called_under.store(top, std::memory_order_relaxed);
+    }
     std::lock_guard _{ g_proc_mutex };
 
     if (g_windows_message_hook == nullptr) {
@@ -52,8 +70,21 @@ WindowsMessageHook::WindowsMessageHook(HWND wnd)
     // Save the original window procedure.
     m_original_proc = (WNDPROC)GetWindowLongPtr(m_wnd, GWLP_WNDPROC);
 
-    // Set it to our "hook" procedure.
-    SetWindowLongPtr(m_wnd, GWLP_WNDPROC, (LONG_PTR)&window_proc);
+    if (g_buried_wnd == m_wnd && g_buried_original != nullptr && m_original_proc != &window_proc &&
+        (LONG_PTR)m_original_proc == g_called_under.load(std::memory_order_relaxed)) {
+        // Our procedure is still in this window's chain, under another module's that has called it (see remove() and window_proc).
+        // Taking that module's procedure as our original and going on top of it would make the two call each other without end: a
+        // stack overflow at the next message (11 Nov 2026 15:57, crash_2026-11-11_155734: window_proc <-> XR_APILAYER_XRFrameBridge).
+        // We keep our place in the chain. (A procedure on top that never called ours is hooked over as before.)
+        spdlog::info("Windows message hook: our procedure is still in the window's chain under another module's procedure {:x}; kept there, not hooked again on top of it",
+                     (uintptr_t)m_original_proc);
+        m_original_proc = g_buried_original;
+    } else {
+        // Set it to our "hook" procedure.
+        SetWindowLongPtr(m_wnd, GWLP_WNDPROC, (LONG_PTR)&window_proc);
+    }
+    g_buried_wnd      = nullptr;
+    g_buried_original = nullptr;
 #ifndef DISABLE_WINDOW_SIZE_FIXES
     auto get_window_rect_fn = GetProcAddress(GetModuleHandleA("user32.dll"), "GetWindowRect");
     m_get_window_rect_hook = safetyhook::create_inline((void*)get_window_rect_fn, onGetWindowRect);
@@ -110,6 +141,10 @@ bool WindowsMessageHook::remove() {
     // lets not try to restore the original window procedure if it's not ours.
     if (current_proc == &window_proc) {
         SetWindowLongPtr(m_wnd, GWLP_WNDPROC, (LONG_PTR)m_original_proc);
+    } else {
+        // Another module's procedure sits on top of ours and may still call it: remembered for the next hook of this window.
+        g_buried_wnd      = m_wnd;
+        g_buried_original = m_original_proc;
     }
 
     // Invalidate this message hook.

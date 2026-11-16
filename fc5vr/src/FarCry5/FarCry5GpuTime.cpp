@@ -14,7 +14,7 @@ namespace fc5::gputime
     {
         constexpr int kSets   = 4;    // pairs in flight
         constexpr int kStamps = 48;   // timestamps per pair
-        const char*   kNames[kCount]{ "pair", "game call (left)", "extra call (right)", "DLSS inputs", "DLSS evaluation", "compose", "aim march", "scope call" };
+        const char*   kNames[kCount]{ "pair", "game call (left)", "extra call (right)", "DLSS inputs", "DLSS evaluation", "compose", "aim march", "scope call", "DLSS periphery (dlssfovea)" };
 
         struct Set
         {

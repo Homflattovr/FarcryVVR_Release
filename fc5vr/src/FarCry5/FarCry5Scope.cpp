@@ -5,6 +5,7 @@
 #include "FarCry5Afw.h"
 #include "FarCry5Bow.h"
 #include "FarCry5GameWeapon.h"
+#include "FarCry5SightTable.h"
 
 #include <Framework.hpp>
 
@@ -1271,6 +1272,18 @@ bool FarCry5Stereo::scope_no_optic(uint32_t sig) const
     return w && w->cls == 7 && w->name && !std::strstr(w->name, "RAT4");
 }
 
+// scopereflex (author 16 Nov 09:45, build DE0001F3): weapon 61926 is the M60 (gameweapon: Weapons/Machineguns/M60, class 6). Its shipped scopecal x3.3 is
+// the game's aim-down-sights zoom (machine guns zoom past scopelearn's x3.0 with any sight: the M60 on iron sights, 24 Oct), and with a reflex sight on
+// it the gun draws sight glass, so the iron-sights guard (optic_now) passed and the x3.3 picture came on (10:34:08 "on the model ... x3.30"). The weapon id
+// is the gun's receiver, the same whatever optic is mounted, so its entry cannot tell the optics apart; the optic's own draw can (sightdata's kOptics,
+// m_sight_optic_count set at each frame's end: the M60's pass drew 1614 348 1374 15192, WPN_ATT_REFLEX). A reflex or red dot sight never magnifies.
+bool FarCry5Stereo::scope_reflex_optic(uint32_t sig) const
+{
+    if (m_scope_reflex.load() || sig == 0 || !optic_now(sig)) return false;
+    const auto* o = fc5::sighttable::find_optic(m_sight_optic_count.load());
+    return o && o->model && (std::strcmp(o->model, "WPN_ATT_REFLEX") == 0 || std::strcmp(o->model, "WPN_ATT_REDDOT") == 0);
+}
+
 void FarCry5Stereo::scope_frame(int frame, const glm::vec3& eye_cam, const glm::mat3& eye_rot)
 {
     if (!m_scope.load() || mounted_now()) {   // mountedweapon (FarCry5Mounted.cpp): no scope picture or scopelearn on a mounted weapon
@@ -1308,6 +1321,17 @@ void FarCry5Stereo::scope_frame(int frame, const glm::vec3& eye_cam, const glm::
                 const auto* w = fc5::gameweapon::info(st.sig);
                 spdlog::info("[Scope] scopelaunchers: weapon {} is a launcher with iron sights ({}): its x{:.1f} entry counts as 1x, no scope picture", st.sig,
                              w && w->name ? w->name : "?", cal.mag);
+            }
+            cal.mag = 1.0f;
+        }
+        // scopereflex: a reflex or red dot sight on the gun now: its entry counts as 1x (the same gun with a scope on keeps it).
+        if (have_cal && cal.mag > 1.01f && scope_reflex_optic(st.sig)) {
+            static std::unordered_set<uint32_t> told_reflex;   // under m_scope_mtx
+            if (told_reflex.insert(st.sig).second) {
+                const auto* w = fc5::gameweapon::info(st.sig);
+                const auto* o = fc5::sighttable::find_optic(m_sight_optic_count.load());
+                spdlog::info("[Scope] scopereflex: weapon {} ({}) has a reflex or red dot sight on ({}): its x{:.1f} entry counts as 1x, no scope picture", st.sig,
+                             w && w->name ? w->name : "?", o && o->model ? o->model : "?", cal.mag);
             }
             cal.mag = 1.0f;
         }
@@ -1500,6 +1524,9 @@ float FarCry5Stereo::scope_zoom_tick(UINT sig, float optic, bool active)
     }
     const float y    = m_zoom_stick_y.load(), x = m_zoom_stick_x.load();
     const bool  push = std::abs(y) > 0.6f && std::abs(y) > std::abs(x);
+    // stickjump (FarCry5FootPad.h): while the stick can zoom this scope, its up / down is no jump or crouch.
+    if (sig != 0 && active && m_scope_zoom_stick.load() && m_two_hand.load() && !m_menu_screen_on)
+        m_scope_stick_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     if (std::abs(y) < 0.3f) m_scope_zoom_latch = false;
     if (sig != 0 && active && push && !m_scope_zoom_latch && m_scope_zoom_stick.load() && m_two_hand.load() && !m_menu_screen_on) {
         m_scope_zoom_latch = true;
@@ -1619,6 +1646,10 @@ void FarCry5Stereo::scope_learn_tick(bool on_foot, bool at_scope, UINT sig, bool
     if (zoom >= 3.0f && !optic) spdlog::info("[Scope] scopelearn: weapon {}: zooms x{:.2f} but draws no sight glass: iron sights, not a scope", a.sig, zoom);
     if (zoom >= 3.0f && optic && scope_no_optic(a.sig)) {
         spdlog::info("[Scope] scopelearn: weapon {}: zooms x{:.2f} but is a launcher with iron sights (scopelaunchers off): not a scope", a.sig, zoom);
+        optic = false;
+    }
+    if (zoom >= 3.0f && optic && scope_reflex_optic(a.sig)) {
+        spdlog::info("[Scope] scopelearn: weapon {}: zooms x{:.2f} but its optic is a reflex or red dot sight (scopereflex off): not a scope", a.sig, zoom);
         optic = false;
     }
     const float mag  = zoom >= 3.0f && optic ? std::round(zoom * 10.0f) / 10.0f : 1.0f;
@@ -1810,6 +1841,7 @@ bool FarCry5Stereo::scope_glow_draw(ID3D11DeviceContext* ctx)
         if (it == m_scope_cal.end() && m_scope_sticky_sig) it = m_scope_cal.find(m_scope_sticky_sig);
         magnifying = it != m_scope_cal.end() && it->second.mag > 1.01f;
     }
+    if (magnifying && scope_reflex_optic(m_weapon_sig.load())) magnifying = false;   // scopereflex: a reflex sight's glow stays
     if (magnifying) {
         m_scope_glow_hidden++;
         return true;
@@ -2178,6 +2210,7 @@ bool FarCry5Stereo::scope_command(const std::string& cmd, const std::string& arg
         }
     }
     else if (cmd == "scopelaunchers") { m_scope_launchers = on; persist(cmd, on ? "scopelaunchers on" : "scopelaunchers off"); }
+    else if (cmd == "scopereflex") { m_scope_reflex = on; persist(cmd, on ? "scopereflex on" : "scopereflex off"); }
     else if (cmd == "scopesteady") { m_scope_steady = on; persist(cmd, on ? "scopesteady on" : "scopesteady off"); }   // the picture at the glass's learned place (steady when firing)
     else if (cmd == "scopeglassat") {
         // scopeglassat X Y Z R SIG (saved, written by the mod): the glass's learned place on the gun (controller axes) and radius.

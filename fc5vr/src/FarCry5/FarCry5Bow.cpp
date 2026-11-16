@@ -70,6 +70,14 @@ namespace
     std::atomic<int>   g_force{ -1 };            // bowforce (test): the arrow's phase as shown, -1 the real one
     std::atomic<int64_t> g_scan_until{ 0 };      // bowscan (test): steady clock ticks
     std::atomic<int>   g_test_hold{ 0 };         // bowshoot (test): RT held this long (ms) for one shot
+    // bowdrawtest MS (test, the simulator; 14 Nov, the bowfine check): bowshoot goes straight to Loose, so no simulator run ever held the
+    // string by hand (Drawing), the only phase in which FarCry5BowArrow.cpp poses the limbs, the string and the arrow. One manual shot with
+    // the string hand's inputs made up: an arrow in the hand for 1 s (half a metre from the nock), the hand on the nock (nocked, the grip
+    // holds the string), pulled back along the bow's own axis to 5 cm past full draw in 1 s, held, the grip let go MS ms after the nock.
+    // The phases, RT and the loose are the real ones; the string's draw is the hand's pull (test_draw()).
+    std::atomic<int>   g_test_draw{ 0 };         // the string held this long (ms), 0 none asked
+    std::atomic<bool>  g_test_draw_on{ false };  // under way
+    clock::time_point  g_test_draw_t{};          // when the hand reaches the nock (under g_mtx)
     std::atomic<uint32_t> g_shots{ 0 };
     // bowhandstring (author 2 Nov 07:51): while the game draws its bow (RT held by the
     // string pull) the right glove is left where the game holds it, on its string, instead of on the controller.
@@ -128,12 +136,17 @@ namespace
     // bow taken with the left grip anywhere along it (within bowslinggrabzone of the line through its grip along its limbs), not only within the
     // sling zone round its grip; a light tick on the left controller when the free left hand comes onto it. The right grip: the sling zone only.
     std::atomic<bool>  g_sling_grab{ true };
+    std::atomic<bool>  g_right_hand{ true };   // bowrighthand (FarCry5Bow.h): the bow taken with the right grip stays in the right hand
+    std::atomic<bool>  g_fine{ true };         // bowfine (FarCry5Bow.h): the drawn bow's parts placed without map-size single floats
+    std::atomic<bool>  g_pin_mid{ true };      // bowpinmid (FarCry5Bow.h): a ring sight's dot on the ring's middle
     std::atomic<float> g_sling_grab_zone{ 0.12f };
     // bowslinghold yaw pitch roll (deg): the bow's turn on the sling. Default 0 0 90 (6 Nov sweep, testruns\2026-11-06_bowslinghold): upright
     // (0 0 0) its upper limb and cam stood in front of the face looking ahead; rolled 90 deg (its limbs across, about as the game holds it)
     // only a cam's edge shows at the bottom right, as with the slung guns (0 0 -45 hid it entirely, 0 -60 0 too).
     constexpr float    kSlingHoldDefault[3]{ 0.0f, 0.0f, 90.0f };
     std::atomic<float> g_sling_hold[3]{ kSlingHoldDefault[0], kSlingHoldDefault[1], kSlingHoldDefault[2] };
+    std::atomic<bool>  g_sling_body{ true };       // bowslingbody (FarCry5Bow.h)
+    std::atomic<float> g_sling_body_deg{ 35.0f };  // bowslingbodyangle
     std::atomic<int64_t> g_loose_ms{ 0 };               // the last shot (Loose -> Empty), steady clock ms; 0 none
     std::atomic<int>   g_cancel_key{ 0x13 };            // bowcancelkey: R
     bool               g_cancel = false;                // a short draw being cancelled: RT still held until g_cancel_t + 300 ms
@@ -227,6 +240,7 @@ void get_nock(float v[3])
 bool  on() { return g_on.load(); }
 bool  in_hand() { return g_in_hand.load(); }
 Phase phase() { return Phase(g_phase.load()); }
+bool  test_draw() { return g_test_draw_on.load(); }
 float draw_m() { return g_draw.load(); }
 float full_m() { return g_full.load(); }
 float start_m() { return g_start.load(); }
@@ -250,12 +264,15 @@ bool game_bow(uint32_t sig)
     return w && w->cls == 15;
 }
 
-void update(const In& in, Out& out)
+void update(const In& in_now, Out& out)
 {
     std::lock_guard _{ g_mtx };
+    In         in  = in_now;   // (bowdrawtest makes up the string hand's part of it)
     const auto now = clock::now();
     Phase      ph  = Phase(g_phase.load());
     if (!(in.active && g_on.load())) {
+        g_test_draw    = 0;
+        g_test_draw_on = false;
         // Not a bow any more (a weapon switch), a vehicle, a menu, the flat screen: the string let go and the arrow gone.
         if (ph != Phase::Off) set_phase(Phase::Off, now, g_rt ? "the bow is no longer in hand: RT let go" : "the bow is no longer in hand");
         g_rt       = false;
@@ -273,6 +290,35 @@ void update(const In& in, Out& out)
     if (ph == Phase::Off) {
         set_phase(Phase::Empty, now, "a bow in hand: the weapon hand's shoulder is the quiver");
         ph = Phase::Empty;
+    }
+    // bowdrawtest: the string hand's inputs made up for one manual shot (see g_test_draw).
+    if (const int td = g_test_draw.load(); td > 0 && in.bow_ok) {
+        bool press = false;
+        if (!g_test_draw_on.load() && (ph == Phase::Empty || ph == Phase::Nocked) && !g_rt && !g_cancel) {
+            g_test_draw_on = true;
+            if (ph == Phase::Empty) {
+                g_test_draw_t = now + std::chrono::milliseconds(1000);
+                g_arrow_min   = 1e9f;
+                set_phase(Phase::Arrow, now, fmt::format("bowdrawtest: an arrow in the hand for 1 s, then nocked, drawn in 1 s and let go after {} ms", td));
+                ph = Phase::Arrow;
+            } else {
+                g_test_draw_t = now;   // an arrow already on the bow: the grip pressed on the nock
+                press         = true;
+            }
+        }
+        if (g_test_draw_on.load()) {
+            const float     ms   = std::chrono::duration<float, std::milli>(now - g_test_draw_t).count();
+            const float     full = std::max(g_full.load(), g_start.load() + 0.05f) + 0.05f;
+            const glm::vec3 n0   = nock_point(in.bow_pos, in.bow_rot, in.mirror);
+            in.hand    = ms < 0.0f ? n0 + glm::normalize(in.bow_rot[0]) * 0.5f : n0 + glm::normalize(in.bow_rot[2]) * (full * std::clamp(ms / 1000.0f, 0.0f, 1.0f));
+            in.hand_ok = true;
+            in.grip    = ms < float(td);
+            in.pressed = press;
+            if (!in.grip || (ph != Phase::Arrow && ph != Phase::Nocked && ph != Phase::Drawing)) {
+                g_test_draw    = 0;
+                g_test_draw_on = false;
+            }
+        }
     }
     const bool      track = in.hand_ok && in.bow_ok;
     const glm::vec3 nock  = nock_point(in.bow_pos, in.bow_rot, in.mirror);
@@ -529,7 +575,23 @@ bool sling_on() { return g_sling.load(); }
 bool quiver_grip() { return g_quiver_grip.load(); }
 bool pull_keep() { return g_pull_keep.load(); }
 bool sling_grab() { return g_sling_grab.load(); }
+bool right_hand() { return g_right_hand.load(); }
+
+bool fine() { return g_fine.load(); }
+
+bool pin_mid() { return g_pin_mid.load(); }
 float sling_grab_zone() { return std::clamp(g_sling_grab_zone.load(), 0.04f, 0.30f); }
+bool  sling_body() { return g_sling_body.load(); }
+float sling_body_deg() { return std::clamp(g_sling_body_deg.load(), 0.0f, 90.0f); }
+glm::mat3 sling_body_turn(bool mirror)
+{
+    // Limbs (y) up and to the other hand's side, the arrow (-z) square to them in the body's front plane, the bow's thin axis (x) into the body.
+    const float     a  = glm::radians(sling_body_deg());
+    const float     m  = mirror ? -1.0f : 1.0f;
+    const glm::vec3 y{ -m * std::sin(a), std::cos(a), 0.0f };
+    const glm::vec3 z{ -m * std::cos(a), -std::sin(a), 0.0f };
+    return glm::mat3{ glm::cross(y, z), y, z };
+}
 void get_sling_hold(float v[3])
 {
     for (int i = 0; i < 3; ++i) v[i] = g_sling_hold[i].load();
@@ -1118,9 +1180,31 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
     if (cmd == "bowsling") {
         g_sling = arg.empty() || on;
         persist = true;
-        spdlog::info("[Bow] bowsling {}", g_sling.load() ? "on: with the sling on, the bow hangs on it; the left grip there holds it, the right grip there puts it in the left hand "
-                                                           "until the left grip is pressed and let go"
+        spdlog::info("[Bow] bowsling {}", g_sling.load() ? (g_right_hand.load() ? "on: with the sling on, the bow hangs on it; the left or the right grip there holds it in that hand "
+                                                                                   "(bowrighthand), back on the sling when it is let go"
+                                                                                 : "on: with the sling on, the bow hangs on it; the left grip there holds it, the right grip there puts it in the "
+                                                                                   "left hand until the left grip is pressed and let go")
                                                          : "off: the bow is always in the left hand");
+        return true;
+    }
+    if (cmd == "bowrighthand") {
+        g_right_hand = arg.empty() || on;
+        persist      = true;
+        spdlog::info("[Bow] bowrighthand {}", g_right_hand.load() ? "on: the slung bow taken with the right grip stays in the right hand, upright as in the left, until that grip is let go "
+                                                                    "(RT draws and looses it as the game does)"
+                                                                  : "off: the slung bow taken with the right grip goes into the left hand until the left grip is pressed and let go");
+        return true;
+    }
+    if (cmd == "bowfine") {   // (test: never saved)
+        g_fine = arg.empty() || on;
+        spdlog::info("[Bow] bowfine {} (not saved)", g_fine.load() ? "on: the drawn bow's limbs, string and arrow placed on the bow from small numbers in doubles, with their position fractions"
+                                                                : "off: the drawn bow's parts placed with single floats at map size (as before 13 Nov)");
+        return true;
+    }
+    if (cmd == "bowpinmid") {   // (test: never saved)
+        g_pin_mid = arg.empty() || on;
+        spdlog::info("[Bow] bowpinmid {} (not saved)", g_pin_mid.load() ? "on: the dot's point on a ring sight is the ring's middle (its reticle draws that agree), not a lone smaller piece"
+                                                                      : "off: the dot's point is the bow's smallest reticle draw (as before 13 Nov)");
         return true;
     }
     if (cmd == "bowslinggrab") {
@@ -1134,6 +1218,19 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
         if (!arg.empty()) g_sling_grab_zone = std::clamp(fv, 0.04f, 0.30f);
         persist = true;
         spdlog::info("[Bow] bowslinggrabzone {:.2f} m: how close to the slung bow's limbs a grip takes it (bowslinggrab)", sling_grab_zone());
+        return true;
+    }
+    if (cmd == "bowslingbody") {
+        g_sling_body = arg.empty() || on;
+        persist      = true;
+        spdlog::info("[Bow] bowslingbody {}", g_sling_body.load() ? fmt::format("on: the slung bow across the front of the body, its limbs from the right hip towards the left shoulder, {:.0f} deg from upright", sling_body_deg())
+                                                                : std::string{ "off: the slung bow turned with the guns' sling (slingrot), then by bowslinghold" });
+        return true;
+    }
+    if (cmd == "bowslingbodyangle") {
+        g_sling_body_deg = arg.empty() ? 35.0f : std::clamp(fv, 0.0f, 90.0f);
+        persist          = true;
+        spdlog::info("[Bow] bowslingbodyangle {:.0f} deg: the slung bow's limbs this far from upright across the body (bowslingbody)", sling_body_deg());
         return true;
     }
     if (cmd == "bowslinghold") {
@@ -1243,6 +1340,12 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
         spdlog::info("[Bow] bowforce {}: the arrow shown as {}", f < 0 ? "off" : kName[f], f < 0 ? "the real phase says" : kName[f]);
         return true;
     }
+    if (cmd == "bowdrawtest") {   // (test: one manual shot with the string hand's inputs made up; g_test_draw)
+        g_test_draw = std::clamp(arg.empty() ? 3000 : int(fv), 1200, 10000);
+        spdlog::info("[Bow] bowdrawtest: one manual shot made up (needs the bow in hand, manualbow on): an arrow in the hand 1 s, nocked, the string drawn in 1 s and let go {} ms after the nock",
+                     g_test_draw.load());
+        return true;
+    }
     if (cmd == "bowshoot") {
         g_test_hold = std::clamp(arg.empty() ? 1500 : int(fv), 100, 5000);
         spdlog::info("[Bow] bowshoot: one test shot with RT held {} ms (needs the bow in hand, manualbow on)", g_test_hold.load());
@@ -1255,12 +1358,11 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
 {
     bool v = g_on.load();
     if (ImGui::Checkbox("Manual bow: arrows from the right shoulder, draw the string with your hand##manualbow", &v)) cmds += v ? "manualbow on\n" : "manualbow off\n";
-    hint("With a bow in your hands (tick it below), the bow is in your left hand and your right shoulder is a quiver instead of a weapon slot. "
-         "Right grip at the right shoulder: an arrow in your hand. Bring it to the bow, just above your left hand, while holding the grip: it sticks to "
-         "the bow and the grip now holds the string. Pull your right hand back: a short buzz says the bow is fully drawn. Let go of the grip: the arrow "
-         "flies where the arrow points. Let go before pulling: the arrow stays on the bow; press the grip there again to take the string. "
-         "The left shoulder still switches weapon. Off (default): the bow is a weapon like the others. Command manualbow on/off.");
+    hint("With a bow, your right shoulder becomes a quiver: take an arrow there, place it on the bow, pull the string back with the grip held, and let go to shoot.");
     if (!v) return;
+    // Holster, bow and throwables clean-up (author 13 Nov 19:27Z): always on, no longer settings: bowgame, bowsteady, bowsteadyaim, bownoscope, bowsteadyarrow, bowdotarrow, bowpinsteady, bowquivergrip,
+    // bowsling, bowrighthand, bowslinggrab, bowdoteye, bowsighteye, bowsightaim, bowupright, bowuprightkeep, bowuprightwait,
+    // bowpull, bowpullkeep, bowhandstring, bowarrowmodel, bowarrow (their commands still act for a session, never saved).
     if (sig != 0) {
         bool b = is_bow(sig);
         if (ImGui::Checkbox(fmt::format("The weapon in your hands (id {}) is a bow###bowhere", sig).c_str(), &b)) {
@@ -1276,16 +1378,11 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
             if (s.empty()) line += " none";
             cmds += line + "\n";
         }
-        hint("The mod knows weapons by an id, not by name: take out each bow you use (compound, recurve, ...) and tick this once for each. Kept in your settings. "
-             "With the next box on, a bow the game itself calls a bow needs no tick.");
+        hint("Tick this once for each bow you use, so the mod treats it as a bow.");
         if (game_bow(sig)) ImGui::TextDisabled("The game says this weapon is a bow.");
     } else {
         ImGui::TextDisabled("No weapon in your hands now: take out a bow to tick it.");
     }
-    bool g = g_game.load();
-    if (ImGui::Checkbox("Ask the game which weapons are bows##bowgame", &g)) cmds += g ? "bowgame on\n" : "bowgame off\n";
-    hint("On (default): a weapon the game's own data calls a bow (the compound and recurve bows and their variants) is a bow without the tick "
-         "above, half a second after you first hold it. Off: only the ticked ones.");
     const std::string bows = list_text();
     ImGui::Text("Bows: %s", bows.empty() ? "none ticked yet" : bows.c_str());
     {
@@ -1299,155 +1396,62 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
     float f = g_full.load(), s = g_start.load(), z = g_nock_zone.load(), a = g_buzz.load();
     int   h = g_hold_ms.load();
     if (ImGui::SliderFloat("Full draw: string hand this far from the nock (m)##bowfull", &f, 0.25f, 0.80f, "%.2f")) cmds += fmt::format("bowfull {:.2f}\n", f);
-    hint("Where the buzz comes. Pull to your usual full draw and read 'Now' above to set it to your arms.");
+    hint("How far back your hand must pull for a full draw (the buzz). Pull to your usual full draw and read 'Now' above.");
     if (ImGui::SliderFloat("The game starts drawing once pulled (m)##bowstart", &s, 0.03f, 0.30f, "%.2f")) cmds += fmt::format("bowstart {:.2f}\n", s);
-    hint("How far you pull the string back from where you nocked the arrow before the game's fire (RT) is held, so its bow draws; let go of the grip any time after that and the arrow flies.");
+    hint("How far you pull back before the game starts drawing the bow.");
     if (ImGui::SliderFloat("Nock: how close the arrow must come (m)##bownockzone", &z, 0.10f, 0.35f, "%.2f")) cmds += fmt::format("bownockzone {:.2f}\n", z);
-    hint("The arrow sticks to the bow once the string hand is this close to the nock point, just above the bow hand ('Now' above shows the distance). "
-         "The two controllers cannot touch, so about 0.15 m is as close as they get.");
+    hint("How close the arrow must come to the bow before it sticks to it.");
     if (ImGui::SliderInt("RT held at least (ms)##bowholdms", &h, 0, 1000)) cmds += fmt::format("bowholdms {}\n", h);
-    hint("A quick pull and release keeps RT held this long, so the game has drawn its bow before it looses the arrow.");
+    hint("Shortest time the shot is held, so a quick pull still fires.");
     if (ImGui::SliderFloat("Full-draw buzz strength##bowbuzz", &a, 0.1f, 1.0f, "%.2f")) cmds += fmt::format("bowbuzz {:.2f}\n", a);
     int pn = std::clamp(g_pin.load(), 0, 2);
     const char* pin_items[]{ "off", "on the bow's sight pin", "where the arrow lands" };
-    bool sa = g_sight_aim.load();
-    if (ImGui::Checkbox("Shoot through the bow's sight##bowsightaim", &sa)) cmds += sa ? "bowsightaim on\n" : "bowsightaim off\n";
-    bool sty = g_steady.load();
-    if (ImGui::Checkbox("Steady bow while drawn##bowsteady", &sty)) cmds += sty ? "bowsteady on\n" : "bowsteady off\n";
-    hint("On (default): while the string is drawn the bow, its sight and the arrow's line are held steady: your hands' shake is filtered out, and "
-         "only a deliberate move (or the bow trailing your hands by 2 deg) moves the aim. After the shot the aim is held a moment so the arrow "
-         "leaves where the sight was. Off: the bow follows the weapon smoothing as the other weapons. Command bowsteady on/off.");
-    bool sta = g_steady_aim.load();
-    if (ImGui::Checkbox("Steady bow: only a real aim move moves it##bowsteadyaim", &sta)) cmds += sta ? "bowsteadyaim on\n" : "bowsteadyaim off\n";
-    hint("On (default, with 'Steady bow while drawn'): your wrist turning the bow (roll) and your body swaying no longer count as a move, so the "
-         "drawn bow and its dot stay steady on the target; swinging the bow to a new target still moves it at once. The bow is held steady "
-         "against your head, as the sight line runs from your eye to the pin. Off: as before 6 Nov (any turn or move of the bow hand opened it). "
-         "Command bowsteadyaim on/off.");
     float shz = g_steady_hz.load();
     if (ImGui::SliderFloat("Steadiness while drawn (Hz, lower is steadier)##bowsteadyhz", &shz, 0.2f, 3.0f, "%.2f")) cmds += fmt::format("bowsteadyhz {:.2f}\n", shz);
-    hint("How fast the drawn bow follows small, slow moves while you hold the aim. 0.6 (default) holds it very still; lower holds it stiller "
-         "but small corrections take longer to show; higher follows the hands more closely. Command bowsteadyhz 0.6.");
-    bool nsc = g_no_scope.load();
-    if (ImGui::Checkbox("No scope picture on the bow's sight##bownoscope", &nsc)) cmds += nsc ? "bownoscope on\n" : "bownoscope off\n";
-    hint("On (default): with the manual bow in hand, the bow's sight never shows the magnified scope picture (it popped up when your eye came "
-         "near the sight line). Command bownoscope on/off.");
-    bool sar = g_steady_arrow.load();
-    if (ImGui::Checkbox("Steady arrow while drawn##bowsteadyarrow", &sar)) cmds += sar ? "bowsteadyarrow on\n" : "bowsteadyarrow off\n";
-    hint("On (default): while the string is drawn the arrow and the string follow your string hand through the same kind of steadier as the bow "
-         "(with 'Steady bow while drawn' on), so your hand's shake no longer moves the arrow; a real pull or let-down still moves it at once. "
-         "Command bowsteadyarrow on/off.");
-    bool da = g_dot_arrow.load();
-    if (ImGui::Checkbox("Red dot only with an arrow on the bow##bowdotarrow", &da)) cmds += da ? "bowdotarrow on\n" : "bowdotarrow off\n";
-    hint("On (default): no red dot or laser with the bow until an arrow is nocked. Command bowdotarrow on/off.");
-    bool ps = g_pin_steady.load();
-    if (ImGui::Checkbox("Steady sight line (walking)##bowpinsteady", &ps)) cmds += ps ? "bowpinsteady on\n" : "bowpinsteady off\n";
-    hint("On (default): drawn, the line from your aiming eye through the bow's sight is taken from this frame's eye and bow, the sight pin kept in "
-         "the bow's own axes, so the dot no longer wanders while you walk. Off: as before (the last eye picture and the last drawn pin). "
-         "Command bowpinsteady on/off.");
-    bool qg = g_quiver_grip.load();
-    if (ImGui::Checkbox("Quiver only while the left grip holds the bow##bowquivergrip", &qg)) cmds += qg ? "bowquivergrip on\n" : "bowquivergrip off\n";
-    hint("On (default): your right shoulder gives an arrow only while the bow is in your left hand with the left grip held. Otherwise (the bow on "
-         "the sling, or in your hand with the left grip free) the right shoulder brings out the weapon in that slot, as with the other weapons. "
-         "Off: with the bow in hand the right shoulder is always the quiver. Command bowquivergrip on/off.");
-    bool bsl = g_sling.load();
-    if (ImGui::Checkbox("Bow on the sling##bowsling", &bsl)) cmds += bsl ? "bowsling on\n" : "bowsling off\n";
-    hint("On (default, with the sling on): the bow hangs on the sling like the other weapons. Hold the left grip on it to hold the bow in the left "
-         "hand (let go: back on the sling). Take it with the right grip and it goes into the left hand and stays there until you press and let go "
-         "the left grip. Off: the bow is always in the left hand. Command bowsling on/off.");
-    bool sgr = g_sling_grab.load();
-    if (ImGui::Checkbox("Take the slung bow anywhere along it##bowslinggrab", &sgr)) cmds += sgr ? "bowslinggrab on\n" : "bowslinggrab off\n";
-    hint("On (default): the left grip anywhere on the slung bow (its limbs and cams as well as its grip) takes it, and the left controller ticks "
-         "when your free left hand comes onto it. The right grip still takes it only at the sling's place (by the right hip), so a throwable grab "
-         "never takes the bow. Off: only a grip near the bow's own grip, at the sling's place, takes it. Command bowslinggrab on/off.");
+    hint("How still the drawn bow holds. Lower: steadier, but slower to follow small corrections.");
     float sgz = sling_grab_zone();
     if (ImGui::SliderFloat("How close to the slung bow (m)##bowslinggrabzone", &sgz, 0.04f, 0.30f, "%.2f")) cmds += fmt::format("bowslinggrabzone {:.2f}\n", sgz);
-    hint("How far from the slung bow's limbs the left grip still takes it (default 0.12 m). Command bowslinggrabzone m.");
+    hint("How close your left hand must be to the slung bow to take it.");
+    bool sbd = g_sling_body.load();
+    if (ImGui::Checkbox("Slung bow across the body##bowslingbody", &sbd)) cmds += sbd ? "bowslingbody on\n" : "bowslingbody off\n";
+    hint("The slung bow hangs flat across the front of your body. Off: it hangs like the rifle.");
+    float sba = sling_body_deg();
+    if (ImGui::SliderFloat("Slung bow's angle from upright (deg)##bowslingbodyangle", &sba, 0.0f, 90.0f, "%.0f")) cmds += fmt::format("bowslingbodyangle {:.0f}\n", sba);
+    hint("0: the slung bow stands upright. 90: it lies flat across the belly.");
     float slh[3]{ g_sling_hold[0].load(), g_sling_hold[1].load(), g_sling_hold[2].load() };
     if (ImGui::SliderFloat3("Bow turn on the sling: right, up, roll (deg)##bowslinghold", slh, -180.0f, 180.0f, "%.0f"))
         cmds += fmt::format("bowslinghold {:.0f} {:.0f} {:.0f}\n", slh[0], slh[1], slh[2]);
-    hint("A further turn of the bow where it hangs on the sling (default 0, 0, 90: rolled so its limbs lie across; 0, 0, 0 stands it upright, "
-         "its top in front of your face). Command bowslinghold yaw pitch roll; bowslinghold alone puts the default back.");
-    bool oe = g_dot_one_eye.load();
-    if (ImGui::Checkbox("Red dot in the aiming eye only##bowdoteye", &oe)) cmds += oe ? "bowdoteye on\n" : "bowdoteye off\n";
-    hint("On (default): the bow's red dot is drawn only in your aiming eye (the right eye, the left one when left-handed), the eye the sight is "
-         "lined up for. Off: in both eyes. Command bowdoteye on/off.");
-    bool se = g_sight_eye.load();
-    if (ImGui::Checkbox("Sight lined up for your aiming eye##bowsighteye", &se)) cmds += se ? "bowsighteye on\n" : "bowsighteye off\n";
-    hint("On (default): the line goes from your string hand's eye (right eye for a right-handed archer) through the sight, so the dot sits in the "
-         "middle of the ring for that eye, as with a real sight; the other eye sees it beside the ring. Off: from between your eyes (the dot "
-         "then sits beside the ring in both eyes). Command bowsighteye on/off.");
-    hint("On (default): while the string is drawn the arrow goes from your head through the bow's sight pin, so the sight (and the dot) put on a "
-         "target is where the arrow lands. Off: along the drawn arrow, from the string hand through the nock. Command bowsightaim on/off.");
+    hint("An extra turn of the slung bow where it hangs.");
     if (ImGui::Combo("Sight dot##bowpin", &pn, pin_items, 3)) cmds += pn == 2 ? "bowpin aim\n" : pn == 1 ? "bowpin pin\n" : "bowpin off\n";
-    hint("Where the arrow lands (default): a red dot at the point the arrow's line meets the scene, in each eye, so both eyes see one dot on the "
-         "target. On the bow's sight pin: the dot sits on the pin itself; your eye is above the arrow, so the pin put on a target shoots high, and "
-         "looking at the target you see the pin double. Command bowpin aim/pin/off.");
+    hint("Where the arrow lands: a red dot on the target. On the bow's pin: the dot sits on the pin itself.");
     float mind = g_min_draw.load() * 100.0f;
     if (ImGui::SliderFloat("Shoots only drawn at least (%)##bowmindraw", &mind, 0.0f, 100.0f, "%.0f")) cmds += fmt::format("bowmindraw {:.2f}\n", mind / 100.0f);
-    hint("Let go short of this share of full draw and the arrow does not fly: the game's draw is cancelled (its cancel-shot key, R) and the arrow "
-         "stays on the bow. 0: every release shoots. Command bowmindraw 0.80; bowcancelkey 0x13 (R) or 0 for pad X.");
-    bool ar = g_arrow_on.load();
-    if (ImGui::Checkbox("Show the arrow (and where to nock it)##bowarrow", &ar)) cmds += ar ? "bowarrow on\n" : "bowarrow off\n";
-    hint("On (default): the arrow is drawn in your hand, on the bow and on the string, always in front of the scene, until the game's own arrow "
-         "is in use (below). Bring it about 20 cm above your bow hand to nock it (no marker is drawn there).");
-    bool up = g_upright.load();
-    if (ImGui::Checkbox("Bow upright in the hand##bowupright", &up)) cmds += up ? "bowupright on\n" : "bowupright off\n";
-    hint("On (default): the bow stands along your left fist with its arrow pointing where your controller points (the game itself holds it tipped "
-         "onto its side). Measured from the game's own bow and arrow a moment after you first hold each bow. Command bowupright on/off.");
+    hint("Let go before this much of a full draw and the arrow stays on the bow instead of flying. 0: every release shoots.");
+    const bool up = g_upright.load();
     if (up) {
         bool fl = g_flip.load();
         if (ImGui::Checkbox("Flip the bow (upside down)##bowflip", &fl)) cmds += fl ? "bowflip on\n" : "bowflip off\n";
-        hint("Off (default): the bow's limbs stand as measured. On: the bow turned a half turn about its arrow, for a bow that still shows upside down "
-             "in your hand. Command bowflip on/off.");
+        hint("Turns the bow upside down, for a bow that shows the wrong way up in your hand.");
         float hp[3]{ g_hand_pos[0].load(), g_hand_pos[1].load(), g_hand_pos[2].load() };
         if (ImGui::SliderFloat3("Bow in the hand: right, up, back (m)##bowhandpos", hp, -0.10f, 0.10f, "%.2f"))
             cmds += fmt::format("bowhandpos {:.2f} {:.2f} {:.2f}\n", hp[0], hp[1], hp[2]);
-        hint("Moves the bow and your left hand on it from your left controller (default 0, -0.02, 0: 2 cm lower). Command bowhandpos x y z.");
+        hint("Moves the bow and your left hand on it.");
         float h[3]{ g_hold[0].load(), g_hold[1].load(), g_hold[2].load() };
         if (ImGui::SliderFloat3("Bow turn in the hand: right, up, roll (deg)##bowhold", h, -45.0f, 45.0f, "%.0f"))
             cmds += fmt::format("bowhold {:.0f} {:.0f} {:.0f}\n", h[0], h[1], h[2]);
-        hint("A further turn of the bow in your hand if it does not sit right: aim it more to the right or up, or roll it (cant). Command bowhold yaw pitch roll.");
-        bool uk = g_upright_keep.load();
-        if (ImGui::Checkbox("Keep each bow's upright turn##bowuprightkeep", &uk)) cmds += uk ? "bowuprightkeep on\n" : "bowuprightkeep off\n";
-        hint("On (default): the turn measured the first time you hold a bow is kept (fc5vr_bowupright.txt), so from the next load that bow is upright at "
-             "once, in your hand and on the sling. Off: measured again each session (on the sling until then it hangs as the game holds it). "
-             "Command bowuprightkeep on/off.");
-        bool uw = g_upright_wait.load();
-        if (ImGui::Checkbox("Measure the bow only once it has settled in the hand##bowuprightwait", &uw)) cmds += uw ? "bowuprightwait on\n" : "bowuprightwait off\n";
-        hint("On (default, author 7 Nov: the bow upside down after the game switched to it by itself): the bow's arrow and upright turn are measured "
-             "only once the bow has been out 1.5 s and the game's arrow points straight ahead, never while the game's switch animation still moves it. "
-             "Off: measured at the first chance, as before. Command bowuprightwait on/off.");
+        hint("Turns the bow in your hand if it doesn't sit right.");
     }
-    bool pl = g_pull.load();
-    if (ImGui::Checkbox("The string follows your right hand (pull it partway)##bowpull", &pl)) cmds += pl ? "bowpull on\n" : "bowpull off\n";
-    hint("On (default): the string and the arrow sit at your right hand as you pull, partway or all the way, and your right hand stays on its "
-         "controller. The bow's rest and full draw are taken from the game the first time you draw each bow fully (that first draw shows the "
-         "game's own animation). The buzz comes when the string reaches full draw. Off: the game's own draw animation. Command bowpull on/off.");
+    const bool pl = g_pull.load();
     if (pl) {
         ImGui::Text("String: %s", g_pull_active.load() ? "follows the hand" : "waits for a first full draw with this bow");
         float sh[3]{ g_string_hand[0].load(), g_string_hand[1].load(), g_string_hand[2].load() };
         if (ImGui::SliderFloat3("String at the hand: right, up, back (m)##bowstringhand", sh, -0.15f, 0.15f, "%.2f"))
             cmds += fmt::format("bowstringhand {:.2f} {:.2f} {:.2f}\n", sh[0], sh[1], sh[2]);
-        hint("Where the string sits from your right controller while you draw (default 0, 0, -0.05: 5 cm in front of the grip, at the fingers). "
-             "Move it until the string runs through your fingers. Command bowstringhand x y z.");
-        bool pk = g_pull_keep.load();
-        if (ImGui::Checkbox("Keep the learnt draw (no arrow slipping)##bowpullkeep", &pk)) cmds += pk ? "bowpullkeep on\n" : "bowpullkeep off\n";
-        hint("On (default): once the bow's rest and full draw are known, the game's own pose is taken again only when the string has been held a "
-             "second (the game's draw done), and the arrow's never shorter than the one known. Off: taken at any still moment, as before; "
-             "right after the trigger the game's own arrow then showed through and the arrow slid back and forth. Command bowpullkeep on/off.");
+        hint("Moves where the string sits from your right hand while drawing.");
         if (ImGui::Button("Learn the string again##bowpullforget")) cmds += "bowpullforget\n";
-        hint("The bows' rest and full draw are kept in fc5vr_bowpull.txt (and fc5vr_bowpull_default.txt shipped with the mod). This forgets yours: "
-             "the next full draw with each bow learns it again.");
+        hint("Forgets your saved draw lengths. The next full draw with each bow learns them again.");
     }
-    bool hs = g_hand_string.load();
-    if (ImGui::Checkbox("Right hand stays on the string while drawing##bowhandstring", &hs)) cmds += hs ? "bowhandstring on\n" : "bowhandstring off\n";
-    hint("On (default): once the string is pulled far enough that the game draws its bow, your right hand is drawn where the game holds the string "
-         "(it follows the game's draw), and goes back to your controller when you let go. Off: it always follows your controller. Command bowhandstring on/off.");
-    bool md = g_model_on.load();
-    if (ImGui::Checkbox("Use the game's own arrow##bowarrowmodel", &md)) cmds += md ? "bowarrowmodel on\n" : "bowarrowmodel off\n";
-    hint("On (default): the game's arrow model instead of the drawn one. The mod learns which of the bow's parts is the arrow at your first shot "
-         "with each bow (until then you see the drawn arrow). Then the bow shows no arrow until you nock one, the arrow you take from the quiver "
-         "is the game's, and on the bow it is the game's own arrow where the game puts it. Command bowarrowmodel on/off.");
+    const bool md = g_model_on.load();
     if (md && sig != 0 && is_bow(sig)) {
         const std::string parts = arrow_parts_text(sig);
         ImGui::Text("This bow's arrow: %s", parts.empty() ? "not learnt yet (shoot one arrow)" : fmt::format("learnt (draws of {} indices)", parts).c_str());

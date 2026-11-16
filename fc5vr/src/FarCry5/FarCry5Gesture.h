@@ -143,6 +143,8 @@ bool hand_point(int hand, glm::vec3& pos);
 // Sling. The weapon's pose on the sling, tracking space, from the head pose: x right, y up, -z along the barrel,
 // origin = the weapon's grip (where the hand holds it). slung(): the last poll put the weapon on the sling.
 glm::mat4 sling_pose(const glm::mat4& head, bool mirror);
+// slingrot's turn alone (the last factor of sling_pose: left, down, roll, mirrored for a left-handed player).
+glm::mat3 sling_rot_turn(bool mirror);
 bool      slung();
 // twohandkeep on|off (saved, default on; author 5 Nov 22:47). The weapon hand's grip let go
 // while the two-handed hold has the weapon: the weapon stays in the other (left) hand, held as it was at that moment, instead of going to
@@ -150,6 +152,8 @@ bool      slung();
 // weapon where the left hand holds it. The right grip pressed within twohandkeepzone m (saved, default 0.15) of the weapon's grip takes it
 // back (or a sling or hip grab); the left grip let go puts it on the sling (or the hip). kept(): the weapon is held so now (the last poll).
 bool      kept();
+// bowrighthand (FarCry5Bow.h): the slung bow taken with the right grip is in the right (weapon) hand while that grip is held (the last poll).
+bool      bow_weapon_hand();
 bool      keep_on();     // twohandkeep
 float     keep_zone();   // twohandkeepzone
 bool      sling_on();   // sling mode switched on (cmd sling)
@@ -219,10 +223,19 @@ glm::mat4 hip_pose(const glm::mat4& head, bool mirror);
 // with the body's heading (fwd: that heading, level), on the other hand's side.
 glm::vec3 pouch_pos(const glm::mat4& head, bool mirror, glm::vec3& fwd);
 glm::mat4 rest_pose(const glm::mat4& head, bool mirror);   // where the game's weapon hangs when not in the hand
-// armik (FarCry5ArmIkDraw.cpp): the body's heading the shoulders, sling and hip turn with (radians about +y, tracking space, 0 = facing -z; it
+// bodyik (FarCry5BodyIkDraw.cpp): the body's heading the body, sling and hip turn with (radians about +y, tracking space, 0 = facing -z; it
 // follows the head past a dead zone), and the neck's pivot from the eyes (head frame: down, back; m).
 float     body_yaw();
 inline constexpr float kNeckPivotDown = 0.10f, kNeckPivotBack = 0.08f;
+// bodyikworn (FarCry5BodyIkDraw.cpp, FarCry5BodyIk.h worn_place; author 14 Nov 15:07Z; replaces
+// bodyikcarry, which moved them from the eyes by the hips' lag): with body IK on and on foot, the slung weapon, the sidearm's holster, the
+// throwables' pouch and the magazine are worn on the drawn body: each frame bodyik gives each one's whole place, as a move from the eyes on
+// the body's heading (tracking space: translate(eyes) x body yaw x rel), and the offsets from the eyes (slingpos, sidearmpos, throwpos,
+// reloadpouch) are not used; the angles (slingrot, sidearmrot) still turn the weapons. Their grab zones go with them. Not given for 0.25 s
+// (body IK off, bodyikworn off, a vehicle, a menu): from the eyes, as before.
+enum CarryPart : int { kCarrySling = 0, kCarryHolster = 1, kCarryPouch = 2, kCarryMag = 3, kCarryParts };
+void set_carry_anchor(bool on, const glm::mat4 (&rel)[kCarryParts]);
+bool carry_anchored();
 bool      side_on();          // sidearm and sling both on
 bool      cur_side();         // the game's weapon at the last poll is a sidearm
 bool      game_draw_grab();   // gamedrawgrab: grabs ask the game for the very weapon

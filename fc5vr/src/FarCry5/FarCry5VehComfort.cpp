@@ -130,20 +130,17 @@ void FarCry5Stereo::draw_vehcomfort_menu(const std::function<void(const char*, s
         m_veh_vignette = g;
         keep("vehvignette", fmt::format("vehvignette {:.2f}", g));
     }
-    hint("In a vehicle, the edges of the picture darken while it turns, speeds up, brakes or bumps hard, and clear again when the ride is calm. More = a smaller clear area. "
-         "0 = off (default).");
+    hint("In a vehicle, the edges of the view darken during hard turns, speed changes and bumps. 0: off.");
     bool fg = m_veh_fly_guard.load();
     if (ImGui::Checkbox("Flying is seen only while the vehicle moves", &fg)) {
         m_veh_fly_guard = fg;
         keep("vehflyguard", fg ? "vehflyguard on" : "vehflyguard off");
     }
-    hint("On (default): a vehicle counts as flying from its tilt only while it moves and you are not looking far down, so a parked car is not taken "
-         "for a plane and the view does not tilt with it. Off: as before 25 Oct.");
+    hint("A vehicle counts as flying only while it moves, so a parked car doesn't tilt your view.");
     float fm = m_fall_vmin.load();
     if (slider("Falls: held as a vehicle once faster than", fm, 0.0f, 12.0f, fm <= 0.001f ? "any fall (as before)" : "%.1f m/s", 0.5f)) {
         m_fall_vmin = fm;
         keep("fallvmin", fmt::format("fallvmin {:.1f}", fm));
     }
-    hint("A fall turns the view with the parachute (the game camera then follows it). Running down a hill sinks 3-4 m/s: below this speed it stays "
-         "on foot and the view does not turn with your running. 6 m/s = default; 0 = any fall over half a second, as before 25 Oct.");
+    hint("A fall faster than this counts as a parachute. 0: any fall over half a second.");
 }

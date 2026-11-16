@@ -96,8 +96,7 @@ namespace fc5::wristammo
         const Opts o = opts();
         bool       v = o.on;
         if (ImGui::Checkbox("Ammo under the wrist##wristammo", &v)) cmds += v ? "wristammo on\n" : "wristammo off\n";
-        hint("Rounds in the gun / what it holds / rounds left, under the weapon hand's wrist. With the manual reload, the rounds you loaded by hand; "
-             "amber while the gun cannot fire yet (rack the handle, work the bolt, close the cylinder), red when empty. Command wristammo on/off.");
+        hint("Shows the rounds in your gun and left under your weapon hand's wrist. Command wristammo.");
         if (!v) return;
         float p[3]{ o.pos[0] * 100.0f, o.pos[1] * 100.0f, o.pos[2] * 100.0f };
         bool  moved = false;
@@ -105,13 +104,10 @@ namespace fc5::wristammo
         moved |= ImGui::SliderFloat("Up (cm)##wristammoy", &p[1], -30.0f, 30.0f, "%.1f");
         moved |= ImGui::SliderFloat("Back towards the elbow (cm)##wristammoz", &p[2], -30.0f, 40.0f, "%.1f");
         if (moved) cmds += fmt::format("wristammopos {:.3f} {:.3f} {:.3f}\n", p[0] * 0.01f, p[1] * 0.01f, p[2] * 0.01f);
-        hint("From the weapon controller, in its own axes (mirrored when left-handed). Default 0, -5, 10 cm: under the wrist. Command wristammopos right up back (m).");
+        hint("Moves the ammo display.");
         float sz = o.size * 100.0f;
         if (ImGui::SliderFloat("Text height (cm)##wristammosize", &sz, 0.5f, 6.0f, "%.1f")) cmds += fmt::format("wristammosize {:.3f}\n", sz * 0.01f);
-        hint("Default 1.8 cm (the first number; the others are smaller). Command wristammosize m.");
-        bool sm = o.smooth;
-        if (ImGui::Checkbox("Smooth digits in Far Cry 5 colours##wristammostyle", &sm)) cmds += sm ? "wristammostyle smooth\n" : "wristammostyle pixel\n";
-        hint("On: smooth digits on a dark panel with an orange bar. Off: the square pixel font of the first version. Command wristammostyle smooth/pixel.");
+        hint("Size of the ammo display's text.");
     }
 }
 
@@ -346,10 +342,15 @@ void main(uint2 p : SV_DispatchThreadID)
             }
         }
         if (fmt != g_wa.fmt || w > g_wa.tw || h > g_wa.th) {
+            // Grown, never shrunk (F11 audit, 13 Nov): the boxes asked for alternate between a wide and a tall shape and drift by a few
+            // pixels as the wrist moves, so sizing to the last box alone made the two textures again at almost every draw (2622 times in
+            // The author's 15 min session of 13 Nov, up to 20 a second). Now each side is the largest seen, rounded up to 64.
+            const UINT kw = fmt == g_wa.fmt ? g_wa.tw : 0, kh = fmt == g_wa.fmt ? g_wa.th : 0;
             wa_release_tex();
             g_wa.fmt = fmt;
             D3D11_TEXTURE2D_DESC nd{};
-            nd.Width = std::max<UINT>(w, 640); nd.Height = std::max<UINT>(h, 256);
+            nd.Width  = (std::max<UINT>({ w, kw, 640u }) + 63u) & ~63u;
+            nd.Height = (std::max<UINT>({ h, kh, 256u }) + 63u) & ~63u;
             nd.MipLevels = 1; nd.ArraySize = 1; nd.SampleDesc = { 1, 0 }; nd.Usage = D3D11_USAGE_DEFAULT;
             nd.Format    = wa_typeless(fmt);
             nd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -565,6 +566,12 @@ void FarCry5Stereo::wrist_ammo_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* e
     if (m_mo.frame == fr) {
         P          = (bow ? m_mo.hand_pos_world : m_mo.ctrl_pos_world) + R * off;
         s.rel      = P - m_hist[0].cur_cam;
+        // camfine: the same from the tracking offsets alone (P and the eye's camera are each rounded to the map's float grid, 0.24 mm:
+        // their difference jumped by a pixel or more every frame). Taken while it agrees with the old one to 2 mm.
+        if (!bow && m_cam_fine.load() && m_mo.ctrl_rel_frame == fr && m_cf_eye_rel_frame == fr) {
+            const glm::vec3 fine = m_mo.ctrl_rel + m_mo.draw_shift + R * off - m_cf_eye_rel;
+            if (glm::length(fine - s.rel) < 0.002f) s.rel = fine;
+        }
         s.rel_frame = fr;
     } else if (fr - s.rel_frame >= 0 && fr - s.rel_frame <= 3) {
         P = m_hist[0].cur_cam + s.rel;
@@ -576,29 +583,31 @@ void FarCry5Stereo::wrist_ammo_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* e
     D3D11_TEXTURE2D_DESC d{};
     eye->GetDesc(&d);
     const float W = float(d.Width), H = float(d.Height);
-    auto proj = [&](const glm::vec3& p, glm::vec2& px) {
-        const glm::vec4 cl = m_hist[0].cur_vrp * glm::vec4{ p - m_hist[0].cur_cam, 1.0f };
+    // (Points are given from the eye's camera, so a 1 cm step is not rounded to the map's float grid: the size no longer flickers by 1 %.)
+    const glm::vec3 P_rel = s.rel;
+    auto proj = [&](const glm::vec3& rel, glm::vec2& px) {
+        const glm::vec4 cl = m_hist[0].cur_vrp * glm::vec4{ rel, 1.0f };
         if (cl.w <= 0.05f) return false;
         px = { (cl.x / cl.w * 0.5f + 0.5f) * W, (0.5f - cl.y / cl.w * 0.5f) * H };
         return true;
     };
     glm::vec2 c{};
-    if (!proj(P, c)) return;
+    if (!proj(P_rel, c)) return;
     // Pixels per metre at the wrist: a 1 cm step across the view (level, square to the line from the eye), so the size does not breathe as
     // the head turns against the world's axes (wristsprint). Looking straight down on it: the largest step along the world's three axes.
     float ppm = 0.0f;
     {
-        glm::vec3       across = glm::cross(P - m_hist[0].cur_cam, glm::vec3{ 0.0f, 0.0f, 1.0f });
+        glm::vec3       across = glm::cross(P_rel, glm::vec3{ 0.0f, 0.0f, 1.0f });
         const float     al     = glm::length(across);
         glm::vec2       q{};
-        if (al > 1e-3f && proj(P + across * (0.01f / al), q)) ppm = glm::length(q - c) / 0.01f;
+        if (al > 1e-3f && proj(P_rel + across * (0.01f / al), q)) ppm = glm::length(q - c) / 0.01f;
     }
     if (ppm <= 0.0f) {
         for (int a = 0; a < 3; ++a) {
             glm::vec3 e{ 0.0f };
             e[a] = 0.01f;
             glm::vec2 q{};
-            if (proj(P + e, q)) ppm = std::max(ppm, glm::length(q - c) / 0.01f);
+            if (proj(P_rel + e, q)) ppm = std::max(ppm, glm::length(q - c) / 0.01f);
         }
     }
     if (ppm <= 0.0f) return;

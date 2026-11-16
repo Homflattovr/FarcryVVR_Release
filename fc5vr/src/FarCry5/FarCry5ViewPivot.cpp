@@ -24,6 +24,9 @@
 //    Those five stay as test commands, no longer saved or in F11; viewpivotlag and walkbob's bob test knobs are retired.
 //  - viewjumpcm N (log only, saved, default 4, 0 = off; 29 Oct, author): [ViewJump] lines for
 //    pairs whose eyes' base steps off a steady motion or whose horizon tilts (view_jump_note).
+//  - smoothlog N (test; sprint view jumps 13 Nov): N pictures of smoothmotion on foot, one [Motion] smoothlog line each: the wall and
+//    display time steps, the filter's input (the body less the offset turned with the head), its output, pace and error, quick or not,
+//    the game camera and the body root with the frames they were seen at. For replaying the filter offline on the game's own samples.
 //  - viewlog N (test): N presents of the drawn eye (position, yaw / pitch / roll), the game camera, its offset from the root in
 //    the aim's frame, the aim, the Extended View offset and the shift, one line per world upload.
 #include "FarCry5Stereo.h"
@@ -63,6 +66,7 @@ bool FarCry5Stereo::pivot_command(const std::string& cmd, const std::string& arg
     if (cmd == "smoothtau") { m_smooth_tau = std::clamp(float(std::atof(arg.c_str())), 0.01f, 0.5f); return true; }   // smoothtau S (test)
     if (cmd == "smoothquick") { m_smooth_quick = std::clamp(float(std::atof(arg.c_str())), 0.005f, 0.5f); return true; }   // smoothquick S (test)
     if (cmd == "aimease") { m_aim_ease_ms = std::clamp(std::atoi(arg.c_str()), 0, 1500); persist = true; return true; }   // aimease ms (saved)
+    if (cmd == "smoothlog") { m_ms_trace = arg.empty() ? 300 : std::max(0, std::atoi(arg.c_str())); return true; }   // smoothlog N (test): N pictures of smoothmotion, one line each
     if (cmd == "viewlog") { m_view_log = arg.empty() ? 600 : std::max(0, std::atoi(arg.c_str())); return true; }   // viewlog N (test)
     if (cmd == "viewjumpcm") { m_vj_cm = std::clamp(float(std::atof(arg.c_str())), 0.0f, 100.0f); persist = true; return true; }   // viewjumpcm N (saved, 0 = off)
     return false;
@@ -276,12 +280,25 @@ glm::vec3 FarCry5Stereo::motion_smooth(int frame, const glm::vec3& base)
     const auto    now  = std::chrono::steady_clock::now();
     const int64_t T    = runtimes::OpenXR::s_fc5_pose_time.load();
     float         dt   = m_ms_pair >= 0 ? std::chrono::duration<float>(now - m_ms_t).count() : 1.0f;
+    const float   wall = dt;   // smoothlog
     const bool    disp = m_ms_T > 0 && T > m_ms_T && T - m_ms_T < 250000000;
     if (disp) dt = float(double(T - m_ms_T) * 1e-9);
     const bool gap = m_ms_pair < 0 || pair < m_ms_pair || pair - m_ms_pair > 8 || !(dt > 1e-4f) || dt > 0.25f;
     m_ms_pair      = pair;
     m_ms_t         = now;
     m_ms_T         = T;
+    // smoothlog (test): this picture's samples, after the filter has run (what = restart, start, reset, quick or steady).
+    glm::vec3   tr_err{ 0.0f };
+    const char* tr_what = "restart";
+    auto trace = [&](const glm::vec3& out) {
+        if (m_ms_trace.load() <= 0) return;
+        m_ms_trace--;
+        spdlog::info("[Motion] smoothlog pair {} wall {:.2f} disp {:.2f} ms{} | z {:.4f} {:.4f} {:.4f} | out {:.4f} {:.4f} {:.4f} | v {:.3f} {:.3f} {:.3f} | err {:.4f} {:.4f} {:.4f} {} | "
+                     "cam {:.4f} {:.4f} {:.4f} | root {:.4f} {:.4f} {:.4f} f {} {} {} | head {:.4f} {:.4f} | bob {:+.4f} | vr {:.2f}",
+                     pair, wall * 1000.0f, dt * 1000.0f, disp ? "" : " (wall)", z.x, z.y, z.z, out.x, out.y, out.z, m_ms_v.x, m_ms_v.y, m_ms_v.z, tr_err.x, tr_err.y, tr_err.z, tr_what,
+                     m_mo.cam.x, m_mo.cam.y, m_mo.cam.z, m_body_root.x, m_body_root.y, m_body_root.z, m_body_root_frame, m_body_root_prev_frame, m_body_root_prev2_frame, head.x, head.y,
+                     m_bob_applied ? m_bob_out : 0.0f, m_vr_w);
+    };
     // The log: steps off a steady motion (scaled to the step's time) before and after the filter, over 4 cm.
     auto off_steady = [&](const glm::vec3& step, const glm::vec3& last) { return glm::length(step - last * (dt / std::max(m_ms_dt, 1e-4f))); };
     if (!foot || gap) {
@@ -295,6 +312,7 @@ glm::vec3 FarCry5Stereo::motion_smooth(int frame, const glm::vec3& base)
             m_ms_raw_ok = true;
             m_ms_dt    = dt;
             m_ms_raw_step = m_ms_out_step = glm::vec3{ 0.0f };
+            trace(z);
         }
         return base;
     }
@@ -303,6 +321,7 @@ glm::vec3 FarCry5Stereo::motion_smooth(int frame, const glm::vec3& base)
         m_ms_x  = z;
         m_ms_v  = m_ms_raw_ok && glm::length(raw_step) < 0.75f ? raw_step / dt : glm::vec3{ 0.0f };
         m_ms_ok = true;
+        tr_what = "start";
     } else {
         const glm::vec3 pred = m_ms_x + m_ms_v * dt;
         const glm::vec3 err  = z - pred;
@@ -311,10 +330,14 @@ glm::vec3 FarCry5Stereo::motion_smooth(int frame, const glm::vec3& base)
             m_ms_v = glm::vec3{ 0.0f };
             m_ms_err_prev = glm::vec3{ 0.0f };
             m_ms_resets++;
+            tr_err  = err;
+            tr_what = "reset";
         } else {
             const bool quick = glm::dot(err, m_ms_err_prev) > 0.0f && glm::length(err) > 0.015f && glm::length(m_ms_err_prev) > 0.015f;
             const float tau  = quick ? std::min(m_smooth_quick.load(), m_smooth_tau.load()) : m_smooth_tau.load();
             if (quick) m_ms_quick_n++;
+            tr_err  = err;
+            tr_what = quick ? "quick" : "steady";
             m_ms_err_prev = err;
             const float a = 1.0f - std::exp(-dt / std::max(tau, 0.005f));
             const float b = a * a / (2.0f - a);
@@ -349,6 +372,7 @@ glm::vec3 FarCry5Stereo::motion_smooth(int frame, const glm::vec3& base)
         m_ms_raw_max = m_ms_out_max = m_ms_lag_max = 0.0f;
     }
     m_ms_out = m_ms_x + head;
+    trace(m_ms_x);
     return m_ms_used ? m_ms_out : base;
 }
 
@@ -441,7 +465,5 @@ void FarCry5Stereo::draw_pivot_menu(const std::function<void(const char*, std::s
         m_aim_ease_ms = ms;
         keep("aimease", fmt::format("aimease {}", ms));
     }
-    hint("Default 300 ms (author 27 Oct when taking a weapon from the sling or the hip). The game's camera sits on the "
-         "player's neck; when a weapon comes into your hand the game's aim goes from your head to the barrel. Spread over this time, the neck moves a "
-         "little at a time instead of jolting the view. The trigger still turns it at once. 0: in one go, as before.");
+    hint("When you take a weapon in hand, the view eases over this time instead of jolting. 0: at once.");
 }

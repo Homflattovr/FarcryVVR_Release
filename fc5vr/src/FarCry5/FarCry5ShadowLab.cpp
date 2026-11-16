@@ -10,6 +10,7 @@
 // in F11 Debug > Sun shadows (FarCry5Stereo.cpp).
 #include "FarCry5Stereo.h"
 #include "FarCry5LodFov.h"
+#include "FarCry5SunShare.h"
 
 #include <d3d11_1.h>
 #include <imgui.h>
@@ -337,6 +338,145 @@ FarCry5Stereo::LabSaved FarCry5Stereo::lab_dispatch(ID3D11DeviceContext* ctx, UI
         s.slot[0]  = slot;
         s.n        = 1;
         if (m_lab_split_runs++ == 0) spdlog::info("[ShadowLab] shadowsplit {}: first resolve patched ({} b{}, {} B from byte {})", split, crc, slot, len, off);
+    }
+    return s;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// sunshare fix 4 (11 Nov 2026). Headset dumps of 11 Nov (research\2026-11-11_f6_sunshare): with the switch on the two calls read
+// the same cascade map, but the right call's resolve still had cascade rows of its own in CTileLightingBlendedParameterProvider
+// (20-84 texels and about 20 cm of depth away), although every upload sunshare saw had been set to the left's rows. So that
+// buffer reaches the GPU by a way note_cb does not see. Here the rows are fixed where they are read: at each sun shadow resolve
+// of the left call c0-c8 of the bound window are kept (GPU copy, no stall); at each resolve of a right call that skipped its
+// cascade draws, the window is copied into a stand-in, the left's c0-c8 go over it, and the stand-in is bound for that one
+// dispatch (lab_restore puts the game's buffer back). Same mechanism as shadowsplit.
+// Self-check: for the first 20 shared pairs after each switch-on, three small readbacks per pair say what the game gave the
+// right call and what the resolve was given. The simulator cannot show the fault (its two calls make the same fit), the headset can.
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+FarCry5Stereo::LabSaved FarCry5Stereo::sun_rows_dispatch(ID3D11DeviceContext* ctx)
+{
+    LabSaved                   s{};
+    ID3D11ComputeShader* const cs = m_cur_cs;
+    if (!cs || m_scope_call || ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return s;
+    const int call = fc5_frame_call();
+    if (call != 1 && call != 2) return s;
+    if (!lab_is_resolve(cs)) return s;
+    UINT        slot = 255;
+    std::string crc;
+    {
+        std::lock_guard _{ m_ps_mtx };
+        if (auto it = m_cs_cbs.find(cs); it != m_cs_cbs.end())
+            for (const auto& [n, sl] : it->second) if (n == "CTileLightingBlendedParameterProvider") { slot = sl; break; }
+        if (auto it = m_cs_names.find(cs); it != m_cs_names.end()) crc = it->second.substr(0, 9);
+    }
+    auto fail = [&](uint32_t bit, const char* why) {
+        if (!(m_sun_fail_logged & bit)) { m_sun_fail_logged |= bit; spdlog::warn("[SunShare] shadow pass {}: the left's rows not given: {}", crc, why); }
+        return LabSaved{};
+    };
+    if (slot == 255) return fail(1, "no CTileLightingBlendedParameterProvider slot known for this shader");
+    const int frame = m_frame.load();
+    if (const uint32_t ser = fc5::sunshare::on_serial(); ser != m_sun_chk_serial) {   // switched on (again): check the next shared pairs
+        m_sun_chk_serial = ser;
+        m_sun_chk_left   = kSunChkPairs;
+        m_sun_chk_lframe = m_sun_chk_rframe = -1;
+        m_sun_chk_n = 0; m_sun_chk_own = 0; m_sun_chk_given = 0; m_sun_chk_wait = 0;
+        m_sun_chk_worst = 0.0f;
+        m_sun_chk_state = 1;
+        m_sun_fail_logged = 0;
+    }
+    if (!m_sun_standin || !m_sun_rows) {
+        ID3D11Device* dev = nullptr;
+        ctx->GetDevice(&dev);
+        if (dev) {
+            D3D11_BUFFER_DESC sd{};
+            sd.Usage     = D3D11_USAGE_DEFAULT;
+            sd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            sd.ByteWidth = 4096;
+            if (!m_sun_standin) dev->CreateBuffer(&sd, nullptr, &m_sun_standin);
+            sd.ByteWidth = 144;
+            if (!m_sun_rows) dev->CreateBuffer(&sd, nullptr, &m_sun_rows);
+            dev->Release();
+        }
+    }
+    if (!m_sun_standin || !m_sun_rows) return fail(2, "the stand-in buffers could not be made");
+    ID3D11DeviceContext1* ctx1 = nullptr;
+    if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&ctx1))) || !ctx1) return fail(4, "no ID3D11DeviceContext1");
+    ID3D11Buffer* cb = nullptr;
+    UINT          first = 0, num = 0;
+    ctx1->CSGetConstantBuffers1(slot, 1, &cb, &first, &num);
+    ctx1->Release();
+    if (!cb) return fail(8, "no buffer bound in that slot");
+    D3D11_BUFFER_DESC bd{};
+    cb->GetDesc(&bd);
+    const UINT off = first * 16;
+    const UINT len = std::min(4096u, bd.ByteWidth > off ? bd.ByteWidth - off : 0u);
+    if (len < 176) { cb->Release(); return fail(16, "the bound window is shorter than 176 B"); }   // c0-c8 and ShadowMapSize (c10)
+
+    if (call == 1) {
+        {
+            OwnGuard  g{ m_lab_own };
+            D3D11_BOX rows{ off, 0, 0, off + 144, 1, 1 };
+            ctx->CopySubresourceRegion(m_sun_rows, 0, 0, 0, 0, cb, 0, &rows);
+        }
+        m_sun_rows_frame = frame;
+        if (m_sun_chk_left > 0 && m_sun_chk_lframe != frame && lab_read_cb(ctx, 2, slot, m_sun_chk_l, 176) && m_sun_chk_l.size() >= 44) m_sun_chk_lframe = frame;
+        cb->Release();
+        return s;
+    }
+
+    // The right call. Only when it skipped its own cascade draws (else its own rows are the right ones for the map it drew).
+    if (m_sun_rows_frame != frame - 1 || !fc5::sunshare::sharing()) {
+        if (m_sun_chk_left > 0 && m_sun_chk_rframe != frame) { m_sun_chk_rframe = frame; m_sun_chk_wait++; }
+        cb->Release();
+        return s;
+    }
+    const bool         chk = m_sun_chk_left > 0 && m_sun_chk_rframe != frame && m_sun_chk_lframe == frame - 1;   // once per pair, at its first resolve
+    std::vector<float> own, got;
+    if (chk) lab_read_cb(ctx, 2, slot, own, 176);   // what the game bound for the right call
+    {
+        OwnGuard  g{ m_lab_own };
+        D3D11_BOX all{ off, 0, 0, off + len, 1, 1 };
+        ctx->CopySubresourceRegion(m_sun_standin, 0, 0, 0, 0, cb, 0, &all);
+        D3D11_BOX rows{ 0, 0, 0, 144, 1, 1 };
+        ctx->CopySubresourceRegion(m_sun_standin, 0, 0, 0, 0, m_sun_rows, 0, &rows);
+    }
+    ctx->CSSetConstantBuffers(slot, 1, &m_sun_standin);
+    s.cb[0]    = cb;   // released by lab_restore
+    s.first[0] = first;
+    s.num[0]   = num;
+    s.slot[0]  = slot;
+    s.n        = 1;
+    if (m_sun_runs++ == 0)
+        spdlog::info("[SunShare] fix 4: first right-call shadow pass given the left's rows ({} b{}, buffer of {} B, window from byte {}, {} B)", crc, slot, bd.ByteWidth, off, num ? num * 16 : bd.ByteWidth - off);
+    if (chk) {
+        m_sun_chk_rframe = frame;
+        lab_read_cb(ctx, 2, slot, got, 176);   // what the resolve reads now
+        const std::vector<float>& L = m_sun_chk_l;
+        if (own.size() >= 44 && got.size() >= 44 && L.size() >= 44) {
+            const float S   = L[40] > 1.0f ? L[40] : 1.0f;   // ShadowMapSize.x
+            float       tex = 0.0f, dep = 0.0f;
+            for (int k = 0; k < 3; ++k) {
+                tex = std::max({ tex, S * std::fabs(own[k * 12 + 3] - L[k * 12 + 3]), S * std::fabs(own[k * 12 + 7] - L[k * 12 + 7]) });
+                dep = std::max(dep, std::fabs(own[k * 12 + 11] - L[k * 12 + 11]));
+            }
+            const bool own_same = std::memcmp(own.data(), L.data(), 144) == 0;
+            const bool given    = std::memcmp(got.data(), L.data(), 144) == 0;
+            const int  n        = ++m_sun_chk_n;
+            if (!own_same) m_sun_chk_own++;
+            if (given) m_sun_chk_given++;
+            if (tex > m_sun_chk_worst.load()) m_sun_chk_worst = tex;
+            spdlog::info("[SunShare] self-check pair {}/{} (frames {} {}, {}): the game gave the right eye {}; its shadow pass read {}",
+                         n, int(kSunChkPairs), frame - 1, frame, crc,
+                         own_same ? std::string{ "the left's rows already" } : fmt::format("rows of its own, up to {:.1f} texels and {:.5f} depth from the left's", tex, dep),
+                         given ? "the left's rows (good)" : "OTHER ROWS (the fix did not hold)");
+            if (--m_sun_chk_left == 0) {
+                m_sun_chk_state = 2;
+                spdlog::info("[SunShare] self-check done: {}: the right eye's shadow pass read the left's rows in {} of {} pairs; the game itself gave the right eye "
+                             "rows of its own in {} of them (up to {:.1f} texels away); {} right calls were not shared meanwhile",
+                             m_sun_chk_given.load() == n ? "PASS" : "FAIL", m_sun_chk_given.load(), n, m_sun_chk_own.load(), m_sun_chk_worst.load(), m_sun_chk_wait.load());
+            }
+        }
     }
     return s;
 }
@@ -756,32 +896,25 @@ bool FarCry5Stereo::lab_command(const std::string& cmd, const std::string& arg, 
 void FarCry5Stereo::lab_menu(void (*hint)(const char*), void (*section)(const char*))
 {
     if (!ImGui::CollapsingHeader("Lights and shadows lab (tests)")) return;
-    ImGui::TextWrapped("Tools to find out what causes the shadow squares, the bar on the water, the roof sheen and the leaf shadows (7 Nov). "
+    ImGui::TextWrapped("Tools to find out what causes the shadow squares, the bar on the water, the roof sheen and the leaf shadows. "
                        "The tools are not saved; each is off until used. They log or save files, except the debug view. The fix being tested is saved.");
     section("Captures");
     {
         bool armed = m_lab_cap_armed.load();
         if (ImGui::Checkbox("F6 also saves the shadow maps", &armed)) m_ui_cmds += armed ? "shadowcap\n" : "shadowcap off\n";
-        hint("The next F6 (or snappair) also saves, for each eye, the far-shadow atlas, its index and extent map, the three near cascades and "
-             "the shadow pass's four constant buffers into dumps\\shadowcap_<frame>_<eye> (about 130 MB; one short stall). Turns itself off "
-             "after one capture. tools\\stereo\\shadowcap_view.py makes pictures of them. Command: shadowcap [now|off].");
+        hint("For testing: the next F6 also saves the shadow maps to disk.");
         bool always = m_lab_cap_always.load();
         if (ImGui::Checkbox("Every F6 saves the shadow maps", &always)) m_ui_cmds += always ? "shadowcapall on\n" : "shadowcapall off\n";
-        hint("The same save as above with every F6 (or snappair), until you untick it, so the F6 that catches a black square brings its "
-             "shadow maps with it. About 130 MB per F6 in dumps\\, and a short stall each time; the README in each folder names the F6 "
-             "picture it goes with. Turns itself off when less than 25 GB is free. Not saved. Command: shadowcapall on|off.");
+        hint("For testing: every F6 also saves the shadow maps to disk.");
         if (m_lab_cap_state.load() > 0) ImGui::TextDisabled("waiting for the next shadow pass...");
         else if (!m_lab_cap_last.empty()) ImGui::TextDisabled("last: %s", m_lab_cap_last.c_str());
     }
     if (ImGui::Button("Log the order of every pass for one frame pair")) m_ui_cmds += "passorder\n";
-    hint("Every draw, compute pass, clear and copy of the next left and right call, in order, with its shaders, inputs, outputs and "
-         "constant buffers, to probes\\passorder_<time>.txt (a few MB). Command: passorder.");
+    hint("For testing: writes the order of every render pass of one frame to a file.");
     if (m_lab_order_state.load() > 0) ImGui::TextDisabled("logging...");
     else if (!m_lab_order_last.empty()) ImGui::TextDisabled("last: %s", m_lab_order_last.c_str());
     if (ImGui::Button("Log the far-shadow and reflection values for 5 s")) m_ui_cmds += "shadowvals\n";
-    hint("Once per frame and eye, as [ShadowVals] in the log: the far-shadow index matrix and its factors, the three near cascade boxes "
-         "in metres (size and centre), the last cascade index, the cascade fade, and the reflections' roughness cut-off. Costs some "
-         "frame rate while it runs. Command: shadowvals [seconds].");
+    hint("For testing: logs the shadow and reflection values for 5 s.");
     section("What you see (debug view, live)");
     {
         int sp = m_lab_split.load();
@@ -793,9 +926,7 @@ void FarCry5Stereo::lab_menu(void (*hint)(const char*), void (*section)(const ch
         ImGui::SameLine();
         ch = ImGui::RadioButton("Far shadows only", &sp, 2) || ch;
         if (ch) m_ui_cmds += fmt::format("shadowsplit {}\n", sp);
-        hint("Near cascades only: the sharp shadows never hand over to the far shadows, so beyond the last cascade the ground reads lit. "
-             "Far shadows only: no near cascade is used; within 10 m the ground then reads lit, beyond it the far shadows alone show. "
-             "Only the main shadow pass changes (water, glass and particles keep the game's). Not saved. Command: shadowsplit 0|1|2.");
+        hint("For testing: which shadows are used, near, far or both.");
     }
     section("Left eye against right eye");
     {
@@ -805,9 +936,7 @@ void FarCry5Stereo::lab_menu(void (*hint)(const char*), void (*section)(const ch
             if (i) ImGui::SameLine();
             if (ImGui::Button(kLabel[i])) m_ui_cmds += fmt::format("pairdiff {} 10\n", kPd[i]);
         }
-        hint("Logs as [PairDiff] every value of that buffer that differs between the left and the right eye's call of the same frame, "
-             "as the first pass of each call reads it. Different wind or time values mean the leaves sway differently in each eye. "
-             "Command: pairdiff <buffer name> [pairs].");
+        hint("For testing: logs the values that differ between the left and right eye.");
         if (m_lab_pd_left.load() > 0) ImGui::TextDisabled("comparing %s, %d pairs left", m_lab_pd_name.c_str(), m_lab_pd_left.load());
     }
     section("Shader dumps");
@@ -816,7 +945,6 @@ void FarCry5Stereo::lab_menu(void (*hint)(const char*), void (*section)(const ch
         if (w < 0) ImGui::TextDisabled("probes\\shdump.txt: not checked yet (no shader created since the start)");
         else if (w == 0) ImGui::TextDisabled("probes\\shdump.txt: not found at start (no shader dumps)");
         else ImGui::TextDisabled("probes\\shdump.txt: %d words; %d shaders dumped to probes\\shaders", w, fc5_shdump_count());
-        hint("A file probes\\shdump.txt present at the game start (one word per line: a shader CRC like #2FFF7035, or a bound resource "
-             "name) writes the disassembly of every matching shader to probes\\shaders\\, which the probes clean-up leaves alone.");
+        hint("For testing: dumps the listed shaders to disk at game start.");
     }
 }

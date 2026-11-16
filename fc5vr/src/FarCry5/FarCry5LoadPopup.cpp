@@ -2,15 +2,17 @@
 // until the mod's load-time work is done; a launcher option skips it, shown by default).
 //
 // Back in play somewhere else (a save loaded, a respawn, fast travel, or the first play) the popup hangs where the F11 menu would (the framework's
-// UI layer, no pointer) and the player's controller input is not sent to the game (ModConfig.cpp: buttons, triggers, sticks and grips; the mod's
-// own presses for the look at the sidearm slot and the camera's steering still go). Once shown it closes once, at least 2 s after play came back
+// UI layer, no pointer) and the player's controller input is not sent to the game (ModConfig.cpp: buttons, triggers and grips; the mod's
+// own presses for the look at the sidearm slot and the camera's steering still go). loadmove (author 16 Nov 15:02): walking and turning are not held back (the left stick, its click, the right
+// stick's turn); moving can keep the look at the sidearm slot waiting, so the popup may then run to its 4 s. Once shown it closes once, at least 2 s after play came back
 // and 1.5 s after it showed:
 //  - the weapon in hand has been recorded (held still 1 s; nothing to do in bare hands or off foot),
 //  - the sidearm has been recorded or the look at the sidearm slot is done (sidearmpeek; nothing to do with it or the sidearm off),
 //  - no weapon-switch scan is running or due (switchfast: the scan a load asks for reads GB of memory and slows the game while it runs),
 //  - loadslot has nothing left to do (the main weapon taken out after the look when the game holds neither it nor the sidearm, so it hangs on the sling),
-// or 10 s after it showed whatever is left (logged; author 2 Nov 21:47, was 30 s). blocking() and draw() check that clock
-// themselves, so the controllers come back and the popup goes at 10 s even on frames where frame() does not run.
+// or 4 s after it showed whatever is left (logged; loadpopup4s, author 16 Nov 21:31; was 10 s from 2 Nov
+// "a 10sec hard limit", 30 s before). Unfinished work goes on after it closes. blocking() and draw() check that clock
+// themselves, so the controllers come back and the popup goes at 4 s even on frames where frame() does not run.
 //
 // When it shows (author 7 Nov 11:04, and it should
 // not come back after the menu). All of it is decided here from the flat screen, the eye images and the camera (frame()):
@@ -51,7 +53,7 @@ namespace
 {
     using clock = std::chrono::steady_clock;
 
-    constexpr float kMinS = 2.0f, kMinShownS = 1.5f, kMaxS = 10.0f;   // kMaxS: the hard limit (s shown)
+    constexpr float kMinS = 2.0f, kMinShownS = 1.5f, kMaxS = 4.0f;    // kMaxS: the hard limit (s shown; loadpopup4s, was 10)
     constexpr float kClearS    = 1.0f;    // settled: no black eye image for this long
     constexpr float kWaitMaxS  = 12.0f;   // settled anyway after this long in 3D (a dark scene; 7 Nov 11:51 had 10 s of black)
     constexpr float kPlaceS    = 1.5f;    // where play stands: only after this long (or loadpopupsettle if longer) in 3D with no black eye image
@@ -184,6 +186,15 @@ void frame(const Steps& s)
                          moved, near_m, r_speed);
     }
 
+    // cineworld (author 16 Nov 21:33: the helicopter exit's prompt; his 21:20:07 popup came 2 s into that scene and held the controls 10 s): a
+    // popup already up when a cutscene or a scripted scene starts goes away and waits; it shows again once play has settled after it.
+    if (s.cine && g_shown.load()) {
+        g_shown    = false;
+        r_armed    = r_have_pos ? 2 : 1;
+        r_settled  = false;
+        spdlog::info("[LoadPopup] a cutscene or a scripted scene started {:.1f} s after it showed: hidden, controller input sent; shown again once play settles after it",
+                     secs(now - r_show_t));
+    }
     // Settled: in 3D long enough with no black eye image, not in a cinematic (12 s at most).
     if (s.cine) r_3d_t0 = now;
     const float in3d   = secs(now - r_3d_t0);
@@ -305,7 +316,7 @@ bool draw()
     const int   done = g_done.load();
     const float eta = g_eta.load(), t = g_elapsed.load();
     ImGui::TextColored(kAccent, "VR mod loading");
-    ImGui::Text("Controls back in %d s", std::max(1, int(std::ceil(eta))));
+    ImGui::Text("You can walk and turn. Other controls back in %d s", std::max(1, int(std::ceil(eta))));
     ImGui::ProgressBar(std::clamp(t / std::max(0.1f, t + eta), 0.0f, 1.0f), ImVec2{ 440.0f, 10.0f }, "");
     const char* labels[4]{ "Weapon in hand", "Sidearm on the hip", "Faster weapon switch", "Main weapon on the sling" };
     for (int i = 0; i < 4; i++) {
@@ -325,10 +336,7 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint)
 {
     bool v = g_on.load();
     if (ImGui::Checkbox("\"VR mod loading\" popup after a load##loadpopup", &v)) cmds += v ? "loadpopup on\n" : "loadpopup off\n";
-    hint("On (default): after a save loads (also a respawn or fast travel), a small popup counts down while the mod records your weapon and "
-         "sidearm and looks for the weapons in memory (faster weapon switch); the controllers do nothing until it closes (10 s at most, even if something is not done yet). "
-         "It shows once per load, not after the pause menu or the map. "
-         "Off: play starts at once, with a few seconds of hitches and no sidearm copy until then. The launcher's \"Skip the loading popup\" sets it too.");
+    hint("After a load, a short popup shows while the mod gets your weapons ready (4 s at most). Off: play starts at once, with a few seconds of hitches.");
     float st = g_settle_s.load();
     ImGui::SliderFloat("Wait for the game to show (s)##loadpopupsettle", &st, 0.0f, 5.0f, st <= 0.0f ? "at once" : "%.1f s");
     if (ImGui::IsItemDeactivatedAfterEdit()) {
@@ -336,7 +344,6 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint)
         std::snprintf(line, sizeof(line), "loadpopupsettle %.1f\n", st);
         cmds += line;
     }
-    hint("How long play has to be on screen (in 3D, no black picture for 1 s) before the popup shows, so it does not come up on a loading "
-         "picture that is about to go again. The controllers are already held back while it waits. 2 s by default; 0 = at the return to 3D, as before.");
+    hint("How long the game must be on screen before the loading popup appears.");
 }
 }

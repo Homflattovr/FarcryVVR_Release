@@ -25,5 +25,22 @@ namespace fc5::gameray
     void set_mask(uint32_t mask);
     void set_flags(int flags);
     void set_fine(bool on);   // meleerayfine
+    // meleereact (12 Nov): on a segment a wall nearer than the body hides that body (nobody is hit through a wall).
+    void set_wall_blocks(bool on);
+    // weaponcollide (12 Nov): one more segment, cast at the next game tick beside the melee ones (its own slot: neither replaces the other).
+    // The answer is the nearest thing on it that is no character and not the player (any = false: nothing); a hit under 3 cm from the start
+    // is a start inside something and is left out.
+    void submit_probe(const Seg& seg);
+    bool take_probe(Hit& out);   // once per cast; false: none since the last call
     std::string status();
+    // melee fix 13 (author 15 Nov: the damage seems to land only after the swing): when the game's blow lands. Any thread, at a press of the game's
+    // melee: the entity's health is read (GetPawnHealth's native, read only, no stim) at each game tick for 1.5 s after the press, and the first change
+    // is logged as "[Melee] damage landed: ... N ms after the press (M ms after the contact)", or "... no change" at the end. entity 0: not known yet
+    // (a bones hit); watch_entity names it from the ray's next answer on the body within 1 s. health_at_contact < 0: the first read is the start.
+    // melee fix 14b: entity 0 with root_ok: the recorded entity nearest the body's root (world x, y, z; within 0.7 m across the ground, 1.2 m up or
+    // down, a living pawn) is looked up at the next game tick (fc5::lua::entity_at_root); none: the reason is logged and nothing is watched. A press
+    // does not replace a watch on an entity still within its 3 s (nor while meleedmgwatch's write watch waits for its write). src: where the entity came from.
+    void watch_damage(uint64_t entity, float health_at_contact, int64_t contact_to_press_ms, bool root_ok = false, float rx = 0.0f, float ry = 0.0f, float rz = 0.0f,
+                      const std::string& src = {});
+    void watch_entity(uint64_t entity, float health);
 }

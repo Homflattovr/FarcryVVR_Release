@@ -1,6 +1,7 @@
 #include "FarCry5Dlss.h"
 #include "FarCry5GpuTime.h"
 #include "FarCry5Hitch.h"
+#include "FarCry5PassTime.h"
 
 #include <d3d11_4.h>
 #include <d3d12.h>
@@ -136,6 +137,41 @@ namespace fc5::dlss
             if (FAILED(output->GetPrivateData(kOfxrReceipt, &n, &r)) || n != sizeof(r) || r.publication == 0) r = {};
             g_receipt[eye] = r;
         }
+
+        // dlssfovea (foveated DLSS thread, 12 Nov). OFXR takes its guides from the DLSS evaluation whose output has an eye image's
+        // size; an evaluation of the centre alone is not that, and OFXR drops it at the eye image. While only the centre is
+        // evaluated and OFXR takes DLSS data, the mod publishes the eye's whole vectors and depth itself, through OFXR's provider
+        // API v2 (include/xrfg/provider_api.hpp of OFXR Bridge v0.983), into the evaluation's own D3D12 list as OFXR's hook does.
+        struct OfxrGuidePubV2
+        {
+            uint32_t                   struct_size, api_version;
+            uint64_t                   stream;
+            ID3D12Resource*            output;
+            ID3D12Resource*            motion_vectors;
+            ID3D12CommandQueue*        producer_queue;
+            ID3D12GraphicsCommandList* producer_command_list;
+            uint32_t                   output_x, output_y, output_width, output_height;
+            uint32_t                   motion_x, motion_y, motion_width, motion_height;
+            float                      scale_x, scale_y, jitter_x, jitter_y;
+            uint32_t                   resource_state;
+            int32_t                    jittered, reset;
+            ID3D12Resource*            depth;
+            uint32_t                   depth_x, depth_y, depth_width, depth_height;
+            uint32_t                   depth_resource_state;
+            float                      frame_time_delta_ms, camera_near, camera_far;
+            int32_t                    depth_inverted, depth_infinite;
+            ID3D12Device*              verified_native_device;
+        };
+        using OfxrPublishFn = int (*)(const OfxrGuidePubV2*);
+        using OfxrRetireFn  = void (*)(uint64_t);
+        OfxrPublishFn ofxr_publish_fn()
+        {
+            const HMODULE l = ofxr_layer();
+            return l ? reinterpret_cast<OfxrPublishFn>(GetProcAddress(l, "OFXR_PublishDlssGuidesV2")) : nullptr;
+        }
+        constexpr uint64_t    kFvStream = 0x4643354600000001ull;   // the mod's own guide streams: this + eye
+        std::atomic<uint64_t> g_ofxr_used{ 0 };                    // OFXR's count of frames its frame generation used DLSS guides in
+        std::atomic<uint64_t> g_fv_pub{ 0 }, g_fv_pub_fail{ 0 };   // the mod's own publications OFXR accepted / refused
 
         ID3D11ComputeShader* g_decode_cs = nullptr; // encoded R8G8 -> pixel motion R16G16F
         ID3D11ComputeShader* g_cammv_cs = nullptr;  // exact camera motion (kCamMv)
@@ -276,6 +312,7 @@ namespace fc5::dlss
             NVSDK_NGX_D3D12_DLSS_Eval_Params ep{};
             ID3D12Resource*                  res[4]{};   // colour, depth, motion (read), output (UAV)
             UINT64                           v12 = 0, v11 = 0;
+            OfxrGuidePubV2                   pub{};      // dlssfovea: the eye's whole guides for OFXR (struct_size 0: none)
         };
         std::atomic<bool>          g_d12_thread{ true };   // default on since 6 Nov (A/B 35.9 -> 39.2-45.5 pairs/s; author 10:21)
         bool                       g_worker_started = false;   // render thread only
@@ -287,7 +324,8 @@ namespace fc5::dlss
         std::atomic<uint32_t>      g_wk_err{ 0 };
 
         // The barriers and NGX's evaluation into an open list (the render thread's inline path and the worker).
-        NVSDK_NGX_Result record12(ID3D12GraphicsCommandList* cl, NVSDK_NGX_Handle* feature, NVSDK_NGX_D3D12_DLSS_Eval_Params& ep, ID3D12Resource* const res[4])
+        NVSDK_NGX_Result record12(ID3D12GraphicsCommandList* cl, NVSDK_NGX_Handle* feature, NVSDK_NGX_D3D12_DLSS_Eval_Params& ep, ID3D12Resource* const res[4],
+                                  const OfxrGuidePubV2* pub = nullptr)
         {
             // Shared textures are in the common state on the D3D12 side between the two APIs' work.
             D3D12_RESOURCE_BARRIER b[4]{};
@@ -299,6 +337,15 @@ namespace fc5::dlss
                 b[i].Transition.StateAfter  = i < 3 ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             }
             cl->ResourceBarrier(4, b);
+            if (pub && pub->struct_size) {
+                // dlssfovea: OFXR records its copies of the vectors and the depth here, as its hook does for a whole evaluation.
+                OfxrGuidePubV2 p        = *pub;
+                p.producer_queue        = g_d12.queue;
+                p.producer_command_list = cl;
+                const auto fn = ofxr_publish_fn();
+                if (fn && fn(&p) != 0) g_fv_pub++;
+                else g_fv_pub_fail++;
+            }
             const NVSDK_NGX_Result r = NGX_D3D12_EVALUATE_DLSS_EXT(cl, feature, g_d12.params, &ep);
             for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
             cl->ResourceBarrier(4, b);
@@ -322,7 +369,7 @@ namespace fc5::dlss
                 ID3D12GraphicsCommandList* cl = g_d12.list[j.slot];
                 NVSDK_NGX_Result           r  = NVSDK_NGX_Result_Fail;
                 const bool recorded = SUCCEEDED(al->Reset()) && SUCCEEDED(cl->Reset(al, nullptr));
-                if (recorded) r = record12(cl, j.feature, j.ep, j.res);
+                if (recorded) r = record12(cl, j.feature, j.ep, j.res, j.pub.struct_size ? &j.pub : nullptr);
                 // The fence value is signalled whatever happened, or D3D11 would wait for ever; the list runs if it was recorded.
                 g_d12.queue->Wait(g_d12.to12, j.v12);
                 if (recorded) {
@@ -889,6 +936,500 @@ void main(uint2 tid : SV_DispatchThreadID)
     g_out[tid] = float4(saturate(r), g_in[p].a);
 })";
 
+        // ---- dlssfovea (foveated DLSS thread, 12 Nov) -----------------------------------------------------------------------
+        // DLSS evaluates only the middle of the view, one binocular-shaped area the same in both eyes (13 Nov, author): each eye's view shrunk to a share around its own middle (an ellipse), and the area is the union of the two, drawn
+        // in both eyes at the same directions, so its edge falls at the same place for both eyes. NGX gets its bounding rectangle. The rest of the eye image is anti-aliased by a small temporal pass of the mod's own
+        // (kFvTaa) and the two are blended over a wide soft band inside the shape's edge (kFvRing). Headset, 12 Nov (author: the
+        // 45 degree rectangle's edges showed in the middle of the other eye's view; "it has to have the shape of the headset view").
+        // One NGX evaluation per eye, as before: the dlssfov attempt of 5 Nov ran two per eye and cost more than it saved.
+        // The idea is the "foveated upscaling" of RippeR37's Metro Exodus VR mod (DLSS centre, temporal periphery, blend ring);
+        // none of its code is used.
+        // The periphery pass: this frame's colour blended into the eye's history, read at where the pixel was (the vector of
+        // the nearest of five depths, the jitter difference taken out), the history kept within the 3x3 neighbourhood's range.
+        const char* kFvTaa = R"(
+Texture2D<float4> g_col : register(t0);
+Texture2D<float2> g_mv : register(t1);
+Texture2D<float> g_dep : register(t2);
+Texture2D<float4> g_hist : register(t3);
+Texture2D<float> g_dhist : register(t4);
+SamplerState g_lin : register(s0);
+RWTexture2D<float4> g_new : register(u0);
+RWTexture2D<float4> g_eye : register(u1);
+RWTexture2D<float> g_dnew : register(u2);
+cbuffer C : register(b0) { float4 g_ax; float2 g_lc; float g_rskip; float g_s; int4 g_rect; float2 g_jd; float g_wgt; float g_gam; uint g_write; uint g_show; uint g_reset; uint g_inv; float g_dis; float3 g_pad; };
+// g_s: render px per history px (1, or more at a lower outer-area level). Below, "px" is history px unless it says render px.
+// g_lc: the middle of this eye's view; g_ax.xy: 1 / the ellipses' half sizes; g_ax.zw: the middle of the other eye's view, as
+// seen in this eye's image (the shape is the union of the two ellipses); g_rskip: inside
+// this radius of the shape (1 = its edge) DLSS alone is shown and no history is kept. g_rect: the centre's rectangle, which the blend pass writes.
+// g_jd: this evaluation's jitter minus the eye's previous one (render px). g_wgt: the new frame's share. g_gam: clamp width in deviations.
+// g_write: the eye image outside the centre is written too (render size = output size). g_show: 1 tinted, 2 black. g_inv: nearer = larger depth.
+// g_dhist / g_dnew: the nearest depth of each history pixel, last frame's and this frame's. g_dis (fix 6, dlssfoveadisocc): where the
+// history pixel was this many times nearer than what is there now, a near object has moved away (a branch passing while walking):
+// its history is held tight to this frame's neighbourhood and half replaced each frame, so it fades in two or three frames instead
+// of being dragged along (the trails behind a near branch in the simulator, 15 Nov). Not dropped outright: just beside a near edge
+// the dilated depth can change with the jitter, and those pixels keep most of their smoothing. 0 = off.
+static const int2 kDiag[4] = { int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1) };
+static const int2 kNbr[8] = { int2(-1, -1), int2(0, -1), int2(1, -1), int2(-1, 0), int2(1, 0), int2(-1, 1), int2(0, 1), int2(1, 1) };
+// Where a pixel centre sits in the binocular shape: 0 in the middle of either eye's view, 1 on the shape's edge.
+float lensR(float2 c, float2 lc, float4 ax)
+{
+    return min(length((c - lc) * ax.xy), length((c - ax.zw) * ax.xy));
+}
+// The history at pos (px): Catmull-Rom from five bilinear taps (the four corner taps left out, the weights made to sum to 1).
+float3 histAt(float2 pos, float2 size)
+{
+    float2 c = floor(pos - 0.5f) + 0.5f;
+    float2 f = pos - c;
+    float2 w0 = f * (-0.5f + f * (1.0f - 0.5f * f));
+    float2 w1 = 1.0f + f * f * (-2.5f + 1.5f * f);
+    float2 w2 = f * (0.5f + f * (2.0f - 1.5f * f));
+    float2 w3 = f * f * (-0.5f + 0.5f * f);
+    float2 w12 = w1 + w2;
+    float2 t0 = (c - 1.0f) / size;
+    float2 t3 = (c + 2.0f) / size;
+    float2 t12 = (c + w2 / w12) / size;
+    float4 r = float4(g_hist.SampleLevel(g_lin, float2(t12.x, t0.y), 0).rgb, 1.0f) * (w12.x * w0.y);
+    r += float4(g_hist.SampleLevel(g_lin, float2(t0.x, t12.y), 0).rgb, 1.0f) * (w0.x * w12.y);
+    r += float4(g_hist.SampleLevel(g_lin, float2(t12.x, t12.y), 0).rgb, 1.0f) * (w12.x * w12.y);
+    r += float4(g_hist.SampleLevel(g_lin, float2(t3.x, t12.y), 0).rgb, 1.0f) * (w3.x * w12.y);
+    r += float4(g_hist.SampleLevel(g_lin, float2(t12.x, t3.y), 0).rgb, 1.0f) * (w12.x * w3.y);
+    return r.rgb / max(r.a, 0.5f);
+}
+[numthreads(8, 8, 1)]
+void main(uint2 tid : SV_DispatchThreadID)
+{
+    uint w, h, rw, rh;
+    g_new.GetDimensions(w, h);
+    g_col.GetDimensions(rw, rh);
+    if (tid.x >= w || tid.y >= h) return;
+    int2 p = int2(tid);
+    int2 rlast = int2(rw - 1, rh - 1);
+    float2 rsz = float2(rw, rh);
+    // The history may be smaller than the render size (the outer area's level, g_s render px per history px): colour, depth and
+    // vectors are read at the pixel's place in the render image. At g_s = 1 every read lands on a render pixel's centre.
+    float2 rp = (float2(p) + 0.5f) * g_s;
+    float4 c4 = g_col.SampleLevel(g_lin, rp / rsz, 0);
+    float3 c = c4.rgb;
+    int2 best = clamp(int2(rp), int2(0, 0), rlast);
+    if (lensR(float2(p) + 0.5f, g_lc, g_ax) < g_rskip) {
+        g_new[p] = c4;
+        g_dnew[p] = g_dep[best];
+        return;
+    }
+    float3 o = c;
+    float bd = g_dep[best];
+    int2 r0 = best;
+    [unroll] for (int i = 0; i < 4; ++i) {
+        int2 q = clamp(r0 + int2(float2(kDiag[i]) * g_s), int2(0, 0), rlast);
+        float dd = g_dep[q];
+        bool nearer = g_inv != 0 ? dd > bd : dd < bd;
+        if (nearer) { bd = dd; best = q; }
+    }
+    g_dnew[p] = bd;
+    if (g_reset == 0) {
+        float2 pos = float2(p) + 0.5f + (g_mv[best] + g_jd) / g_s;
+        bool gone = false;
+        if (g_dis > 0.0f) {   // nearness ~ near / distance: the device depth (reversed) or 1 - it
+            float pd = g_dhist[clamp(int2(pos), int2(0, 0), int2(w - 1, h - 1))];
+            float nb = g_inv != 0 ? bd : 1.0f - bd;
+            float np = g_inv != 0 ? pd : 1.0f - pd;
+            gone = np > 1e-6f && np > nb * g_dis;
+        }
+        if (pos.x >= 0.0f && pos.y >= 0.0f && pos.x <= float(w) && pos.y <= float(h)) {
+            float3 m1 = c, m2 = c * c, mn = c, mx = c;
+            [unroll] for (int j = 0; j < 8; ++j) {
+                float3 n = g_col.SampleLevel(g_lin, clamp(rp + float2(kNbr[j]) * g_s, float2(0.5f, 0.5f), rsz - 0.5f) / rsz, 0).rgb;
+                m1 += n;
+                m2 += n * n;
+                mn = min(mn, n);
+                mx = max(mx, n);
+            }
+            m1 /= 9.0f;
+            float3 sg = sqrt(max(m2 / 9.0f - m1 * m1, 0.0f));
+            float gam = gone ? min(g_gam, 0.5f) : g_gam;
+            float3 lo = max(mn, m1 - gam * sg);
+            float3 hi = min(mx, m1 + gam * sg);
+            float3 hc = clamp(histAt(pos, float2(w, h)), lo, hi);
+            o = lerp(hc, c, gone ? max(g_wgt, 0.5f) : g_wgt);
+        }
+    }
+    g_new[p] = float4(o, c4.a);
+    if (g_write != 0 && !(p.x >= g_rect.x && p.y >= g_rect.y && p.x < g_rect.z && p.y < g_rect.w)) {
+        float3 e = o;
+        if (g_show == 1) e = lerp(e, float3(1.0f, 0.0f, 0.0f), 0.35f);
+        if (g_show == 2) e = float3(0.0f, 0.0f, 0.0f);
+        g_eye[p] = float4(e, c4.a);
+    }
+}
+)";
+        // The blend: DLSS's image comes in over a band inside the lens shape's edge (radius 1 - g_band to 1); outside the shape
+        // it is the periphery (the history just written, stretched when the output is larger than the render size).
+        const char* kFvRing = R"(
+Texture2D<float4> g_ctr : register(t0);
+Texture2D<float4> g_per : register(t1);
+SamplerState g_lin : register(s0);
+RWTexture2D<float4> g_out : register(u0);
+cbuffer C : register(b0) { int4 g_rect; int2 g_org; float g_band; uint g_show; float4 g_ax; float2 g_lc; float2 g_pad; };
+// g_rect: the centre's rectangle in output px (x0 y0 x1 y1). g_org: the first pixel this dispatch covers. g_band: blend width as a
+// share of the shape's radius. g_lc, g_ax: the binocular shape as in kFvTaa (output px).
+[numthreads(8, 8, 1)]
+void main(uint2 tid : SV_DispatchThreadID)
+{
+    uint w, h;
+    g_out.GetDimensions(w, h);
+    int2 q = int2(tid) + g_org;
+    if (q.x >= int(w) || q.y >= int(h)) return;
+    float4 o = g_per.SampleLevel(g_lin, (float2(q) + 0.5f) / float2(w, h), 0);
+    if (g_show == 1) o.rgb = lerp(o.rgb, float3(1.0f, 0.0f, 0.0f), 0.35f);
+    if (g_show == 2) o.rgb = float3(0.0f, 0.0f, 0.0f);
+    if (q.x >= g_rect.x && q.y >= g_rect.y && q.x < g_rect.z && q.y < g_rect.w) {
+        float2 c = float2(q) + 0.5f;
+        float r = min(length((c - g_lc) * g_ax.xy), length((c - g_ax.zw) * g_ax.xy));
+        float t = saturate((1.0f - r) / g_band);
+        t = t * t * (3.0f - 2.0f * t);
+        o = lerp(o, g_ctr[q - g_rect.xy], t);
+    }
+    g_out[q] = o;
+})";
+
+        std::atomic<float>    g_fv_share{ 0.0f };    // dlssfovea: the centre's size as a share of each eye's view (0.5..0.85); 0 = off
+        std::atomic<float>    g_fv_outer{ 1.0f };    // dlssfoveaouter: the outer area's anti-aliasing size, a share of the render size (1, 0.67, 0.58, 0.5, 0.33)
+        std::atomic<float>    g_fv_band{ 0.25f };     // dlssfoveaband (test): the blend's width as a share of the shape's radius
+        // Each eye's own field of view (tangents left, right, up, down as the projection uses them; left and down negative), from
+        // the eye's camera upload (set_eye_fov). The lens centre comes from these, not from DLSS's camera rows: in the author's
+        // headset session of 13 Nov the rows held the other eye's camera at the left eye's evaluation twice (21:18:57, 21:19:01),
+        // and the centre jumped to the right eye's place and back, its feature made again and its history lost each time.
+        std::atomic<float>    g_eye_tan[2][4]{};
+        std::atomic<bool>     g_eye_tan_ok[2]{};
+        std::atomic<uint64_t> g_fv_resets{ 0 };      // centre evaluations that started the DLSS history again
+        std::atomic<float>    g_fv_disocc{ 1.5f };   // dlssfoveadisocc: periphery history dropped where it was this many times nearer (0 = off)
+        std::atomic<float>    g_fv_weight{ 0.10f };  // dlssfoveaweight: the new frame's share in the periphery
+        std::atomic<float>    g_fv_gamma{ 1.5f };    // dlssfoveaclamp: the history is kept within the neighbourhood's mean +- this many deviations
+        std::atomic<float>    g_fv_jit{ 1.0f };      // dlssfoveajit (test): multiplier on the jitter difference in the reprojection
+        std::atomic<int>      g_fv_show{ 0 };        // dlssfoveashow (test): 1 periphery tinted red, 2 centre alone
+        std::atomic<int>      g_fv_ofxr{ 0 };        // dlssfoveaofxr: 0 auto, 1 always publish, 2 whole evaluations while OFXR takes DLSS data
+        // What OFXR does with the guides the mod publishes (auto): 0 watching, 1 a trial with whole evaluations, 2 settled on the
+        // centre (OFXR uses no guides either way), 3 settled on whole evaluations (OFXR used theirs and not the published ones).
+        std::atomic<int>      g_fv_ox{ 0 };
+        std::atomic<bool>     g_fv_publishing{ false };   // the last evaluation carried a publication
+        std::atomic<int>      g_fv_why{ 1 };         // why the last evaluation was not foveated (0: it was)
+        std::atomic<uint32_t> g_fv_size{ 0 };        // the centre at the last foveated evaluation (render w << 16 | h)
+        std::atomic<uint64_t> g_fv_evals{ 0 }, g_fv_whole{ 0 }, g_fv_errors{ 0 }, g_fv_moves{ 0 }, g_fv_made{ 0 };
+        std::atomic<bool>     g_fv_dead{ false };    // off for this game run after repeated failures
+        // The centre's rectangle in render px, then output px; the lens centre (u, v: shares of the image), the share k it was made
+        // with, and where the middle of the other eye's view sits in this eye's image, from this one's (dx, dy: shares of the image).
+        struct FvRect { UINT x = 0, y = 0, w = 0, h = 0, ox = 0, oy = 0, ow = 0, oh = 0; float u = 0.5f, v = 0.5f, k = 0.0f, dx = 0.0f, dy = 0.0f; };
+        struct FvPlan { FvRect r; float band = 0.25f; UINT pw = 0, ph = 0; bool publish = false, moved = false, fresh = false; };   // pw x ph: the outer area's history
+        // The binocular shape in an image of w x h px (shaders' g_lc, g_ax): the middle of this eye's view (the image's middle),
+        // 1 / the ellipses' half sizes (share k of half the image), the middle of the other eye's view in this image.
+        void fovea_shape(const FvRect& r, UINT w, UINT h, float lc[2], float ax[4])
+        {
+            lc[0] = 0.5f * float(w);
+            lc[1] = 0.5f * float(h);
+            ax[0] = 1.0f / std::max(r.k * 0.5f * float(w), 1.0f);
+            ax[1] = 1.0f / std::max(r.k * 0.5f * float(h), 1.0f);
+            ax[2] = (0.5f + r.dx) * float(w);
+            ax[3] = (0.5f + r.dy) * float(h);
+        }
+        FvRect               g_fv_rect[2];           // each eye's centre (kept until the camera's says it moved by more than a few px)
+        float                g_fv_rect_share[2]{};
+        UINT                 g_fv_rect_for[2][3]{};  // the image it was made for: render w, h, output w
+        NVSDK_NGX_Handle*    g_fv_feature[2]{};      // each eye's DLSS feature of the centre's size (made on the API g_features_12 says)
+        FvRect               g_fv_feat[2];
+        Tex                  g_fv_out[2];            // the centre from DLSS (shared with D3D12 under perfdlss12)
+        Tex                  g_fv_hist[2][2];        // each eye's periphery history, two in turn
+        Tex                  g_fv_dh[2][2];          // its nearest depths (R32F), in turn with it (dlssfoveadisocc)
+        int                  g_fv_cur[2]{};          // the one written last
+        bool                 g_fv_ran[2]{};          // the eye's last evaluation was foveated (its history and its feature follow on)
+        bool                 g_fv_stream[2]{};       // the eye's own guide stream is known to OFXR
+        float                g_fv_pjit[2][2]{};      // the jitter of the eye's last foveated evaluation
+        ID3D11ComputeShader* g_fv_taa_cs  = nullptr;
+        ID3D11ComputeShader* g_fv_ring_cs = nullptr;
+        ID3D11Buffer*        g_fv_taa_cb  = nullptr;
+        ID3D11Buffer*        g_fv_ring_cb = nullptr;
+
+        const char* fovea_why(int why)
+        {
+            switch (why) {
+            case 0: return "in use";
+            case 1: return "off";
+            case 2: return "this image is not an eye image (a menu or the flat screen)";
+            case 3: return "no camera from the game yet";
+            case 4: return "the lens centre could not be read from the camera";
+            case 5: return "OFXR takes DLSS data and DLSS runs on D3D11 (the centre alone cannot be given to it there)";
+            case 6: return "OFXR used the whole evaluation's guides and not the published ones (dlssfoveaofxr on forces the centre)";
+            case 7: return "it failed several times: off until dlssfovea is set again or the game restarts";
+            case 8: return "its shaders did not compile (see [DLSS] shader ... failed in the log)";
+            case 9: return "OFXR takes DLSS data (dlssfoveaofxr off)";
+            case 10: return "this OFXR has no entry to publish guides through (OFXR_PublishDlssGuidesV2)";
+            case 11: return "a trial with whole evaluations is running (does OFXR use guides at all?)";
+            case 12: return "a texture or buffer could not be made";
+            case 13: return "the centre would cover most of the image (nothing to save)";
+            case 14: return "the centre's DLSS feature could not be made (see the log)";
+            default: return "?";
+            }
+        }
+        void fovea_error(const std::string& what)
+        {
+            const uint64_t n = ++g_fv_errors;
+            if (n <= 5) spdlog::warn("[DLSS] dlssfovea: {} ({} so far)", what, n);
+            if (n >= 5 && !g_fv_dead.exchange(true)) spdlog::warn("[DLSS] dlssfovea: 5 failures, off for this game run (whole evaluations as before)");
+        }
+        bool fovea_cb(ID3D11Buffer*& cb, UINT bytes)
+        {
+            if (!cb) {
+                D3D11_BUFFER_DESC bd{};
+                bd.ByteWidth = bytes; bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+                g_device->CreateBuffer(&bd, nullptr, &cb);
+            }
+            return cb != nullptr;
+        }
+        // The eye's own guide stream is dropped at OFXR when the eye goes back to whole evaluations (OFXR then follows those).
+        void fovea_retire(int eye)
+        {
+            if (!g_fv_stream[eye]) return;
+            g_fv_stream[eye] = false;
+            if (g_features_12) worker_idle();   // no publication of it is being recorded
+            const HMODULE l  = ofxr_layer();
+            const auto    fn = l ? reinterpret_cast<OfxrRetireFn>(GetProcAddress(l, "OFXR_RetireDlssGuideStreamV2")) : nullptr;
+            if (fn) fn(kFvStream + uint64_t(eye));
+        }
+        void fovea_release()
+        {
+            for (int e = 0; e < 2; ++e) {
+                release_feature(g_fv_feature[e]);
+                g_fv_feat[e] = {};
+                g_fv_ran[e]  = false;
+                fovea_retire(e);
+            }
+        }
+        // The centre for an image of w x h (output ow x oh). The lens centre comes from DLSS's own camera rows: g_cam_rows[0..15] is
+        // the inverse of this eye's view-projection with the eye at the origin; points of one device depth lie on a plane square to
+        // the optical axis, and the point of that plane nearest to the eye is where the eye looks straight ahead. The shape is the
+        // eye's view shrunk by `share` around that point: from the lens centre, share of the way to each edge of the image (each
+        // eye's own field, so the left eye's reaches further left, as the headset's does), rounded like the view through the lens
+        // (kFvTaa's lensR). NGX gets its bounding rectangle. 0: done; otherwise the reason (fovea_why).
+        int fovea_rect(int eye, UINT w, UINT h, UINT ow, UINT oh, float share, FvRect& out)
+        {
+            const float* m = g_cam_rows;
+            auto unproj = [&](float x, float y, glm::vec3& q) {
+                const float c[4]{ x, y, 0.5f, 1.0f };
+                float       r[4];
+                for (int i = 0; i < 4; ++i) r[i] = m[i * 4] * c[0] + m[i * 4 + 1] * c[1] + m[i * 4 + 2] * c[2] + m[i * 4 + 3] * c[3];
+                if (!(std::abs(r[3]) > 1e-12f)) return false;
+                q = glm::vec3{ r[0], r[1], r[2] } / r[3];
+                return true;
+            };
+            glm::vec3 q0{}, qx{}, qy{};
+            if (!unproj(0.0f, 0.0f, q0) || !unproj(1.0f, 0.0f, qx) || !unproj(0.0f, 1.0f, qy)) return 4;
+            const glm::vec3 a = qx - q0, b = qy - q0;
+            const float     aa = glm::dot(a, a), bb = glm::dot(b, b);
+            if (!(aa > 1e-20f) || !(bb > 1e-20f)) return 4;
+            const float nx = -glm::dot(q0, a) / aa, ny = -glm::dot(q0, b) / bb;   // the optical axis in NDC
+            float       u  = 0.5f + 0.5f * nx, v = 0.5f - 0.5f * ny;
+            if (g_eye_tan_ok[eye].load()) {   // the eye's own field of view: where it looks straight ahead in its image
+                const float tl = g_eye_tan[eye][0].load(), tr = g_eye_tan[eye][1].load(), tu = g_eye_tan[eye][2].load(), td = g_eye_tan[eye][3].load();
+                if (tr - tl > 1e-3f && tu - td > 1e-3f) { u = -tl / (tr - tl); v = tu / (tu - td); }
+            }
+            if (!(u > 0.1f && u < 0.9f && v > 0.1f && v < 0.9f)) return 4;
+            const float k  = std::clamp(share, 0.2f, 0.95f);
+            // The other eye: a direction straight ahead sits at its u, v there and at this eye's u, v here; with the two images the
+            // same angular size (and the eyes parallel), the middle of its view lands dx = u_this - u_other from this image's middle.
+            // Before the other eye has a lens centre: the headset's mirror image (u_other = 1 - u).
+            float         ou = 1.0f - u, ov = v;   // the headset's mirror image until the other eye is known
+            const int     oe = eye ^ 1;
+            const float   otl = g_eye_tan[oe][0].load(), otr = g_eye_tan[oe][1].load(), otu = g_eye_tan[oe][2].load(), otd = g_eye_tan[oe][3].load();
+            if (g_eye_tan_ok[oe].load() && otr - otl > 1e-3f && otu - otd > 1e-3f) { ou = -otl / (otr - otl); ov = otu / (otu - otd); }
+            const float   dx = std::clamp(u - ou, -0.5f, 0.5f);
+            const float   dy = std::clamp(v - ov, -0.5f, 0.5f);
+            // The union's reach each way from this image's middle (shares of the image), within the image.
+            const float hu0 = 0.5f - std::max(0.5f * (1.0f - k) + std::min(dx, 0.0f), 0.0f);
+            const float hu1 = std::min(0.5f * (1.0f + k) + std::max(dx, 0.0f), 1.0f) - 0.5f;
+            const float hv0 = 0.5f - std::max(0.5f * (1.0f - k) + std::min(dy, 0.0f), 0.0f);
+            const float hv1 = std::min(0.5f * (1.0f + k) + std::max(dy, 0.0f), 1.0f) - 0.5f;
+            // Whole pixels on both sides: when the output is larger than the render size, the edges go to render pixels whose
+            // place in the output is nearest to a whole pixel, so the centre lines up with the periphery.
+            const double sx = double(ow) / double(w), sy = double(oh) / double(h);
+            auto fit = [](int want, double s, int lo, int hi) {
+                int    best = std::clamp(want, lo, hi);
+                double be   = 1e9;
+                for (int d = 0; d <= 12; ++d) {
+                    for (int sg = -1; sg <= 1; sg += 2) {
+                        const int x = want + sg * d;
+                        if (x < lo || x > hi) continue;
+                        const double e = std::abs(x * s - std::round(x * s)) + 1e-4 * d;
+                        if (e < be) { be = e; best = x; }
+                    }
+                }
+                return best;
+            };
+            const int kMin = 256;
+            if ((int)w < 2 * kMin || (int)h < 2 * kMin) return 13;
+            const int x0 = fit(std::clamp((int)std::lround((0.5f - hu0) * float(w)), 0, (int)w - kMin), sx, 0, (int)w - kMin);
+            const int x1 = fit(std::clamp((int)std::lround((0.5f + hu1) * float(w)), x0 + kMin, (int)w), sx, x0 + kMin, (int)w);
+            const int y0 = fit(std::clamp((int)std::lround((0.5f - hv0) * float(h)), 0, (int)h - kMin), sy, 0, (int)h - kMin);
+            const int y1 = fit(std::clamp((int)std::lround((0.5f + hv1) * float(h)), y0 + kMin, (int)h), sy, y0 + kMin, (int)h);
+            if (double(x1 - x0) * double(y1 - y0) > 0.85 * double(w) * double(h)) return 13;
+            out.x  = UINT(x0); out.y = UINT(y0); out.w = UINT(x1 - x0); out.h = UINT(y1 - y0);
+            out.u  = u; out.v = v; out.k = k; out.dx = dx; out.dy = dy;
+            out.ox = UINT(std::lround(x0 * sx)); out.oy = UINT(std::lround(y0 * sy));
+            out.ow = std::min(UINT(std::lround(x1 * sx)), ow) - out.ox;
+            out.oh = std::min(UINT(std::lround(y1 * sy)), oh) - out.oy;
+            return 0;
+        }
+        // Whether this evaluation is of the centre alone, and its rectangle. Everything that can fail without NGX is made here.
+        bool fovea_plan(FvPlan& pl, int eye, UINT w, UINT h, UINT ow, UINT oh, DXGI_FORMAT work, bool use12)
+        {
+            auto no = [](int why) { g_fv_why = why; return false; };
+            const float share = g_fv_share.load();
+            if (!(share > 0.0f)) return no(1);
+            if (g_fv_dead.load()) return no(7);
+            if (!g_fv_taa_cs || !g_fv_ring_cs || !g_linear) return no(8);
+            if (w < 1024 || h * 4 < w * 3) return no(2);
+            if (!g_cam_valid) return no(3);
+            if (g_ofxr_wants.load()) {
+                const int mode = g_fv_ofxr.load();
+                if (mode == 2) return no(9);
+                if (!use12) return no(5);
+                if (!ofxr_publish_fn()) return no(10);
+                const int ox = g_fv_ox.load();
+                if (mode == 0 && (ox == 1 || ox == 3)) return no(ox == 1 ? 11 : 6);
+                pl.publish = true;
+            }
+            FvRect r;
+            if (const int why = fovea_rect(eye, w, h, ow, oh, share, r)) return no(why);
+            FvRect&    k    = g_fv_rect[eye];
+            auto       off  = [](UINT a, UINT b, UINT lim) { return (a > b ? a - b : b - a) > lim; };
+            const bool same = g_fv_rect_share[eye] == share && g_fv_rect_for[eye][0] == w && g_fv_rect_for[eye][1] == h && g_fv_rect_for[eye][2] == ow;
+            // The jitter moves the lens centre by half a pixel each way: the rectangle stays until it is off by more than that.
+            if (!same || k.w == 0 || off(r.x, k.x, 12) || off(r.y, k.y, 12) || off(r.w, k.w, 16) || off(r.h, k.h, 16)) {
+                if (same && k.w != 0) g_fv_moves++;
+                k = r;
+                g_fv_rect_share[eye]  = share;
+                g_fv_rect_for[eye][0] = w; g_fv_rect_for[eye][1] = h; g_fv_rect_for[eye][2] = ow;
+                pl.moved = true;
+            }
+            pl.r    = k;
+            pl.band = std::clamp(g_fv_band.load(), 0.05f, 0.6f);
+            // The outer area's level: its anti-aliasing (and history) at that share of the render size, stretched into the eye image.
+            const float os = std::clamp(g_fv_outer.load(), 0.25f, 1.0f);
+            pl.pw = os > 0.99f ? w : std::max(UINT(std::lround(double(w) * os)), 64u);
+            pl.ph = os > 0.99f ? h : std::max(UINT(std::lround(double(h) * os)), 64u);
+            if (!make_tex(g_fv_out[eye], k.ow, k.oh, work, use12) || !make_tex(g_fv_hist[eye][g_fv_cur[eye] ^ 1], pl.pw, pl.ph, DXGI_FORMAT_R16G16B16A16_FLOAT) ||
+                !make_tex(g_fv_dh[eye][g_fv_cur[eye] ^ 1], pl.pw, pl.ph, DXGI_FORMAT_R32_FLOAT) ||
+                !fovea_cb(g_fv_taa_cb, 96) || !fovea_cb(g_fv_ring_cb, 64))
+                return no(12);
+            g_fv_why = 0;
+            return true;
+        }
+        // A DLSS feature of the centre's size, made as the whole image's is (resolve).
+        NVSDK_NGX_Result fovea_create(ID3D11DeviceContext* ctx, ID3D12GraphicsCommandList* cl, int eye, const FvRect& r, bool use12)
+        {
+            NVSDK_NGX_DLSS_Create_Params cp{};
+            cp.Feature.InWidth = r.w; cp.Feature.InHeight = r.h;
+            cp.Feature.InTargetWidth = r.ow; cp.Feature.InTargetHeight = r.oh;
+            const bool  up    = r.ow > r.w && r.oh > r.h;
+            const float ratio = (float)r.w / (float)r.ow;
+            cp.Feature.InPerfQualityValue = !up ? NVSDK_NGX_PerfQuality_Value_DLAA
+                                          : ratio > 0.62f ? NVSDK_NGX_PerfQuality_Value_MaxQuality
+                                          : ratio > 0.55f ? NVSDK_NGX_PerfQuality_Value_Balanced
+                                                          : NVSDK_NGX_PerfQuality_Value_MaxPerf;
+            cp.InFeatureCreateFlags = g_flags.load();
+            const int preset = g_preset.load();
+            for (const char* p : { NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
+                                   NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
+                                   NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality }) {
+                NVSDK_NGX_Parameter_SetUI(use12 ? g_d12.params : g_params, p, (unsigned int)preset);
+            }
+            return use12 ? NGX_D3D12_CREATE_DLSS_EXT(cl, 1, 1, &g_fv_feature[eye], g_d12.params, &cp) : NGX_D3D11_CREATE_DLSS_EXT(ctx, &g_fv_feature[eye], g_params, &cp);
+        }
+        // The periphery pass (before the evaluation): the eye's new history, and in DLAA the eye image outside the centre.
+        void fovea_taa(ID3D11DeviceContext* ctx, int eye, const FvPlan& pl, ID3D11ShaderResourceView* mv, UINT w, UINT h, UINT /*ow*/, float jx, float jy, bool reset, bool write_eye)
+        {
+            Tex&       prev = g_fv_hist[eye][g_fv_cur[eye]];
+            Tex&       next = g_fv_hist[eye][g_fv_cur[eye] ^ 1];
+            Tex&       dprev = g_fv_dh[eye][g_fv_cur[eye]];
+            Tex&       dnext = g_fv_dh[eye][g_fv_cur[eye] ^ 1];
+            const UINT pw = pl.pw, ph = pl.ph;   // the history's size
+            const bool have = !reset && g_fv_ran[eye] && prev.tex && prev.w == pw && prev.h == ph && dprev.tex && dprev.w == pw && dprev.h == ph;
+            if (pw != w || ph != h) write_eye = false;   // the blend pass writes the whole eye image then
+            struct { float ax[4]; float lc[2]; float rskip, s; int32_t rect[4]; float jd[2]; float wgt, gam; uint32_t write, show, reset, inv; float dis, pad[3]; } cb{};
+            static_assert(sizeof(cb) == 96, "kFvTaa's cbuffer");
+            const int x0 = int(pl.r.x), y0 = int(pl.r.y), x1 = int(pl.r.x + pl.r.w), y1 = int(pl.r.y + pl.r.h);
+            fovea_shape(pl.r, pw, ph, cb.lc, cb.ax);
+            cb.s = float(w) / float(pw);
+            // History is kept from the band's inner edge out, plus 24 px for what a fast turn brings into the band.
+            const float near_px = std::max(cb.ax[0], cb.ax[1]);   // 1 / the shorter half size
+            cb.rskip   = 1.0f - pl.band - 24.0f * near_px;
+            cb.rect[0] = x0; cb.rect[1] = y0; cb.rect[2] = x1; cb.rect[3] = y1;
+            // The image sits (jx, jy) px from its unjittered place (the projection's shift, FarCry5Stereo.cpp), and the vectors
+            // hold the difference between the two frames' shifts: taken out, a still view reads the history at its own pixel.
+            const float k = g_fv_jit.load();
+            cb.jd[0] = (jx - g_fv_pjit[eye][0]) * k;
+            cb.jd[1] = (jy - g_fv_pjit[eye][1]) * k;
+            cb.wgt   = std::clamp(g_fv_weight.load(), 0.02f, 1.0f);
+            cb.gam   = std::clamp(g_fv_gamma.load(), 0.25f, 8.0f);
+            cb.write = write_eye ? 1u : 0u;
+            cb.show  = uint32_t(std::clamp(g_fv_show.load(), 0, 2));
+            cb.reset = have ? 0u : 1u;
+            cb.inv   = (g_flags.load() & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) ? 1u : 0u;
+            cb.dis   = g_fv_disocc.load();
+            ctx->UpdateSubresource(g_fv_taa_cb, 0, nullptr, &cb, 0, 0);
+            ID3D11ComputeShader* prev_cs = nullptr;
+            ctx->CSGetShader(&prev_cs, nullptr, nullptr);
+            ID3D11ShaderResourceView*  srv[5]{ g_color_in.srv, mv, g_depth32.srv, have ? prev.srv : nullptr, have ? dprev.srv : nullptr };
+            ID3D11UnorderedAccessView* uav[3]{ next.uav, write_eye ? g_out.uav : nullptr, dnext.uav };
+            ctx->CSSetShader(g_fv_taa_cs, nullptr, 0);
+            ctx->CSSetConstantBuffers(0, 1, &g_fv_taa_cb);
+            ctx->CSSetShaderResources(0, 5, srv);
+            ctx->CSSetSamplers(0, 1, &g_linear);
+            ctx->CSSetUnorderedAccessViews(0, 3, uav, nullptr);
+            ctx->Dispatch((pw + 7) / 8, (ph + 7) / 8, 1);
+            ID3D11ShaderResourceView*  null_srv[5]{};
+            ID3D11UnorderedAccessView* null_uav[3]{};
+            ID3D11Buffer*              null_cb = nullptr;
+            ctx->CSSetShaderResources(0, 5, null_srv);
+            ctx->CSSetUnorderedAccessViews(0, 3, null_uav, nullptr);
+            ctx->CSSetConstantBuffers(0, 1, &null_cb);
+            ctx->CSSetShader(prev_cs, nullptr, 0);
+            if (prev_cs) prev_cs->Release();
+            g_fv_cur[eye] ^= 1;
+            g_fv_pjit[eye][0] = jx;
+            g_fv_pjit[eye][1] = jy;
+        }
+        // The blend (after the evaluation), into the eye image: over the centre's rectangle in DLAA (the periphery pass wrote
+        // the rest), over the whole image when the output is larger than the render size.
+        void fovea_ring(ID3D11DeviceContext* ctx, int eye, const FvPlan& pl, Tex& dst, bool whole)
+        {
+            struct { int32_t rect[4]; int32_t org[2]; float band; uint32_t show; float ax[4]; float lc[2]; float pad[2]; } cb{};
+            static_assert(sizeof(cb) == 64, "kFvRing's cbuffer");
+            cb.rect[0] = int(pl.r.ox); cb.rect[1] = int(pl.r.oy); cb.rect[2] = int(pl.r.ox + pl.r.ow); cb.rect[3] = int(pl.r.oy + pl.r.oh);
+            cb.org[0]  = whole ? 0 : int(pl.r.ox);
+            cb.org[1]  = whole ? 0 : int(pl.r.oy);
+            cb.band    = pl.band;
+            fovea_shape(pl.r, dst.w, dst.h, cb.lc, cb.ax);   // the eye image is output size (g_out or g_hi)
+            cb.show    = uint32_t(std::clamp(g_fv_show.load(), 0, 2));
+            ctx->UpdateSubresource(g_fv_ring_cb, 0, nullptr, &cb, 0, 0);
+            ID3D11ComputeShader* prev_cs = nullptr;
+            ctx->CSGetShader(&prev_cs, nullptr, nullptr);
+            ID3D11ShaderResourceView* srv[2]{ g_fv_out[eye].srv, g_fv_hist[eye][g_fv_cur[eye]].srv };
+            ctx->CSSetShader(g_fv_ring_cs, nullptr, 0);
+            ctx->CSSetConstantBuffers(0, 1, &g_fv_ring_cb);
+            ctx->CSSetShaderResources(0, 2, srv);
+            ctx->CSSetSamplers(0, 1, &g_linear);
+            ctx->CSSetUnorderedAccessViews(0, 1, &dst.uav, nullptr);
+            const UINT dw = whole ? dst.w : pl.r.ow, dh = whole ? dst.h : pl.r.oh;
+            ctx->Dispatch((dw + 7) / 8, (dh + 7) / 8, 1);
+            ID3D11ShaderResourceView*  null_srv[2]{};
+            ID3D11UnorderedAccessView* null_uav = nullptr;
+            ID3D11Buffer*              null_cb  = nullptr;
+            ctx->CSSetShaderResources(0, 2, null_srv);
+            ctx->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+            ctx->CSSetConstantBuffers(0, 1, &null_cb);
+            ctx->CSSetShader(prev_cs, nullptr, 0);
+            if (prev_cs) prev_cs->Release();
+        }
+
         void sharpen(ID3D11DeviceContext* ctx, Tex& src, Tex& dst)
         {
             if (!g_sharpen_cb) {
@@ -978,6 +1519,8 @@ void main(uint2 tid : SV_DispatchThreadID)
             g_compose_layer_cs = compile(kComposeLayer, "fc5_dlss_compose_layer");
             g_panel_cs = compile(kPanel, "fc5_dlss_panel");
             g_sharpen_cs = compile(kSharpen, "fc5_dlss_sharpen");
+            g_fv_taa_cs  = compile(kFvTaa, "fc5_dlss_fovea_taa");     // dlssfovea: without them the switch does nothing (fovea_status says so)
+            g_fv_ring_cs = compile(kFvRing, "fc5_dlss_fovea_ring");
             D3D11_SAMPLER_DESC sd{};
             sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
             sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -1051,6 +1594,58 @@ void main(uint2 tid : SV_DispatchThreadID)
         return g_ev_last;
     }
 
+    // dlssfovea (FarCry5Dlss.h)
+    void set_fovea(float percent)
+    {
+        g_fv_share  = percent > 0.0f ? std::clamp(percent, 50.0f, 85.0f) / 100.0f : 0.0f;
+        g_fv_dead   = false;   // set again: tried again
+        g_fv_errors = 0;
+        g_fv_ox     = 0;
+    }
+    float fovea() { return g_fv_share.load() * 100.0f; }
+    void  set_fovea_band(float share) { g_fv_band = std::clamp(share, 0.05f, 0.6f); }
+    void  set_fovea_outer(float scale) { g_fv_outer = std::clamp(scale, 0.25f, 1.0f); }
+    void  set_eye_fov(int eye, float tan_left, float tan_right, float tan_up, float tan_down)
+    {
+        if (eye < 0 || eye > 1) return;
+        g_eye_tan[eye][0] = tan_left; g_eye_tan[eye][1] = tan_right; g_eye_tan[eye][2] = tan_up; g_eye_tan[eye][3] = tan_down;
+        g_eye_tan_ok[eye] = true;
+    }
+    float fovea_outer() { return g_fv_outer.load(); }
+    void  set_fovea_weight(float w) { g_fv_weight = std::clamp(w, 0.02f, 1.0f); }
+    void  set_fovea_clamp(float deviations) { g_fv_gamma = std::clamp(deviations, 0.25f, 8.0f); }
+    void  set_fovea_disocc(float ratio) { g_fv_disocc = ratio > 0.0f ? std::clamp(ratio, 1.05f, 100.0f) : 0.0f; }
+    void  set_fovea_jitter(float k) { g_fv_jit = std::clamp(k, -2.0f, 2.0f); }
+    void  set_fovea_show(int mode) { g_fv_show = std::clamp(mode, 0, 2); }
+    void  set_fovea_ofxr(int mode) { g_fv_ofxr = std::clamp(mode, 0, 2); g_fv_ox = 0; }
+    std::string fovea_status()
+    {
+        const float share = g_fv_share.load();
+        if (!(share > 0.0f)) return "off";
+        const int why = g_fv_why.load();
+        if (why != 0) return fmt::format("on, but not in use: {}", fovea_why(why));
+        const uint32_t s = g_fv_size.load();
+        return fmt::format("on: DLSS on the middle {:.0f}% of each eye's view ({}x{} px), the mod's own anti-aliasing around it{}", share * 100.0f, s >> 16, s & 0xffffu,
+                           g_fv_publishing.load() ? "; the eye's whole vectors and depth published to OFXR" : "");
+    }
+    std::string fovea_stats()
+    {
+        std::string ofxr;
+        if (g_ofxr_wants.load()) {
+            static const char* kOx[4]{ "watching", "trial with whole evaluations", "settled: the centre", "settled: whole evaluations" };
+            ofxr = fmt::format("; OFXR takes DLSS data: guides published {} accepted, {} refused, OFXR used guides in {} frames so far, watch: {} (dlssfoveaofxr {})",
+                               g_fv_pub.exchange(0), g_fv_pub_fail.exchange(0), g_ofxr_used.load(), kOx[std::clamp(g_fv_ox.load(), 0, 3)],
+                               g_fv_ofxr.load() == 1 ? "on" : g_fv_ofxr.load() == 2 ? "off" : "auto");
+        }
+        const FvRect& l = g_fv_rect[0];
+        const FvRect& r = g_fv_rect[1];
+        return fmt::format("{}; since the last call: {} centre-only evaluations ({} with the history started again), {} whole ones with the switch on, {} rectangle moves, {} errors; centre L {}x{} at ({}, {}) -> "
+                           "{}x{} at ({}, {}), R {}x{} at ({}, {}) -> {}x{} at ({}, {}); weight {:.2f}, clamp {:.2f}, history dropped where it was {:.2f}x nearer (0 = never), jitter x{:.1f}, show {}{}; lens centre L ({:.3f}, {:.3f}), R ({:.3f}, {:.3f}); band {:.2f}; outer area at {:.2f} of the render size",
+                           fovea_status(), g_fv_evals.exchange(0), g_fv_resets.exchange(0), g_fv_whole.exchange(0), g_fv_moves.exchange(0), g_fv_errors.load(), l.w, l.h, l.x, l.y, l.ow, l.oh, l.ox,
+                           l.oy, r.w, r.h, r.x, r.y, r.ow, r.oh, r.ox, r.oy, g_fv_weight.load(), g_fv_gamma.load(), g_fv_disocc.load(), g_fv_jit.load(), g_fv_show.load(), ofxr,
+                           l.u, l.v, r.u, r.v, g_fv_band.load(), g_fv_outer.load());
+    }
+
     void set_debug(int mode) { g_debug = mode; }
     // dlssmenurelease (author 9 Nov 11:05). A frame generation tool that takes DLSS's
     // data (OFXR's NVIDIA DLSS frame generation) starts only once the game has made and run a DLSS feature, and keeps generating
@@ -1074,10 +1669,12 @@ void main(uint2 tid : SV_DispatchThreadID)
         int n = 0;
         for (auto* f : g_feature) n += f != nullptr;
         for (auto* f : g_spare) n += f != nullptr;
+        for (auto* f : g_fv_feature) n += f != nullptr;   // dlssfovea
         if (n == 0) return;
         if (g_features_12) worker_idle();   // perfdlss12thread: no feature is touched while the worker runs
         for (auto& f : g_feature) release_feature(f);
         for (auto& f : g_spare) release_feature(f);
+        fovea_release();   // dlssfovea: the centres' features, and the mod's own guide streams at OFXR
         for (int e = 0; e < 2; ++e) g_feature_w[e] = g_feature_h[e] = g_feature_ow[e] = g_spare_w[e] = g_spare_h[e] = g_spare_ow[e] = 0;
         if (g_menu_releases++ < 20 || g_menu_releases % 50 == 0)
             spdlog::info("[DLSS] dlssmenurelease: {} DLSS feature(s) released for the flat screen (made again at the first evaluation in play; {} so far)", n, g_menu_releases);
@@ -1105,12 +1702,16 @@ void main(uint2 tid : SV_DispatchThreadID)
                     spdlog::info("[DLSS] ofxrdlss11: OFXR's route is now {}{}: it {} DLSS data", ofxr_route_name(snap.desired.frame_generation),
                                  snap.desired.motion_vectors == 1 ? " with DLSS motion vectors" : "", wants ? "takes" : "takes no");
                     starved = retries = 0;
+                    g_fv_ox = 0;   // dlssfovea: a new route is watched afresh
                 }
                 g_ofxr_wants = wants;
                 if (!wants && g_ofxr_d11.exchange(false)) spdlog::info("[DLSS] ofxrdlss11: OFXR takes no DLSS data any more: DLSS back on D3D12");
             }
             OfxrStatsV2 st{};
-            if (ofxr_stats(st)) g_ofxr_published = st.published;
+            if (ofxr_stats(st)) {
+                g_ofxr_published = st.published;
+                g_ofxr_used      = st.used;
+            }
         }
         const bool tagged = g_receipt[eye].publication != 0;
         // Progress = a receipt (D3D11 route) or OFXR's own publication counter moving (D3D12 route, no receipt). Counted on the
@@ -1122,6 +1723,40 @@ void main(uint2 tid : SV_DispatchThreadID)
             const uint64_t ev  = g_evals_ok.load();
             const bool     ran = ev != evals_seen;
             evals_seen = ev;
+            {
+                // dlssfovea (dlssfoveaofxr auto): does OFXR's frame generation use the guides the mod publishes itself? Its own
+                // "used" counter tells. If it stands still for 600 frames of centre-only evaluations, 600 frames of whole
+                // evaluations follow: if it moves then, the published guides are what OFXR does not take and whole evaluations
+                // stay while OFXR takes DLSS data; if it does not move either, OFXR uses no guides at all just now and the
+                // centre stays.
+                static uint32_t fv_n    = 0;
+                static uint64_t fv_used = 0;
+                const uint64_t  used    = g_ofxr_used.load();
+                const int       ox      = g_fv_ox.load();
+                if (g_fv_ofxr.load() != 0 || ox >= 2 || (ox == 0 && !g_fv_publishing.load())) {
+                    fv_n    = 0;
+                    fv_used = used;
+                } else if (used != fv_used) {
+                    fv_used = used;
+                    fv_n    = 0;
+                    if (ox == 1) {
+                        g_fv_ox = 3;
+                        spdlog::warn("[DLSS] dlssfovea: OFXR ({}) uses a whole evaluation's guides but used none of the guides published with the centre: whole "
+                                     "evaluations while OFXR takes DLSS data (dlssfoveaofxr on forces the centre)", ofxr_route_name(g_ofxr_fg.load()));
+                    }
+                } else if (ran && ++fv_n >= 600) {
+                    fv_n = 0;
+                    if (ox == 0) {
+                        g_fv_ox = 1;
+                        spdlog::info("[DLSS] dlssfovea: OFXR ({}) used no guides in 600 frames with the centre alone evaluated (its own publications {}, the mod's {} "
+                                     "accepted, {} refused): 600 frames of whole evaluations to compare", ofxr_route_name(g_ofxr_fg.load()), pub, g_fv_pub.load(),
+                                     g_fv_pub_fail.load());
+                    } else {
+                        g_fv_ox = 2;
+                        spdlog::info("[DLSS] dlssfovea: OFXR uses no guides with whole evaluations either: the centre alone again");
+                    }
+                }
+            }
             if (tagged || pub != seen) {
                 seen    = pub;
                 starved = 0;
@@ -1406,7 +2041,7 @@ void main(uint2 tid : SV_DispatchThreadID)
         g_encoded_mv = encoded_mv;
     }
 
-    std::atomic<int> g_dlaa_phases{ 8 };
+    std::atomic<int> g_dlaa_phases{ 16 };   // dlaaphases: 16 always since 13 Nov (the shipped value; no longer a setting, F11 Experimental gone)
     void set_dlaa_phases(int n) { g_dlaa_phases = std::clamp(n, 4, 32); }
     int  dlaa_phases() { return g_dlaa_phases.load(); }
 
@@ -1705,13 +2340,50 @@ void main(uint2 tid : SV_DispatchThreadID)
             if (g_recreate.exchange(false) || use12 != g_features_12) {   // perfdlss12 switched: the features are made again on the other API
                 for (auto& f : g_feature) release_feature(f);
                 for (auto& f : g_spare) release_feature(f);
+                fovea_release();   // dlssfovea
                 g_features_12 = use12;
             }
             g_render_w = w;
             const bool up = g_out_w > w && g_out_h > h;
             const UINT ow = up ? g_out_w : w, oh = up ? g_out_h : h;
             if (up && !make_tex(g_hi, ow, oh, work, use12)) { g_status = "upscale texture allocation failed"; break; }
-            if (g_feature[eye] && (g_feature_w[eye] != w || g_feature_h[eye] != h || g_feature_ow[eye] != ow) && g_spare[eye] &&
+            // dlssfovea: this evaluation is of the centre alone (fov), or of the whole image as before.
+            FvPlan fv;
+            bool   fov = fovea_plan(fv, eye, w, h, ow, oh, work, use12);
+            if (fov && (!g_fv_feature[eye] || g_fv_feat[eye].w != fv.r.w || g_fv_feat[eye].h != fv.r.h || g_fv_feat[eye].ow != fv.r.ow || g_fv_feat[eye].oh != fv.r.oh)) {
+                if (use12) worker_idle();   // perfdlss12thread: NGX's parameters and features are not touched while the worker runs
+                release_feature(g_fv_feature[eye]);
+                g_fv_feat[eye] = {};
+                if (use12 && !cl_open) {
+                    slot = d12_begin();
+                    if (slot >= 0) {
+                        cl      = g_d12.list[slot];
+                        cl_open = true;
+                    }
+                }
+                const NVSDK_NGX_Result fr = (use12 && !cl_open) ? NVSDK_NGX_Result_Fail : fovea_create(ctx, cl, eye, fv.r, use12);
+                if (NVSDK_NGX_FAILED(fr)) {
+                    g_fv_feature[eye] = nullptr;
+                    fov               = false;   // the whole image this time
+                    g_fv_why          = 14;
+                    fovea_error(fmt::format("the centre's feature ({}x{} -> {}x{}) could not be made, 0x{:x}", fv.r.w, fv.r.h, fv.r.ow, fv.r.oh, (uint32_t)fr));
+                } else {
+                    g_fv_feat[eye] = fv.r;
+                    fv.fresh       = true;
+                    if (g_fv_made.fetch_add(1) < 12)
+                        spdlog::info("[DLSS] dlssfovea: feature for eye {} created: the centre {}x{} at ({}, {}) of {}x{} -> {}x{} at ({}, {}) of {}x{}, binocular: {:.0f}% of each eye's view, the two together in both eyes, lens centre ({:.3f}, {:.3f}), "
+                                     "the other eye's middle {:+.3f}, {:+.3f} from this one's, blend over the outer {:.0f}% of the shape, preset {}{}", eye, fv.r.w, fv.r.h, fv.r.x,
+                                     fv.r.y, w, h, fv.r.ow, fv.r.oh, fv.r.ox, fv.r.oy, ow, oh, fv.r.k * 100.0f, fv.r.u, fv.r.v, fv.r.dx, fv.r.dy, fv.band * 100.0f, g_preset.load(), use12 ? ", on D3D12 (perfdlss12)" : "");
+                }
+            }
+            if (!fov && g_fv_ran[eye]) {
+                // Back to the whole image: its feature's history is from before the centre-only evaluations.
+                g_fv_ran[eye] = false;
+                reset         = true;
+                fovea_retire(eye);
+            }
+            if (!fov && g_fv_share.load() > 0.0f) g_fv_whole++;
+            if (!fov && g_feature[eye] && (g_feature_w[eye] != w || g_feature_h[eye] != h || g_feature_ow[eye] != ow) && g_spare[eye] &&
                 g_spare_w[eye] == w && g_spare_h[eye] == h && g_spare_ow[eye] == ow) {
                 // Back to the kept size: swap the two (its history is old, so it starts again).
                 std::swap(g_feature[eye], g_spare[eye]);
@@ -1722,7 +2394,7 @@ void main(uint2 tid : SV_DispatchThreadID)
                     spdlog::info("[DLSS] feature for eye {} reused: {}x{} -> {}x{} (kept from before; {}x{} kept in its place)", eye, w, h, ow, oh, g_spare_w[eye], g_spare_h[eye]);
                 reset = true;
             }
-            if (!g_feature[eye] || g_feature_w[eye] != w || g_feature_h[eye] != h || g_feature_ow[eye] != ow) {
+            if (!fov && (!g_feature[eye] || g_feature_w[eye] != w || g_feature_h[eye] != h || g_feature_ow[eye] != ow)) {
                 if (use12) worker_idle();   // perfdlss12thread: NGX's parameters and features are not touched while the worker runs
                 release_feature(g_spare[eye]);
                 g_spare[eye]    = g_feature[eye];   // kept for a switch back (a menu and the world)
@@ -1762,6 +2434,17 @@ void main(uint2 tid : SV_DispatchThreadID)
                 reset = true;
             }
             fc5::gputime::end(ctx, fc5::gputime::kDlssPrep);
+            // dlssfovea: the centre's history starts again when its feature is new, its rectangle moved or the eye's last
+            // evaluation was of the whole image; the periphery's when the view jumped or the eye's last evaluation was whole.
+            const bool ev_reset = fov ? (reset || fv.fresh || fv.moved || !g_fv_ran[eye]) : reset;
+            if (fov) {
+                fc5::passtime::mark(ctx, "mod: DLSS periphery (dlssfovea)");   // gputime passes N: its own segment, not the input compute's
+                fc5::gputime::begin(ctx, fc5::gputime::kDlssFovea);
+                fovea_taa(ctx, eye, fv, (mv_in == g_mv_cam.tex ? g_mv_cam : g_mv).srv, w, h, ow, jx, jy, reset, !up);
+                fc5::gputime::end(ctx, fc5::gputime::kDlssFovea);
+            }
+            NVSDK_NGX_Handle* const feat = fov ? g_fv_feature[eye] : g_feature[eye];
+            fc5::passtime::mark(ctx, "mod: DLSS evaluation");   // gputime passes N: its own segment, not the input compute's
             fc5::gputime::begin(ctx, fc5::gputime::kDlssEval);
             in_eval = true;
             float frame_ms = 11.1f;
@@ -1784,10 +2467,11 @@ void main(uint2 tid : SV_DispatchThreadID)
             }
             if (timing && g_ev_query) ctx->End(g_ev_query);
             const auto t_ev0 = std::chrono::steady_clock::now();
-            ID3D11Texture2D* const out_tex = up ? g_hi.tex : g_out.tex;
+            ID3D11Texture2D* const out_tex = fov ? g_fv_out[eye].tex : up ? g_hi.tex : g_out.tex;
             NVSDK_NGX_Result r = NVSDK_NGX_Result_Success;
+            g_fv_publishing = false;
             if (use12) {
-                Tex* const out_t = up ? &g_hi : &g_out;
+                Tex* const out_t = fov ? &g_fv_out[eye] : up ? &g_hi : &g_out;
                 Tex* const mv_t  = mv_in == g_mv_cam.tex ? &g_mv_cam : &g_mv;
                 ID3D12Resource* const res[4]{ g_color_in.r12, g_depth32.r12, mv_t->r12, out_t->r12 };
                 NVSDK_NGX_D3D12_DLSS_Eval_Params ep{};
@@ -1798,9 +2482,47 @@ void main(uint2 tid : SV_DispatchThreadID)
                 ep.InJitterOffsetX           = jx;
                 ep.InJitterOffsetY           = jy;
                 ep.InRenderSubrectDimensions = { w, h };
-                ep.InReset                   = reset ? 1 : 0;
+                ep.InReset                   = ev_reset ? 1 : 0;
                 ep.InMVScaleX = 1.0f; ep.InMVScaleY = 1.0f;
                 ep.InFrameTimeDeltaInMsec    = frame_ms;
+                OfxrGuidePubV2 pub{};   // struct_size 0: nothing to publish
+                if (fov) {
+                    // dlssfovea: the centre is read out of the whole inputs (no copies), into its own output.
+                    ep.InRenderSubrectDimensions = { fv.r.w, fv.r.h };
+                    ep.InColorSubrectBase        = { fv.r.x, fv.r.y };
+                    ep.InDepthSubrectBase        = { fv.r.x, fv.r.y };
+                    ep.InMVSubrectBase           = { fv.r.x, fv.r.y };
+                    Tex* const eye_t = up ? &g_hi : &g_out;   // the eye-size image the blend writes: what OFXR matches an eye image by
+                    if (fv.publish && eye_t->r12) {
+                        const int flags = g_flags.load();
+                        pub.struct_size          = sizeof(pub);
+                        pub.api_version          = 2;
+                        pub.stream               = kFvStream + uint64_t(eye);
+                        pub.output               = eye_t->r12;
+                        pub.motion_vectors       = mv_t->r12;
+                        pub.output_width         = ow;
+                        pub.output_height        = oh;
+                        pub.motion_width         = w;
+                        pub.motion_height        = h;
+                        pub.scale_x              = 1.0f;
+                        pub.scale_y              = 1.0f;
+                        pub.jitter_x             = jx;
+                        pub.jitter_y             = jy;
+                        pub.resource_state       = uint32_t(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        pub.jittered             = (flags & NVSDK_NGX_DLSS_Feature_Flags_MVJittered) ? 1 : 0;
+                        pub.reset                = ev_reset ? 1 : 0;
+                        pub.depth                = g_depth32.r12;
+                        pub.depth_width          = w;
+                        pub.depth_height         = h;
+                        pub.depth_resource_state = uint32_t(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        pub.frame_time_delta_ms  = frame_ms;
+                        pub.camera_near          = 0.1f;
+                        pub.camera_far           = 1000.0f;
+                        pub.depth_inverted       = (flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) ? 1 : 0;
+                        g_fv_stream[eye]         = true;
+                        g_fv_publishing          = true;
+                    }
+                }
                 // perfdlss12thread: the worker records and submits, unless this evaluation's list is already open (a feature was
                 // just made into it on this thread).
                 const bool threaded = g_d12_thread.load() && !cl_open;
@@ -1810,7 +2532,10 @@ void main(uint2 tid : SV_DispatchThreadID)
                         g_worker_started = true;
                         spdlog::info("[DLSS] perfdlss12thread: NGX's D3D12 recording on its own thread");
                     }
-                    if (const uint32_t e = g_wk_err.exchange(0)) g_status = fmt::format("evaluation failed 0x{:x} (D3D12, worker)", e);
+                    if (const uint32_t e = g_wk_err.exchange(0)) {
+                        g_status = fmt::format("evaluation failed 0x{:x} (D3D12, worker)", e);
+                        if (fov) fovea_error(fmt::format("an evaluation failed 0x{:x} (D3D12, worker)", e));   // most likely this eye's or the other's centre
+                    }
                     // D3D11 signals after its input passes and flushes; the worker's list waits for that on the GPU. D3D11's next
                     // command waits on the GPU for the value the worker will signal after the list.
                     g_d12.ctx4->Signal(g_d12.to12_11, ++g_d12.to12_v);
@@ -1818,8 +2543,9 @@ void main(uint2 tid : SV_DispatchThreadID)
                     const auto t_fl = std::chrono::steady_clock::now();
                     D12Job job;
                     job.slot    = d12_slot();
-                    job.feature = g_feature[eye];
+                    job.feature = feat;
                     job.ep      = ep;
+                    job.pub     = pub;
                     std::copy(res, res + 4, job.res);
                     job.v12     = g_d12.to12_v;
                     job.v11     = ++g_d12.to11_v;
@@ -1843,7 +2569,7 @@ void main(uint2 tid : SV_DispatchThreadID)
                         cl      = g_d12.list[slot];
                         cl_open = true;
                     }
-                    r       = record12(cl, g_feature[eye], ep, res);
+                    r       = record12(cl, feat, ep, res, pub.struct_size ? &pub : nullptr);
                     cl_open = false;
                     const auto t_rec = std::chrono::steady_clock::now();
                     // The list runs even if the evaluation failed (a feature made in it is set up there).
@@ -1875,10 +2601,16 @@ void main(uint2 tid : SV_DispatchThreadID)
                 ep.InJitterOffsetX   = jx;
                 ep.InJitterOffsetY   = jy;
                 ep.InRenderSubrectDimensions = { w, h };
-                ep.InReset           = reset ? 1 : 0;
+                ep.InReset           = ev_reset ? 1 : 0;
                 ep.InMVScaleX = 1.0f; ep.InMVScaleY = 1.0f;
                 ep.InFrameTimeDeltaInMsec = frame_ms;
-                r = NGX_D3D11_EVALUATE_DLSS_EXT(ctx, g_feature[eye], g_params, &ep);
+                if (fov) {   // dlssfovea: the centre out of the whole inputs
+                    ep.InRenderSubrectDimensions = { fv.r.w, fv.r.h };
+                    ep.InColorSubrectBase        = { fv.r.x, fv.r.y };
+                    ep.InDepthSubrectBase        = { fv.r.x, fv.r.y };
+                    ep.InMVSubrectBase           = { fv.r.x, fv.r.y };
+                }
+                r = NGX_D3D11_EVALUATE_DLSS_EXT(ctx, feat, g_params, &ep);
             }
             if (timing) {
                 const int k = use12 ? 1 : 0;
@@ -1886,9 +2618,31 @@ void main(uint2 tid : SV_DispatchThreadID)
                 g_ev_n[k]++;
                 if (g_ev_query && ctx->GetData(g_ev_query, nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK) g_ev_idle[k]++;
             }
-            if (NVSDK_NGX_FAILED(r)) { g_status = fmt::format("evaluation failed 0x{:x}{}", (uint32_t)r, use12 ? " (D3D12)" : ""); break; }
+            if (NVSDK_NGX_FAILED(r)) {
+                g_status = fmt::format("evaluation failed 0x{:x}{}", (uint32_t)r, use12 ? " (D3D12)" : "");
+                if (fov) fovea_error(fmt::format("the centre's evaluation failed 0x{:x}{}", (uint32_t)r, use12 ? " (D3D12)" : ""));
+                break;
+            }
             g_evals_ok++;
-            keep_ofxr_receipt(eye, out_tex);
+            std::string fv_note;
+            if (fov) {
+                // dlssfovea: the centre blended into the eye image (the periphery pass wrote the rest in DLAA). No receipt: on
+                // D3D11 OFXR tagged the centre's output, which is no eye image.
+                g_receipt[eye] = {};
+                fc5::gputime::end(ctx, fc5::gputime::kDlssEval);
+                fc5::gputime::begin(ctx, fc5::gputime::kDlssFovea);
+                fovea_ring(ctx, eye, fv, up ? g_hi : g_out, up || fv.pw != w || fv.ph != h);   // whole: the outer area is stretched in too
+                fc5::gputime::end(ctx, fc5::gputime::kDlssFovea);
+                fc5::gputime::begin(ctx, fc5::gputime::kDlssEval);
+                g_fv_ran[eye] = true;
+                g_fv_size     = (fv.r.w << 16) | fv.r.h;
+                if (ev_reset) g_fv_resets++;
+                if (++g_fv_evals >= 5400 && eye == 1)   // a status line about every 30 s at 90 pairs a second (it and dlssfoveastat reset the count)
+                    spdlog::info("[DLSS] dlssfovea: {}", fovea_stats());
+                fv_note = fmt::format(", DLSS on the centre {}x{} (dlssfovea)", fv.r.w, fv.r.h);
+            } else {
+                keep_ofxr_receipt(eye, out_tex);
+            }
             if (up) {
                 // The game's own low-resolution path goes on (SMAA, then the HUD); the eye image is
                 // composed at present from the DLSS output and the HUD.
@@ -1897,7 +2651,7 @@ void main(uint2 tid : SV_DispatchThreadID)
                     ctx->CopyResource(g_hi.tex, g_sharp.tex);
                 }
                 g_have_hi = true;
-                g_status  = fmt::format("DLSS {}x{} -> {}x{} per eye", w, h, ow, oh);
+                g_status  = fmt::format("DLSS {}x{} -> {}x{} per eye{}", w, h, ow, oh, fv_note);
                 ok        = false;
                 break;
             }
@@ -1908,11 +2662,12 @@ void main(uint2 tid : SV_DispatchThreadID)
             } else {
                 ctx->CopyResource(target_res, g_out.tex);
             }
-            g_status = fmt::format("DLAA {}x{} per eye", w, h);
+            g_status = fmt::format("DLAA {}x{} per eye{}", w, h, fv_note);
             ok = true;
         } while (false);
         if (cl_open) cl->Close();   // left before its submission: not run (the allocator is reset at its next use)
         fc5::gputime::end(ctx, in_eval ? fc5::gputime::kDlssEval : fc5::gputime::kDlssPrep);
+        fc5::passtime::mark(ctx, "after DLSS (until the game's next target change)");
         if (color_res) color_res->Release();
         if (target_res) target_res->Release();
         if (timing) eval_window();

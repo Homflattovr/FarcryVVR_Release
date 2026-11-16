@@ -27,6 +27,15 @@
 //    it, straight ahead of the head. World markers come back when it ends. Not in a vehicle (its own rules). Off: as before.
 //    Log: "[HUD] qtehud: ... the whole HUD on the panel" at the start, "... world markers again after N s (M draws kept on the panel)".
 //    downforce on (test) also starts it, so it can be seen standing in the simulator.
+//    cineprompt (author 16 Nov 14:28; his 14:20-14:27 log, build
+//    6ED7C778): the same holds while a cutscene is shown (m_cine_on), in a vehicle or not. In a 3D cutscene the game camera is the
+//    scene's camera: a prompt drawn in the marker phase came out ~2 deg wide where that camera looked (14:23-14:24: the eyes 30-55 deg
+//    off it on average), 30 m out (hudmarkdist). It is not a QTE for the game (the log: QTE false), so the struggle rule did not catch
+//    it. He pressed LB, B, A and the left grip through both cutscenes, looking for it. World markers mean nothing in a cutscene anyway.
+//    cineworld (author 16 Nov 21:33, log 21:13-21:31: the arrest and the helicopter exit prompts still missing): those parts are scenes the game
+//    plays in the world (a script sequence with no camera cut, the player camera), not cutscenes, so m_cine_on was off and a prompt in the
+//    marker phase went to the world markers: shrunk to 0.21, capped at 4 deg, 30 m out, ~25 deg under where the game camera looked. The same
+//    hold now covers such a scene (m_cine_world, update_cinematic) until the script stops it.
 #include "FarCry5Stereo.h"
 #include "FarCry5Lua.h"
 
@@ -164,8 +173,9 @@ void FarCry5Stereo::update_qte_hud()
     const int  gd  = fc5::lua::pawn_down();
     const int  gst = fc5::lua::pawn_stance();
     const int  gq  = fc5::lua::pawn_qte();
-    const bool now = m_qte_hud.load() && !m_in_vehicle.load() &&
-                     (m_dv_active || m_down_force.load() == 1 || gd == 1 || gst == 4 || gq == 1);
+    const bool down = !m_in_vehicle.load() && (m_dv_active || m_down_force.load() == 1 || gd == 1 || gst == 4 || gq == 1);
+    const bool cine = m_cine_on || m_cine_world;   // cineprompt: a cutscene's prompts too (in a vehicle or not); cineworld: a scene played in the world
+    const bool now  = m_qte_hud.load() && (down || cine);
     const bool was = m_qte_hud_now.load(std::memory_order_relaxed);
     if (now == was) return;
     m_qte_hud_now.store(now, std::memory_order_relaxed);
@@ -173,8 +183,8 @@ void FarCry5Stereo::update_qte_hud()
         m_qte_hud_t0   = std::chrono::steady_clock::now();
         m_qte_hud_kept = 0;
         spdlog::info("[HUD] qtehud: {}: the whole HUD on the panel (no world markers), prompts where the flat game puts them",
-                     gq == 1 ? "in a QTE (the game's IsInQTE)" : gd == 1 ? "knocked down (the game's IsPawnDown)" : gst == 4 ? "knocked down (the game's stance 4)"
-                     : m_down_force.load() == 1 ? "downforce" : "downview still holding the view");
+                     !down ? (m_cine_on ? "a cutscene (cineprompt)" : "a scene played in the world (cineworld)") : gq == 1 ? "in a QTE (the game's IsInQTE)" : gd == 1 ? "knocked down (the game's IsPawnDown)"
+                     : gst == 4 ? "knocked down (the game's stance 4)" : m_down_force.load() == 1 ? "downforce" : "downview still holding the view");
     } else {
         spdlog::info("[HUD] qtehud: world markers again after {:.1f} s ({} marker-phase draws kept on the panel){}",
                      std::chrono::duration<float>(std::chrono::steady_clock::now() - m_qte_hud_t0).count(), m_qte_hud_kept,
@@ -234,16 +244,11 @@ void FarCry5Stereo::draw_downview_menu(const std::function<void(const char*, std
         if (!v && m_dv_active) down_view_release("downview off");
         keep("downview", v ? "downview on" : "downview off");
     }
-    hint("downview. On (default; author 30 Oct): knocked down, the game's camera is "
-         "the animation's and the game draws only what it sees. Your view now turns to face where it looks (past 15 deg, eased; at once on a camera cut), the "
-         "horizon kept level, and your position follows it smoothly; getting up, it eases back to the normal view without a jump. Off: as before.");
+    hint("When knocked down, your view follows the game's camera smoothly instead of showing cut-off scenery. Off: your view stays where it was.");
     bool q = m_qte_hud.load();
-    if (ImGui::Checkbox("Knocked down or in a struggle (QTE): all button prompts on the HUD panel##qtehud", &q)) {
+    if (ImGui::Checkbox("Knocked down, in a struggle (QTE), in a cutscene or a scripted scene: all button prompts on the HUD panel##qtehud", &q)) {
         m_qte_hud = q;
         keep("qtehud", q ? "qtehud on" : "qtehud off");
     }
-    hint("qtehud. On (default; author 8 Nov): while you are knocked down or in a "
-         "struggle (the game's IsPawnDown or IsInQTE), the whole HUD stays on the panel in front of you, so the struggle's button prompts show where the flat "
-         "game puts them. Otherwise they were taken for world markers: made small and put where the game's camera looked, which was the animation's, "
-         "far from where you look. World markers come back when it ends. Off: as before.");
+    hint("When knocked down, in a struggle or in a cutscene, button prompts stay on the HUD panel in front of you so you can see them.");
 }

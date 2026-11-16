@@ -25,7 +25,12 @@ namespace fc5::camscan
             float*   p;
             uint32_t hits;
             bool     image;
+            // gunscan early (research 2026-11-12_nativeweapon): the copy as it stood at the weapon pass's first draw (snap), and how
+            // often that was already the value the gun mesh was then drawn with (track_early).
+            float    early[3];
+            uint32_t early_hits;
         };
+        uint32_t g_early_frames = 0;
         std::vector<Cand>   g_cands;
         std::vector<float*> g_live;
         uint32_t            g_frames = 0;
@@ -61,6 +66,19 @@ namespace fc5::camscan
                 for (int k = 0; k < 16; ++k) out[k] = p[k];
                 return true;
             } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return false;
+            }
+        }
+
+        bool read3(const float* p, float out[3])
+        {
+            __try {
+                out[0] = p[0];
+                out[1] = p[1];
+                out[2] = p[2];
+                return true;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                out[0] = out[1] = out[2] = 0.0f;
                 return false;
             }
         }
@@ -205,6 +223,7 @@ namespace fc5::camscan
     size_t scan(const float pos[3])
     {
         g_cands.clear();
+        g_early_frames = 0;
         g_frames = 0;
         if (pos[0] == 0.0f && pos[1] == 0.0f && pos[2] == 0.0f) return 0;
         MEMORY_BASIC_INFORMATION mbi{};
@@ -226,6 +245,20 @@ namespace fc5::camscan
         return g_cands.size();
     }
 
+    void snap()
+    {
+        for (auto& c : g_cands) read3(c.p, c.early);
+    }
+
+    void track_early(const float pos[3])
+    {
+        if (g_cands.empty()) return;
+        ++g_early_frames;
+        for (auto& c : g_cands) {
+            if (c.early[0] == pos[0] && c.early[1] == pos[1] && c.early[2] == pos[2]) ++c.early_hits;
+        }
+    }
+
     void track(const float pos[3])
     {
         if (g_cands.empty()) return;
@@ -244,14 +277,16 @@ namespace fc5::camscan
             // Every candidate's count, also below the share (the first 50).
             if (logged < 50) {
                 const bool kept = g_frames != 0 && c.hits >= uint32_t(min_share * g_frames);
-                spdlog::info("[CamScan] candidate {} {} hits {}/{}{}", static_cast<void*>(c.p), module_of(c.p), c.hits, g_frames, kept ? fmt::format(" (listed as {})", g_live.size()) : std::string{ " (below the share)" });
+                spdlog::info("[CamScan] candidate {} {} hits {}/{}{}{}", static_cast<void*>(c.p), module_of(c.p), c.hits, g_frames,
+                             g_early_frames ? fmt::format(", already this pass's value at the pass's first draw {}/{}", c.early_hits, g_early_frames) : std::string{},
+                             kept ? fmt::format(" (listed as {})", g_live.size()) : std::string{ " (below the share)" });
                 ++logged;
             }
             if (g_frames == 0 || c.hits < uint32_t(min_share * g_frames)) continue;
             float       v[16]{};
             std::string around = read16(c.p - 8, v) ? std::string{} : std::string{ "(unreadable)" };
             if (around.empty()) for (float f : v) around += fmt::format("{:.6g} ", f);
-            out << fmt::format("{} {} {} hits {}/{} | {}\n", g_live.size(), static_cast<void*>(c.p), module_of(c.p), c.hits, g_frames, around);
+            out << fmt::format("{} {} {} hits {}/{} early {}/{} | {}\n", g_live.size(), static_cast<void*>(c.p), module_of(c.p), c.hits, g_frames, c.early_hits, g_early_frames, around);
             g_live.push_back(c.p);
         }
         spdlog::info("[CamScan] {} of {} copies followed the camera in at least {:.0f}% of {} frames (list: probes/camscan.txt)", g_live.size(), g_cands.size(),

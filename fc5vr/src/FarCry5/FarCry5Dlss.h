@@ -124,6 +124,35 @@ namespace fc5::dlss
     // Output width / render width while upscaling (1 otherwise).
     float upscale_ratio();
 
+    // dlssfovea (foveated DLSS thread, 12 Nov; cmd dlssfovea off|on|<percent>, saved, default off). DLSS evaluates only the
+    // middle of the view: one binocular-shaped area, the same directions in both eyes (the union of the two eyes' views, each
+    // shrunk to that share around its own middle), so its edge falls at the same place for both eyes (headset, 12 Nov: a
+    // fixed-angle rectangle's edges showed in the middle of the other eye's view; 13 Nov: "the shape of a binocular, not two circles"). The rest of the eye image gets the mod's own temporal anti-aliasing, blended in over a wide band
+    // inside the shape's edge. One NGX evaluation per eye, as before. The idea
+    // is the "foveated upscaling" of RippeR37's Metro Exodus VR mod; none of its code is used. Eye images only (menus and the
+    // flat screen keep whole evaluations). While OFXR takes DLSS data, the mod publishes the eye's whole vectors and depth to it
+    // itself (D3D12 path only), and goes back to whole evaluations if OFXR does not use them (set_fovea_ofxr: 0 auto, 1 always
+    // publish, 2 whole evaluations while OFXR takes DLSS data).
+    void  set_fovea(float percent);   // 0 = off, else 50..85 (% of each eye's view)
+    float fovea();                    // the same, 0 = off
+    void  set_fovea_band(float share);          // dlssfoveaband (test): the blend's width as a share of the shape's radius (0.25)
+    // dlssfoveaouter (test, not saved, default 1): the outer area's level, its anti-aliasing done at this share of the render size and
+    // stretched (1 native, 0.67 quality, 0.58 balanced, 0.5 performance, 0.33 ultra performance). The centre's level is DLSS's
+    // render scale (the game's render size, F11 "DLSS render scale", at the next start).
+    void  set_fovea_outer(float scale);         // test only since fix 5 (not saved): lower levels cost as much and blurred the view
+    // Each eye's field of view as its projection uses it (tangents; left and down negative), from the eye's camera upload: where
+    // the eye looks straight ahead in its image, for dlssfovea's shape.
+    void  set_eye_fov(int eye, float tan_left, float tan_right, float tan_up, float tan_down);
+    float fovea_outer();
+    void  set_fovea_weight(float w);            // dlssfoveaweight (test): the new frame's share in the periphery (0.10)
+    void  set_fovea_clamp(float deviations);    // dlssfoveaclamp (test): how far the periphery's history may sit from its neighbourhood (1.5)
+    void  set_fovea_disocc(float ratio);        // dlssfoveadisocc (test): the periphery's history dropped where it was this many times nearer (1.5; 0 off)
+    void  set_fovea_jitter(float k);            // dlssfoveajit (test): multiplier on the jitter difference in the periphery's reprojection (1)
+    void  set_fovea_show(int mode);             // dlssfoveashow (test): 1 periphery tinted red, 2 centre alone
+    void  set_fovea_ofxr(int mode);
+    std::string fovea_status();                 // one line for the F11 menu
+    std::string fovea_stats();                  // dlssfoveastat: the line above plus counters since the last call
+
     std::string status();
     void        new_frame();
     // This frame's DLSS output before the HUD (eye size), null without one (scopesrc reads the scope's view from it).

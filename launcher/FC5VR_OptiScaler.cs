@@ -306,9 +306,13 @@ static class OptiScalerSetup
             // The mod sizes the render target itself; no ratio overrides, no output scaling.
             new[] { "OutputScaling", "Enabled", "false" }, new[] { "UpscaleRatio", "UpscaleRatioOverrideEnabled", "false" },
             new[] { "QualityOverrides", "QualityRatioOverrideEnabled", "false" },
-            // Nothing else loaded or blocked.
+            // Nothing else loaded.
             new[] { "Plugins", "LoadAsiPlugins", "false" }, new[] { "Plugins", "LoadReshade", "false" }, new[] { "Plugins", "LoadSpecialK", "false" },
-            new[] { "fakenvapi", "UseFakenvapi", "false" }, new[] { "Hotfix", "CheckForUpdate", "false" }, new[] { "Hotfix", "DisableOverlays", "false" },
+            new[] { "fakenvapi", "UseFakenvapi", "false" }, new[] { "Hotfix", "CheckForUpdate", "false" },
+            // Game overlays (Ubisoft Connect, Steam, Discord) blocked: on AMD / Intel OptiScaler wraps the game's swap chain and the
+            // Ubisoft overlay crashed on that wrapper at start (tester report 12 Nov 2026, access violation in dxgi.dll). They
+            // cannot be seen in the headset anyway. Launcher.WriteUpscaler sets it again at every Play for older installs.
+            new[] { "Hotfix", "DisableOverlays", "true" },
             // A log to check which upscaler ran, at Info.
             new[] { "Log", "LogToFile", "true" }, new[] { "Log", "LogLevel", "2" }, new[] { "Log", "SingleFile", "true" },
         };

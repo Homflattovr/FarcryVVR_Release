@@ -72,6 +72,8 @@ namespace fc5::afw
     // Copies the eye's last captured image (the rotation-only fallback).
     bool copy_last(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* dst);
     ID3D11Texture2D* last_image(int eye);
+    // afwpereye: the eye's last linear depth copy (R32F metres, a render target), where the hidden area is marked (hidmask::mark).
+    ID3D11Texture2D* last_depth(int eye);
     const Camera&    last_camera(int eye);
 
     // Flat test: keeps the last rebuild and, at the next capture of that eye, measures how far it is
@@ -119,7 +121,8 @@ namespace fc5::afw
     // Experiments from the BioShock VR mod's rebuild (24 Oct; F11 Experimental > AFW), bits: 1 afwfoot (a refined point whose
     // remaining step crosses a depth break is refused), 2 afwrail (thin near things retried from the nearest texel beside the seed);
     // 4 afwfoliage (29 Oct): a held point in a porous patch (needles, leaves, grass) is not taken for moved while the fresh eye
-    // has a speck of the plant within 6 texels.
+    // has a speck of the plant within 6 texels; 8 afwspeck (15 Nov): the held eye's own point is not replaced by a nearer fresh
+    // point that is only a speck (needle, leaf, blade, lattice bar) while the held image has the plant within 6 texels.
     void set_experiments(int bits);
     void set_enabled(bool on);
     bool enabled();

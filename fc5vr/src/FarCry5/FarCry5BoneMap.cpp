@@ -311,9 +311,7 @@ namespace fc5::bonemap
         const Opts o = opts();
         bool       v = o.on;
         if (ImGui::Checkbox("Show every first-person bone with its name##bonemap", &v)) cmds += v ? "bonemap on\n" : "bonemap off\n";
-        hint("Debug (off by default, not saved). Every bone of the held weapon, its attachments, the gloves, the bare arms and sleeves as a dot with its name "
-             "from the game's own model files, where the game draws it. Unknown draws show their id (index count / palette slot): the ids "
-             "reloadmagmesh and reloadhandlepart take. Map: research\\2026-11-02_bonemap.md. Command bonemap on/off.");
+        hint("Shows every bone of the weapon, gloves and arms as a dot with its name. For testing. Command bonemap.");
         if (!v) return;
         ImGui::Text("%s", status().c_str());
         static const char* const kLabel[6]{ "", "Weapon parts (yellow)##bmw", "Hands and fingers (cyan)##bmh", "Arms, wrist to shoulder (green)##bma",
@@ -326,11 +324,10 @@ namespace fc5::bonemap
         }
         bool h = o.hidden;
         if (ImGui::Checkbox("Also the draws the mod hides (bare arms), dimmed##bmhid", &h)) cmds += h ? "bonemaphidden on\n" : "bonemaphidden off\n";
-        hint("With hand models on, the mod hides the game's bare forearms and sleeves: their bones still show where the game animates its own arms.");
+        hint("Also shows the bones of the arms the mod hides, dimmed.");
         bool b = o.game_body;
         if (ImGui::Checkbox("The game's body bones (magenta)##bmgb", &b)) cmds += b ? "bonemapbody on\n" : "bonemapbody off\n";
-        hint("The player's body as the game's GetBonePos gives it every 100 ms (head, spine, shoulders, elbows, hands, legs; holster points where the skeleton has them). "
-             "For the sling and the holsters.");
+        hint("Shows the game's body bones (head, spine, arms, legs) in magenta.");
         int l = o.labels;
         ImGui::TextUnformatted("Labels:");
         ImGui::SameLine();
@@ -348,7 +345,7 @@ namespace fc5::bonemap
         int mx = o.max;
         if (ImGui::SliderInt("Labels at most##bmmax", &mx, 10, 400)) cmds += fmt::format("bonemapmax {}\n", mx);
         if (ImGui::Button("Log this frame's draws and bones##bmdump")) cmds += "bonemapdump\n";
-        hint("One [BoneMap] dump line per draw in fc5vr_log.txt: its id, the model, each slot's name, vertices and place on the weapon controller (cm: right, up, back).");
+        hint("Writes this frame's weapon and arm parts to the log, for testing.");
     }
 }
 
@@ -556,8 +553,7 @@ void FarCry5Stereo::bonemap_note(ID3D11DeviceContext* ctx, UINT count, UINT star
     }
 }
 
-// A draw's vertices read once (one draw every 5 frames: each is a GPU read): the palette slots they use and their centres. Shared by
-// bonemap_note and bonemap_identify (armik). Returns the Scan, or nullptr while it is not read (yet, or it failed).
+// A draw's vertices read once (one draw every 5 frames: each is a GPU read): the palette slots they use and their centres. Returns the Scan, or nullptr while it is not read (yet, or it failed).
 const void* FarCry5Stereo::bonemap_scan(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, bool skinned, float scale)
 {
     if (!m_bm) m_bm = new BoneMapState{};
@@ -644,31 +640,6 @@ const void* FarCry5Stereo::bonemap_scan(ID3D11DeviceContext* ctx, UINT count, UI
     if (vb) vb->Release();
     if (ib) ib->Release();
     return si != s.scans.end() ? &si->second : nullptr;
-}
-
-// armik (FarCry5ArmIkDraw.cpp): the kDraws index of the draw now bound (-1 unknown, or two models share its count and its vertices are not read yet).
-int FarCry5Stereo::bonemap_identify(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, bool indirect, int& alts)
-{
-    alts = 0;
-    if (count == 0 || !ctx) return -1;
-    ID3D11Buffer* cb[2]{};
-    ctx->VSGetConstantBuffers(2, 2, cb);   // b2 CSceneGeometry (position scale), b3 the palette
-    bool  skinned = false;
-    float scale   = 0.0f;
-    if (cb[1]) {
-        D3D11_BUFFER_DESC d{};
-        cb[1]->GetDesc(&d);
-        skinned = d.ByteWidth == kPaletteBytes;
-    }
-    {
-        std::lock_guard _{ m_obj_mtx };
-        if (cb[0]) if (auto it = m_obj_consts.find(cb[0]); it != m_obj_consts.end() && it->second.f[5] > 1e-7f && it->second.f[5] < 1e-2f) scale = it->second.f[5];
-    }
-    for (auto* b : cb) if (b) b->Release();
-    const Scan* sc = static_cast<const Scan*>(bonemap_scan(ctx, count, start, base, skinned, scale));
-    const int   d  = fc5::bonemap::find(count, !skinned ? -2 : sc ? sc->max_bone : -1, indirect, alts);
-    if (d >= 0 && alts > 0 && skinned && !sc) return -1;   // not told apart yet
-    return d;
 }
 
 // After the overlays: each point of the frame's draws (this frame's, else the last one's) and the game's body as dots and labels.

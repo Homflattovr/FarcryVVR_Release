@@ -38,9 +38,29 @@ D3D11Hook::~D3D11Hook() {
 }
 
 bool D3D11Hook::hook() {
-    spdlog::info("Hooking D3D11");
-
     g_d3d11_hook = this;
+
+    // Far Cry 5 (FSR tester crash, 12 Nov 2026): the dummy swap chain below is created through every overlay's and
+    // wrapper's CreateSwapChain hook. With FSR on an AMD card, OptiScaler wraps the game's swap chain and the Ubisoft
+    // overlay (overlay64.dll) hooks Present on that wrapper; when the dummy (a plain dxgi swap chain) went through the
+    // overlay too, the overlay's next call for the game's Present went straight into dxgi's Present with OptiScaler's
+    // wrapper as the swap chain: access violation reading 0xffffffffffffffff in dxgi.dll, 8 s after start.
+    // The mod already sees the game's real swap chain (its inline hook on the system CreateSwapChain sits under all of
+    // them), and every dxgi swap chain shares one vtable: patch that one directly, with no dummy device or swap chain.
+    // Safety: if a hook made that way never saw a present (no swap chain yet), the next rehook takes the old dummy route.
+    const auto vtable = s_game_swap_chain_vtable.load();
+
+    if (vtable != nullptr && !(m_tried_game_vtable && m_swapchain_0 == nullptr)) {
+        m_tried_game_vtable = true;
+        spdlog::info("Hooking D3D11 through the game's own swap chain class (vtable {}), no dummy swap chain", (void*)vtable);
+        return hook_swap_chain_vtable(vtable);
+    }
+
+    if (vtable != nullptr) {
+        spdlog::warn("Hooking D3D11: no present came through the game's swap chain class, trying a dummy swap chain");
+    }
+
+    spdlog::info("Hooking D3D11");
 
     HWND h_wnd = GetDesktopWindow();
     IDXGISwapChain* swap_chain = nullptr;
@@ -95,13 +115,21 @@ bool D3D11Hook::hook() {
         }
     }
 
+    hook_swap_chain_vtable(*(void***)swap_chain);
+
+    device->Release();
+    context->Release();
+    swap_chain->Release();
+    return m_hooked;
+}
+
+bool D3D11Hook::hook_swap_chain_vtable(void** vtable) {
     utility::ThreadSuspender suspender{};
 
     try {
         m_present_hook.reset();
         m_resize_buffers_hook.reset();
 
-        void** vtable = *(void***)swap_chain;
 
         // Far Cry 5 (5 Nov 2026, OptiScaler set to its own DLSS): OptiScaler's D3D11CreateDeviceAndSwapChain hands back its own wrapper
         // swap chain (WrappedIDXGISwapChain4), so the slots hooked here were the wrapper's, which the game never presents through: no
@@ -127,10 +155,6 @@ bool D3D11Hook::hook() {
     }
 
     suspender.resume();
-
-    device->Release();
-    context->Release();
-    swap_chain->Release();
     return m_hooked;
 }
 

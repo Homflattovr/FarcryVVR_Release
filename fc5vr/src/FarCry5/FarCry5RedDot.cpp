@@ -269,8 +269,10 @@ bool FarCry5Stereo::reddot_excluded()
     // glow (on the sight itself, seen by both eyes).
     if ((m_mo.bow || m_bow_slung_now) && m_motion.load()) return true;   // bowsling: nor on the sling
     if (m_scope.load() && m_scope_st.active && m_scope_st.frame == m_frame.load()) return true;
+    const uint32_t sig = m_weapon_sig.load();
+    if (scope_reflex_optic(sig)) return false;   // scopereflex: a reflex or red dot sight on a gun with a magnifying entry (the M60) keeps the red dot
     std::lock_guard _{ m_scope_mtx };
-    const auto it = m_scope_cal.find(m_weapon_sig.load());
+    const auto it = m_scope_cal.find(sig);
     return it != m_scope_cal.end() && it->second.mag > 1.01f;
 }
 

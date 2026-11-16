@@ -76,7 +76,8 @@ namespace fc5::spawn
             float dist = 6.0f;   // (not in the list: a car's distance)
             for (const auto& v : kVehicles)
                 if (v.archetype == id) dist = v.dist;
-            fc5::lua::vehicle_request(id, fx, fy, dist, cmd == "spawnvehiclein");
+            // <id>@clear (the vehicle passes of tools\wheelglue): on a flat empty patch found around the player, not ahead (FarCry5Lua.h).
+            fc5::lua::vehicle_request(id, fx, fy, dist, cmd == "spawnvehiclein", arg.find("@clear") != std::string::npos);
             return true;
         }
         if (id == 0) {
@@ -98,8 +99,7 @@ namespace fc5::spawn
             for (const auto& e : kTable)
                 if (seen.insert(e.kind).second) kinds.push_back(e.kind);
         }
-        hint("In hand: the game adds that item to your inventory and draws it, and the weapon you were holding falls in front of you. On the ground: its world entity appears in front of you. "
-             "Added items are real: if you save, they may stay in that save, and a dropped weapon comes back with default attachments.");
+        hint("In hand: the item goes into your inventory and hands. On the ground: it appears in front of you. Saving may keep it.");
         ImGui::SetNextItemWidth(220.0f);
         if (!kinds.empty()) ImGui::Combo("Kind##spawnkind", &kind_at, kinds.data(), int(kinds.size()));
         ImGui::SameLine();
@@ -108,7 +108,7 @@ namespace fc5::spawn
         std::string want = filter;
         std::transform(want.begin(), want.end(), want.begin(), [](char c) { return char(std::tolower(static_cast<unsigned char>(c))); });
         ImGui::Checkbox("Also show what the game marks as not for use##spawnmarked", &show_marked);
-        hint("Names with DONOTUSE, DELETE_ME, LEGACY, NPC, PLACEHOLDER, E3ONLY, zz_ and the like: cut or unfinished items, shown in orange. They may not work, and one could crash the game.");
+        hint("Also lists unfinished items the game doesn't use. They may not work and could crash the game.");
         // mountedlist: the mounted guns in one row.
         ImGui::TextUnformatted("Mounted guns:");
         for (const auto& q : kMountedQuick) {
@@ -120,8 +120,7 @@ namespace fc5::spawn
             if (ImGui::SmallButton(fmt::format("{}##mountedquick", q.label).c_str())) cmds += fmt::format("spawnground {:x}\n", arch);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", q.name);
         }
-        hint("Each puts that mounted gun on the ground in front of you, its handles towards you (the Mounted kind below has them all). Walk to it and use it with pad X "
-             "(on 5 Nov the 360 mortar mounted; the 360 M2 and M60 did not: try the 180 and dynamic ones). If one comes facing you, spawnyaw 180 turns the next ones.");
+        hint("Puts that mounted gun on the ground in front of you.");
         const std::string status = fc5::lua::spawn_status();
         ImGui::TextWrapped("%s", status.empty() ? "Nothing asked yet." : status.c_str());
         ImGui::BeginChild("##spawnlist", ImVec2(0.0f, 320.0f), true);
@@ -172,10 +171,9 @@ namespace fc5::spawn
             for (const auto& v : kVehicles)
                 if (seen.insert(v.kind).second) kinds.push_back(v.kind);
         }
-        hint("The vehicle appears a few metres in front of you (a helicopter or plane further off), turned the way you face. Face open, flat ground: it is placed on the ground "
-             "straight ahead, through anything in between. A boat on land stays on land: face the water from the shore. Spawned vehicles are real: if you save, they may stay in that save.");
+        hint("The vehicle appears in front of you, facing the way you face. Saving may keep it.");
         ImGui::Checkbox("Get in after it appears##vehspawnin", &get_in);
-        hint("The game seats you in its driver seat, the way a mission script does. Off: it is only placed.");
+        hint("Seats you in the vehicle once it appears.");
         ImGui::SetNextItemWidth(220.0f);
         if (!kinds.empty()) ImGui::Combo("Kind##vehspawnkind", &kind_at, kinds.data(), int(kinds.size()));
         ImGui::SameLine();
@@ -185,7 +183,7 @@ namespace fc5::spawn
         std::transform(want.begin(), want.end(), want.begin(), [](char c) { return char(std::tolower(static_cast<unsigned char>(c))); });
         ImGui::Checkbox("Also show what the game marks as cut##vehspawnmarked", &show_marked);
         if (ImGui::Button("Remove the vehicles spawned here##vehspawnremove")) cmds += "spawnvehicleremove\n";
-        hint("Every vehicle spawned from this menu since the game started, except the one you are in.");
+        hint("Removes every vehicle spawned from this menu, except the one you're in.");
         const std::string status = fc5::lua::spawn_status();
         ImGui::TextWrapped("%s", status.empty() ? "Nothing asked yet." : status.c_str());
         ImGui::BeginChild("##vehspawnlist", ImVec2(0.0f, 320.0f), true);

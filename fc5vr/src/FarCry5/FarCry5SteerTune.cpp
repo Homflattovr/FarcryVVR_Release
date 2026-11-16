@@ -717,8 +717,7 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint)
     if (ImGui::Button("Log them##steerlist")) cmds += "steerlist 16\n";
     ImGui::SameLine();
     if (ImGui::Button("Game's own values##steersetoff")) cmds += "steerset off\n";
-    hint("Test. The game's own steering of cars, quads and bikes: it turns the wheels towards the stick at a capped rate. Find them reads several GB "
-         "(a hitch of a few seconds). Commands steerset FIELD V|xK|off, steerprobe S, steerstep RT X MS ...");
+    hint("For testing: the game's own steering values.");
     float r = 1.0f;
     {
         std::lock_guard _{ g_mtx };
@@ -732,7 +731,6 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint)
     if (ImGui::Button("Sweep##steersweep")) cmds += "steersweep\n";
     ImGui::SameLine();
     if (ImGui::Button("Log##steerfindlist")) cmds += "steerfind list\n";
-    hint("Test, with the car standing still: the stick is held right, left, centred and right by itself for about 15 s while the game's memory "
-         "is read (hitches), to find the angle the car's wheels are at. Sweep then steps the stick and logs how far and how fast the wheels turn.");
+    hint("For testing: finds the car's wheel angle in the game's memory (the car must stand still).");
 }
 }

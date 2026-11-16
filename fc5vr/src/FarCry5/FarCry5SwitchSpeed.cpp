@@ -61,6 +61,11 @@ namespace
     constexpr size_t kDraw     = 0x1d8;   // fDrawTime
     constexpr size_t kMachete  = 0x1e0;   // fSwitchToMacheteTime
     constexpr size_t kLast     = 0x1e8;   // fSprintToFireTime, the run's last float
+    // gunsrcoffsets (test; research 2026-11-12_nativeweapon): the game's weapon offsets (its gun trailing a turn of the view and leaning
+    // into a strafe) take the view's turn speed up to these two limits (registered at FC_m64.dll+0x1DF25B5 and +0x1DF25FA: "Maximum
+    // degree per second of turn speed accounted for by offsets"; 180 and 90 in every weapon's data).
+    constexpr size_t kYawLimit   = 0x1b30;  // fYawSpeedLimit
+    constexpr size_t kPitchLimit = 0x1b34;  // fPitchSpeedLimit
     constexpr size_t kNearFov  = 0x1d5c;  // fNearFovDegrees (logged only: 55-90 in the data)
     constexpr size_t kSpan     = kLast + 4;
 
@@ -86,6 +91,9 @@ namespace
         float     draw0, holster0;   // the game's own times
         float     draw1, holster1;   // what was written (= the own time when it is already short enough)
         bool      written;
+        float     yaw0{ 0.0f }, pitch0{ 0.0f };   // gunsrcoffsets: the game's own turn-speed limits
+        float     lim1{ 0.0f };                   // and what was written over both
+        bool      off_written{ false }, off_bad{ false };
     };
     std::mutex         g_mtx;
     std::vector<Block> g_blocks;
@@ -199,6 +207,42 @@ namespace
         return found;
     }
 
+    // gunsrcoffsets off | V (test, not saved): V written over both turn-speed limits of every weapon block held (V > 0: 0.01 for
+    // "almost no turn speed counts", 100000 for "no turn is ever fast": which of the two stops the gun trailing depends on how the
+    // game uses the limit, and one simulator run tells). Only a block whose two limits read as the data's (30-720 and 30-360 deg/s)
+    // is written; off puts every block's own values back.
+    std::atomic<float> g_off_lim{ 0.0f };   // 0 = off
+    std::atomic<int>   g_off_n{ 0 }, g_off_skipped{ 0 };
+    bool apply_offsets(Block& b, float lim)
+    {
+        float y = 0.0f, pt = 0.0f;
+        if (!read(b.a + kYawLimit, &y, 4) || !read(b.a + kPitchLimit, &pt, 4)) return false;
+        if (lim <= 0.0f) {
+            if (!b.off_written) return true;
+            const bool ok = write_f(b.a + kYawLimit, b.yaw0) && write_f(b.a + kPitchLimit, b.pitch0);
+            b.off_written = false;
+            return ok;
+        }
+        if (b.off_written) {
+            if (y == b.lim1 && pt == b.lim1 && b.lim1 == lim) return true;   // still as written
+            if (y != b.lim1 || pt != b.lim1) b.off_written = false;          // the game wrote it again: its own values now
+        }
+        if (!b.off_written) {
+            if (!in(y, 30.0f, 720.0f) || !in(pt, 30.0f, 360.0f)) {
+                if (!b.off_bad) g_off_skipped++;   // counted once
+                b.off_bad = true;
+                return false;
+            }
+            b.yaw0   = y;
+            b.pitch0 = pt;
+        }
+        const bool ok = write_f(b.a + kYawLimit, lim) && write_f(b.a + kPitchLimit, lim);
+        if (ok && !b.off_written) g_off_n++;
+        b.off_written = ok;
+        b.lim1        = lim;
+        return ok;
+    }
+
     void do_scan(const char* why)
     {
         spdlog::info("[SwitchFast] scan {} ({}) started", g_scans + 1, why);   // its end line gives the time: a hitch in between is the scan's
@@ -220,6 +264,7 @@ namespace
             if ((a & 15) == 0) aligned16++;
             Block b{ a, f_at(buf, kDraw), f_at(buf, kHolster), 0.0f, 0.0f, false };
             if (g_on.load()) apply(b, false);
+            if (const float lim = g_off_lim.load(); lim > 0.0f) apply_offsets(b, lim);
             g_blocks.push_back(b);
             added++;
         }
@@ -250,6 +295,7 @@ namespace
                     again++;
                 }
             }
+            if (const float lim = g_off_lim.load(); lim > 0.0f || it->off_written) apply_offsets(*it, lim);   // gunsrcoffsets (off: put back)
             ++it;
         }
         g_count = int(g_blocks.size());
@@ -338,6 +384,22 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
         return true;
     }
     if (cmd == "switchrescan") { g_rescan_s = std::clamp(arg.empty() ? 300 : int(fv), 0, 3600); persist = true; return true; }
+    if (cmd == "gunsrcoffsets") {   // test, not saved: off | V (see apply_offsets); taken by the next upkeep, within a second
+        const float lim = (arg.empty() || arg == "off") ? 0.0f : std::clamp(fv, 0.001f, 1000000.0f);
+        g_off_n       = 0;
+        g_off_skipped = 0;
+        g_off_lim     = lim;
+        if (lim > 0.0f)
+            spdlog::info("[GunSrc] gunsrcoffsets {}: the weapon offsets' turn-speed limits (fYawSpeedLimit +0x1b30, fPitchSpeedLimit +0x1b34) written in every weapon block held "
+                         "({} now); gunsrcstat shows how many took it", lim, g_count.load());
+        else spdlog::info("[GunSrc] gunsrcoffsets off: every block's own limits put back");
+        return true;
+    }
+    if (cmd == "gunsrcstat") {
+        spdlog::info("[GunSrc] gunsrcoffsets {}: written in {} weapon blocks, {} left alone (their limits did not read as the data's 30-720 / 30-360 deg/s); {} blocks held",
+                     g_off_lim.load(), g_off_n.load(), g_off_skipped.load(), g_count.load());
+        return true;
+    }
     if (cmd == "switchscan") { g_scan_req = true; return true; }                           // test: scan now
     if (cmd == "switchlist") { g_list_req = arg.empty() ? 64 : std::max(1, int(fv)); return true; }   // test: log the blocks held
     return false;
@@ -374,14 +436,12 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint)
 {
     bool v = g_on.load();
     if (ImGui::Checkbox("Faster weapon switch: the game's own draw and holster sped up##switchfast", &v)) cmds += v ? "switchfast on\n" : "switchfast off\n";
-    hint("On (default): every weapon's draw and holster animations in the game play in the times below instead of the game's own "
-         "(about 0.3 s to put a weapon away and 0.5-0.9 s to draw one), so a switch is quicker and the new weapon can fire sooner. "
-         "Works for the shoulder and hip grabs and for the game's own weapon wheel and buttons.");
+    hint("Weapons are drawn and put away faster, so you can fire sooner after a switch.");
     if (!v) return;
     ImGui::Text("Weapons found in the game's memory: %d (%d sped up)", g_count.load(), g_written.load());
     float d = g_draw.load(), h = g_holster.load();
     if (ImGui::SliderFloat("Draw time (s)##switchdraw", &d, 0.05f, 1.0f, "%.2f")) cmds += fmt::format("switchdraw {:.2f}\n", d);
     if (ImGui::SliderFloat("Holster time (s)##switchholster", &h, 0.05f, 1.0f, "%.2f")) cmds += fmt::format("switchholster {:.2f}\n", h);
-    hint("A weapon whose own time is already shorter keeps it.");
+    hint("How long putting a weapon away takes.");
 }
 }

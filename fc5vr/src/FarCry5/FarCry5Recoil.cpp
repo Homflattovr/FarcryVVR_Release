@@ -45,7 +45,7 @@ namespace
     std::atomic<bool>  g_buzz{ true };     // recoilbuzz (saved)
     std::atomic<bool>  g_aim{ true };      // recoilaim (saved): the shots follow the kicked gun
     std::atomic<bool>  g_log{ false };     // recoillog (not saved)
-    std::atomic<float> g_scale{ 1.0f };    // recoilscale (saved, 0-2)
+    std::atomic<float> g_scale{ 0.66f };   // recoilscale (saved, 0-2; 0.66 since 13 Nov, the author's value, was 1.0)
     std::atomic<float> g_two{ 0.6f };      // recoiltwohand (saved, 0-1): the kick's share while both hands hold the gun
     std::atomic<float> g_scope{ 0.4f };    // recoilscope (saved, 0-1): the kick's share while the eye is behind a magnifying scope
 
@@ -138,7 +138,7 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
                      on ? "each shot kicks the drawn gun back and its muzzle up, then it settles (the shots stay on the controller)" : "no kick on the drawn gun");
         return true;
     }
-    if (cmd == "recoilscale") { g_scale = std::clamp(arg.empty() ? 1.0f : fv, 0.0f, 2.0f); persist = true; return true; }
+    if (cmd == "recoilscale") { g_scale = std::clamp(arg.empty() ? 0.66f : fv, 0.0f, 2.0f); persist = true; return true; }
     if (cmd == "recoiltwohand") { g_two = std::clamp(arg.empty() ? 0.6f : fv, 0.0f, 1.0f); persist = true; return true; }
     if (cmd == "recoilscope") { g_scope = std::clamp(arg.empty() ? 0.4f : fv, 0.0f, 1.0f); persist = true; return true; }
     if (cmd == "recoilbuzz") { g_buzz = on; persist = true; return true; }

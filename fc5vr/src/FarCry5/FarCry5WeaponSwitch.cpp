@@ -236,22 +236,3 @@ bool FarCry5Stereo::weapon_switch_command(const std::string& cmd, const std::str
     return false;
 }
 
-// F11 Gestures > Right shoulder: switch weapon (experimental): the weapon taken from the shoulder. The faster switch (switchfast)
-// stays in Experimental > Weapon switch (test).
-void FarCry5Stereo::draw_weapon_switch_menu(const std::function<void(const char*)>& hint, const std::function<void(const char*)>& section)
-{
-    section("Weapon taken from the shoulder");
-    bool v = m_sh_draw.load();
-    if (ImGui::Checkbox("Weapon taken from the shoulder: in the hand at once, no draw animation##shoulderdraw", &v)) m_ui_cmds += v ? "shoulderdraw on\n" : "shoulderdraw off\n";
-    hint("Off by default. On: when you grip at your shoulder to switch weapon, the weapon you held disappears and the new one shows in your "
-         "hand where you hold it, without the game's draw animation. With the sling on, the new weapon stays in your hand while you keep the "
-         "grip pressed and goes on the sling when you let go. A weapon the mod has never seen you hold standing still shows the end of the game's "
-         "animation the first time.");
-    if (!v) return;
-    bool in = m_sh_instant.load();
-    if (ImGui::Checkbox("At once: the new weapon in the hand the moment you grip##shoulderinstant", &in)) m_ui_cmds += in ? "shoulderinstant on\n" : "shoulderinstant off\n";
-    hint("On (default): the game needs about half a second to take the new weapon out; meanwhile the mod draws its own copy of it in your "
-         "hand (a weapon you have held still for a second this session), and the game's weapon takes its place when it is out. It cannot fire "
-         "before then. The copy is the weapon the switch brought last time from the one you held, else the one you held before. Off: your hand "
-         "is empty until the game's weapon is out.");
-}

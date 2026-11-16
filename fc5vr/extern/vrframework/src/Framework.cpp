@@ -118,6 +118,8 @@ void Framework::hook_monitor() {
 
                 auto proc = (WNDPROC)GetWindowLongPtr(m_wnd, GWLP_WNDPROC);
 
+                m_hook_test_calls = WindowsMessageHook::calls();
+
                 if (proc != nullptr) {
                     const auto ret = CallWindowProc(proc, m_wnd, WM_NULL, 0, 0);
 
@@ -126,6 +128,14 @@ void Framework::hook_monitor() {
 
                 m_last_sendmessage_time = std::chrono::steady_clock::now();
                 m_sent_message = true;
+            } else if (WindowsMessageHook::calls() != m_hook_test_calls) {
+                // The test message (or any other since) reached our window procedure through the procedure another module put on top of
+                // ours: the hook works. (11 Nov 2026: a snappair held two presents for 11 s each; the test between them had arrived, but
+                // this branch ran after the second one on the old flag, and the hook was made again on top of the OFXR layer's procedure.)
+                spdlog::info("Windows message hook still gets messages under another window procedure, ignoring...");
+                m_last_message_time = now;
+                m_last_sendmessage_time = now;
+                m_sent_message = false;
             } else if (now - m_last_sendmessage_time > std::chrono::seconds(1)) {
                 spdlog::info("Sending reinitialization request for message hook");
 

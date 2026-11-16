@@ -17,6 +17,11 @@ namespace fc5::camscan
     // Called each frame with the current camera position while tracking: counts which candidates
     // still hold it.
     void track(const float pos[3]);
+    // gunscan early: snap() keeps every candidate's value as it stands now (the weapon pass's first draw); track_early(pos) then
+    // counts the candidates whose kept value is pos (the value the gun mesh is drawn with later in the same pass). The report
+    // lists both counts.
+    void snap();
+    void track_early(const float pos[3]);
     // Logs the candidates that matched in at least min_share of the tracked frames, with the 64 bytes
     // around each one.
     void report(float min_share);

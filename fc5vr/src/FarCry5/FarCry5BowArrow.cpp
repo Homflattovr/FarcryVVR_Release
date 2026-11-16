@@ -56,6 +56,13 @@ namespace
     constexpr float kSettleSecs     = 1.5f;
     constexpr float kRestArrowMaxDeg = 4.0f;
     constexpr int   kSettleGapFrames = 10;   // weapon-pass draws of the bow missing this many frames: out again from then
+    // bowupsign (9 Nov, a tester's log on Beta 0.4.6, "a bow upside down"): which end of the limbs' line is the bow's top was taken from the
+    // side of the hand's middle the game's arrow passes. In the author's game the arrow passes 4 cm left and 6.5 cm below it (every run since
+    // 2 Nov: canted -69 deg, its up 69 deg from the camera's); in the tester's it passed 4.5 cm right and 3.6 cm above, so the same rule took
+    // the bottom limb for the top (canted 136 deg) and the bow was drawn upside down, in the hand and on the sling. The game never holds a
+    // bow with its top below level, so when the limbs stand clearly off level (their up at least this far up, about 75 deg of cant or less)
+    // the end above level is the top, whatever side of the hand the arrow is on. Nearer level, the arrow's side decides, as before.
+    constexpr float kUpSignMinY = 0.25f;
 
     // bowpull poses only the bow's own draws. A draw whose index count the bone map knows only as the game's arms, gloves or sleeves
     // (kind 2..4, e.g. 4110 = Body_FPSArmsLeft/Right) is never sampled, posed or kept; a count it does not know, or knows as a weapon, is.
@@ -192,6 +199,27 @@ namespace
     }
 }
 
+namespace
+{
+    // bowfine (FarCry5Bow.h). A position fraction is a few tenths of a millimetre at most (NaN fails).
+    bool frac_like(const float* f) { return std::abs(f[0]) < 0.002f && std::abs(f[1]) < 0.002f && std::abs(f[2]) < 0.002f; }
+    // An object's place from the game camera's, each with its position fraction when it holds one (rows: object rows, the place in
+    // [3], [7], [11]): small numbers, exact in doubles.
+    glm::dvec3 fine_u(const float* rows, const float* frac, const glm::vec3& cam, const glm::vec3& cam_frac)
+    {
+        glm::dvec3 u = glm::dvec3{ double(rows[3]), double(rows[7]), double(rows[11]) } - glm::dvec3{ cam };
+        if (frac && frac_like(frac)) u += glm::dvec3{ double(frac[0]), double(frac[1]), double(frac[2]) };
+        if (frac_like(&cam_frac.x)) u -= glm::dvec3{ cam_frac };
+        return u;
+    }
+    glm::dmat3 rows_rot(const float* rows)
+    {
+        glm::dmat3 r{ 1.0 };
+        for (int i = 0; i < 3; ++i) for (int c = 0; c < 3; ++c) r[c][i] = double(rows[i * 4 + c]);
+        return r;
+    }
+}
+
 struct FarCry5Stereo::BowArrowState
 {
     int            frame{ -1 };
@@ -245,6 +273,7 @@ struct FarCry5Stereo::BowArrowState
     std::map<uint32_t, glm::vec3> hand_kept;
     std::set<uint32_t>            hand_saved, hand_kept_said;
     bool                          fix_from_kept{ false };
+    std::vector<uint32_t>         upsign_fixed;   // bowupsign: kept turns found upside down at load (turned and written back)
     BowArrowState() { fix_load(); }
     void fix_load()
     {
@@ -263,7 +292,21 @@ struct FarCry5Stereo::BowArrowState
             }
             bool               ok  = tag == "upright" && sig != 0;
             for (int c = 0; c < 3 && ok; ++c) for (int r = 0; r < 3 && ok; ++r) ok = bool(ls >> m[c][r]) && std::isfinite(m[c][r]) && std::abs(m[c][r]) <= 1.01f;
-            if (ok && std::abs(glm::determinant(m) - 1.0f) < 0.05f) fix_kept[sig] = m;
+            if (ok && std::abs(glm::determinant(m) - 1.0f) < 0.05f) {
+                // bowupsign: a turn kept by an earlier build that stood the bow on its head (its up, row 1, pointing down) turned 180 deg about
+                // its arrow, as a measurement now would be, and written back so the slung bow is upright from this load.
+                if (m[1][1] < -kUpSignMinY) {
+                    m = glm::mat3{ -1, 0, 0, 0, -1, 0, 0, 0, 1 } * m;
+                    upsign_fixed.push_back(sig);
+                }
+                fix_kept[sig] = m;
+            }
+        }
+        if (!upsign_fixed.empty()) {
+            std::string b;
+            for (const uint32_t w : upsign_fixed) b += (b.empty() ? "" : ", ") + std::to_string(w);
+            spdlog::info("[BowArrow] bowupsign: the kept turn of bow(s) {} stood the bow upside down (an earlier build's rule): turned 180 deg about the arrow", b);
+            fix_save();
         }
         if (!fix_kept.empty()) {
             std::string b;
@@ -329,6 +372,63 @@ struct FarCry5Stereo::BowArrowState
     int                ref_frame{ -1 };                            // the bow's main mesh this frame: its transform (world, and q)
     bool               ref_ok{ false };
     glm::mat4          ref_world{ 1.0f }, ref_q{ 1.0f };
+    // bowfine (FarCry5Bow.h): the main mesh from the game camera in small numbers (doubles, both position fractions): its turn and its
+    // place in q. Per draw of the string, for the [BowArrow] bowfine line, the old way against it (mm as drawn): 0 a part's place on the
+    // main mesh (the skinned parts' bones and every sample), 1 a rigid part's place as written, 2 the arrow in the string hand.
+    glm::dmat3         ref_rq{ 1.0 };
+    glm::dvec3         ref_uq{ 0.0 };
+    uint64_t           bf_n[3]{}, bf_refused[3]{}, bf_stale{ 0 };
+    double             bf_2[3]{};
+    float              bf_max[3]{};
+    bool               bf_note(int what, float mm)
+    {
+        if (!(mm < 5.0f)) { bf_refused[what]++; return false; }   // (the old way is a millimetre off at most: anything further is a fault, not rounding)
+        bf_n[what]++;
+        bf_2[what] += double(mm) * mm;
+        bf_max[what] = std::max(bf_max[what], mm);
+        return true;
+    }
+    void               bf_line(uint32_t sig)
+    {
+        if (bf_n[0] + bf_n[1] + bf_n[2] + bf_refused[0] + bf_refused[1] + bf_refused[2] == 0) return;
+        auto part = [&](int i) {
+            return fmt::format("{:.3f} mm rms, {:.3f} max ({} draws, {} refused)", bf_n[i] ? std::sqrt(bf_2[i] / double(bf_n[i])) : 0.0, bf_max[i], bf_n[i], bf_refused[i]);
+        };
+        spdlog::info("[BowArrow] bow {}: bowfine {}: since the last line, single floats at map size against small numbers in doubles, as drawn: the parts' place on the "
+                     "bow's main mesh {}, {} of them with last frame's main mesh | the arrow on the string as written {} | the arrow in the string hand {}",
+                     sig, fc5::bow::fine() ? "on" : "off", part(0), bf_stale, part(1), part(2));
+        for (int i = 0; i < 3; ++i) {
+            bf_n[i] = bf_refused[i] = 0;
+            bf_2[i]   = 0.0;
+            bf_max[i] = 0.0f;
+        }
+        bf_stale = 0;
+    }
+    // bowpinmid (FarCry5Bow.h): this bow's reticle draws seen lately, each one's middle from the bow's grip (q).
+    struct PinSeen { UINT count{ 0 }; glm::vec3 q{ 0.0f }; int frame{ -100 }; };
+    std::vector<PinSeen> pin_seen;
+    uint32_t           pin_seen_sig{ 0 };
+    UINT               pin_pick_said{ 0 }, pin_pick_cur{ 0 };
+    int                pin_pick_runs{ 0 };
+    // The draw that carries the dot: the smallest, unless it sits alone (1.5 cm or more from every other) while two or more of the
+    // others agree to 5 mm: then the smallest of those (a ring sight's glass, its middle; the lone one is a piece on its rim).
+    UINT               pin_pick(bool& mid) const
+    {
+        mid = false;
+        const PinSeen* sm = nullptr;
+        for (const auto& e : pin_seen) if (!sm || e.count < sm->count) sm = &e;
+        if (!sm) return 0;
+        for (const auto& e : pin_seen) if (&e != sm && glm::length(e.q - sm->q) < 0.015f) return sm->count;
+        const PinSeen* best = nullptr;
+        for (const auto& a : pin_seen) {
+            if (&a == sm) continue;
+            bool agrees = false;
+            for (const auto& b : pin_seen) if (&b != &a && &b != sm && glm::length(a.q - b.q) < 0.005f) agrees = true;
+            if (agrees && (!best || a.count < best->count)) best = &a;
+        }
+        mid = best != nullptr;
+        return best ? best->count : sm->count;
+    }
     int                t_frame{ -1 };
     float              t{ 0.0f };
     bool               t_by_hand{ false };
@@ -602,6 +702,12 @@ void FarCry5Stereo::bow_arrow_frame(uint32_t sig)
         if (glm::length(up) < 1e-3f) up = glm::vec3{ 0.0f, 1.0f, 0.0f } - a * a.y;
         up = glm::normalize(up);
         if (glm::dot(up, v) > 0.0f) up = -up;   // the limbs' up points away from the arrow, past the hand
+        // bowupsign (above, kUpSignMinY): limbs clearly off level: their end above level is the top, whichever side the arrow passed.
+        if (up.y < -kUpSignMinY) {
+            up = -up;
+            spdlog::info("[BowArrow] bow {}: bowupsign: the arrow passes the other side of the hand ({:.1f}, {:.1f}, {:.1f}) cm, which would stand the bow on its head; "
+                         "its top taken as the limbs' end above level", sig, v.x * 100.0f, v.y * 100.0f, v.z * 100.0f);
+        }
         const glm::vec3 z = -a, x = glm::normalize(glm::cross(up, z));
         s.fix_base        = glm::transpose(glm::mat3{ x, glm::cross(z, x), z });
         s.fix_sig         = sig;
@@ -895,10 +1001,14 @@ bool FarCry5Stereo::bow_arrow_draw(ID3D11DeviceContext* ctx, UINT count, UINT st
     if (!have || !fresh || m_hand_cb_swapped || m_th_cb_swapped || !m_mo.bow) return done(true);   // cannot be placed: not drawn on the bow either
     const glm::mat4 O = from_rows(obj);
     glm::vec3       F;   // the nock end, q
+    glm::dvec3      Ff;  // bowfine: the same from small numbers (the draw from the game camera with both position fractions)
+    const glm::dvec3 arrow_u = fine_u(obj, obj_size >= 76 && obj_size <= 128 ? obj + 16 : nullptr, hm.cam, m_hand_map_cam_frac);
     if (const auto it = s.tail.find(count); s.tail_sig == sig && it != s.tail.end()) {
-        F = hm.rot * (glm::vec3{ O * glm::vec4{ it->second, 1.0f } } - hm.cam);
+        F  = hm.rot * (glm::vec3{ O * glm::vec4{ it->second, 1.0f } } - hm.cam);
+        Ff = glm::dmat3{ hm.rot } * (rows_rot(obj) * glm::dvec3{ it->second } + arrow_u);
     } else {
-        F = hm.rot * (glm::vec3{ O[3] } - hm.cam);
+        F  = hm.rot * (glm::vec3{ O[3] } - hm.cam);
+        Ff = glm::dmat3{ hm.rot } * arrow_u;
         if (!s.origin_said) {
             s.origin_said = true;
             spdlog::info("[BowArrow] bow {}: the arrow in the hand placed by its draw's origin (its nock end not measured yet)", sig);
@@ -919,6 +1029,17 @@ bool FarCry5Stereo::bow_arrow_draw(ID3D11DeviceContext* ctx, UINT count, UINT st
     float o1[32];
     std::memcpy(o1, obj, sizeof(o1));
     to_rows(A * O, o1);
+    // nearfine: the arrow moved to the hand: the game camera + G (its place from the camera) + the hand's offset.
+    // bowfine: that offset's two measures were single floats at map size (the nock end F through the arrow's object transform, the string
+    // hand against the bow hand as a difference of two rounded world places): the nock end from small numbers, the hands from the tracking
+    // offsets (fine_from_grip).
+    glm::dvec3 hand_off{ rT * (hm.grip + WT * (place - hm.w_pos)) - rT * WT * LR * F };
+    {
+        const glm::dvec3 fine_off = glm::dvec3{ rT * (hm.grip + WT * (fine_from_grip(m_mo.hand_pos_world, hm.w_pos) + Hc * glm::vec3{ off[0], off[1], off[2] })) } -
+                                    glm::dmat3{ rT * WT * LR } * Ff;
+        if (s.bf_note(2, 1000.0f * float(glm::length(fine_off - hand_off))) && fc5::bow::fine()) hand_off = fine_off;
+    }
+    near_place(o1, glm::dmat3{ G } * near_u(obj, obj + 16) + hand_off, 2);
     ID3D11Device* dev = nullptr;
     ctx->GetDevice(&dev);
     for (auto*& b : s.standin) {
@@ -966,16 +1087,35 @@ int FarCry5Stereo::bow_pull_draw(ID3D11DeviceContext* ctx, UINT count, bool skin
     glm::mat4       V{ hm.rot };   // game world -> q (the game camera's axes)
     V[3]               = glm::vec4{ -(hm.rot * hm.cam), 1.0f };
     const glm::mat4 O  = from_rows(obj);
+    // bowfine: this draw from the game camera in small numbers: its turn and its place in q (both position fractions).
+    const glm::dmat3 rotd{ hm.rot };
+    const glm::dmat3 Rq = rotd * rows_rot(obj);
+    const glm::dvec3 uq = rotd * fine_u(obj, obj_size >= 76 && obj_size <= 128 ? obj + 16 : nullptr, hm.cam, m_hand_map_cam_frac);
     if (count == sig_mesh(sig)) {
         s.ref_world = O;
         s.ref_q     = V * O;
         s.ref_frame = frame;
         s.ref_ok    = true;
+        s.ref_rq    = Rq;
+        s.ref_uq    = uq;
     }
     if (!s.ref_ok) { dg.why = "the bow's main mesh not seen yet"; return -1; }
     // The bow's main mesh now: this frame's, else last frame's where it sat from the game camera.
     const glm::mat4 Oref  = s.ref_frame == frame ? s.ref_world : glm::inverse(V) * s.ref_q;
-    const glm::mat4 K     = glm::inverse(Oref) * O;   // this draw's transform from the main mesh's
+    // bowfine: Oref^-1 O was a general inverse and a product of two map-size transforms in single floats (up to a millimetre off, new
+    // every frame: in each skinned part's bones as drawn and in every sample taken as the rest or the full draw). The same from the two
+    // draws as they sit from the game camera (the main mesh of last frame taken where it sat from the camera, as Oref is).
+    glm::mat4       K     = glm::inverse(Oref) * O;   // this draw's transform from the main mesh's
+    if (count != sig_mesh(sig)) {
+        const glm::dmat3 Ri = glm::inverse(s.ref_rq);
+        glm::dmat4       Kd{ Ri * Rq };
+        Kd[3] = glm::dvec4{ Ri * (uq - s.ref_uq), 1.0 };
+        const glm::mat4 Kf{ Kd };
+        if (s.ref_frame != frame) s.bf_stale++;
+        if (s.bf_note(0, 1000.0f * glm::length(glm::mat3{ Oref } * (glm::vec3{ Kf[3] } - glm::vec3{ K[3] }))) && fc5::bow::fine()) K = Kf;
+    } else if (fc5::bow::fine()) {
+        K = glm::mat4{ 1.0f };   // the main mesh itself
+    }
     auto&           parts = s.pull[sig];
     // A sample every 5 frames; two alike in a row: held still.
     if (!again && frame % 5 == 0) {
@@ -1061,17 +1201,25 @@ int FarCry5Stereo::bow_pull_draw(ID3D11DeviceContext* ctx, UINT count, bool skin
     if (s.t_frame != frame) {
         float t     = fc5::bow::pull_frac();
         s.t_by_hand = false;
-        if (s.tail_sig == sig) {
+        if (s.tail_sig == sig && !fc5::bow::test_draw()) {   // (bowdrawtest: the made-up hand's pull, not the tracked hand)
             for (const auto& [c, tl] : s.tail) {
                 const auto at = parts.find(c);
                 if (at == parts.end() || at->second.skinned || !at->second.has_rest || !at->second.has_full) continue;
-                const glm::vec3 nr = glm::vec3{ s.ref_q * at->second.rest[0] * glm::vec4{ tl, 1.0f } };
-                const glm::vec3 nf = glm::vec3{ s.ref_q * at->second.full[0] * glm::vec4{ tl, 1.0f } };
+                // bowfine: the main mesh in q from small numbers, the string hand against the bow hand from the tracking offsets.
+                glm::mat4 ref_q = s.ref_q;
+                if (fc5::bow::fine()) {
+                    glm::dmat4 rq{ s.ref_rq };
+                    rq[3] = glm::dvec4{ s.ref_uq, 1.0 };
+                    ref_q = glm::mat4{ rq };
+                }
+                const glm::vec3 nr = glm::vec3{ ref_q * at->second.rest[0] * glm::vec4{ tl, 1.0f } };
+                const glm::vec3 nf = glm::vec3{ ref_q * at->second.full[0] * glm::vec4{ tl, 1.0f } };
                 float off[3];
                 fc5::bow::get_string_hand(off);   // bowstringhand: at the fingers
                 if (m_left_handed.load()) off[0] = -off[0];
                 const glm::vec3 place = m_mo.hand_pos_world + m_mo.hand_rot_world * glm::vec3{ off[0], off[1], off[2] };
-                const glm::vec3 h     = hm.grip + glm::transpose(hm.w_rot) * (place - hm.w_pos);   // the hand in q
+                const glm::vec3 from  = fc5::bow::fine() ? fine_from_grip(m_mo.hand_pos_world, hm.w_pos) + m_mo.hand_rot_world * glm::vec3{ off[0], off[1], off[2] } : place - hm.w_pos;
+                const glm::vec3 h     = hm.grip + glm::transpose(hm.w_rot) * from;   // the hand in q
                 const float     L2    = glm::dot(nf - nr, nf - nr);
                 if (L2 > 0.05f * 0.05f) {
                     t           = std::clamp(glm::dot(h - nr, nf - nr) / L2, 0.0f, 1.0f);
@@ -1115,6 +1263,7 @@ int FarCry5Stereo::bow_pull_draw(ID3D11DeviceContext* ctx, UINT count, bool skin
             t          = s.ts;
         } else if (s.ts_ok && ph != fc5::bow::Phase::Drawing) {
             s.ts_ok = false;
+            s.bf_line(sig);
             if (s.ts_n > 0 && fc5::bow::arrow_log())
                 spdlog::info("[BowArrow] bow {}: bowsteadyarrow: a draw of {} steps: the string's draw moved {:.2f} % of a full draw per step as read, {:.2f} % steadied; "
                              "opened for a pull in {:.0f} % of steps", sig, s.ts_n, 100.0 * s.ts_raw_sum / s.ts_n, 100.0 * s.ts_out_sum / s.ts_n, 100.0 * s.ts_open / s.ts_n);
@@ -1149,7 +1298,30 @@ int FarCry5Stereo::bow_pull_draw(ID3D11DeviceContext* ctx, UINT count, bool skin
         if (!s.standin[0] || !s.standin[1] || obj_size != 128) return -1;
         float o1[32];
         std::memcpy(o1, obj, sizeof(o1));
-        to_rows(Oref * blend_m(pp.rest[0], pp.full[0], t), o1);
+        const glm::mat4 B = blend_m(pp.rest[0], pp.full[0], t);
+        to_rows(Oref * B, o1);
+        // bowfine: its place was this product's sum rounded to a map-size float, beside the fraction of the place the game drew it at.
+        // The exact place (the game camera + the main mesh from it + the part on the main mesh) as the nearest float plus its own fraction.
+        {
+            const glm::vec3  cf      = m_hand_map_cam_frac;
+            const bool       slot_ok = frac_like(o1 + 16);
+            const glm::dvec3 P       = glm::dvec3{ hm.cam } + (frac_like(&cf.x) ? glm::dvec3{ cf } : glm::dvec3{ 0.0 }) +
+                                       glm::transpose(rotd) * (s.ref_uq + s.ref_rq * glm::dvec3{ glm::vec3{ B[3] } });
+            const glm::dvec3 old     = glm::dvec3{ double(o1[3]), double(o1[7]), double(o1[11]) } +
+                                       (slot_ok ? glm::dvec3{ double(o1[16]), double(o1[17]), double(o1[18]) } : glm::dvec3{ 0.0 });
+            if (s.bf_note(1, 1000.0f * float(glm::length(old - P))) && fc5::bow::fine()) {
+                const glm::vec3 pf{ P };
+                o1[3]  = pf.x;
+                o1[7]  = pf.y;
+                o1[11] = pf.z;
+                if (slot_ok) {   // (a slot that does not hold a fraction is not written)
+                    const glm::vec3 fr{ P - glm::dvec3{ pf } };
+                    o1[16] = fr.x;
+                    o1[17] = fr.y;
+                    o1[18] = fr.z;
+                }
+            }
+        }
         ctx->VSGetConstantBuffers(1, 4, s.orig);
         call_orig<void>(m_update_sub_hook, 48, ctx, static_cast<ID3D11Resource*>(s.standin[0]), 0u, static_cast<const D3D11_BOX*>(nullptr), static_cast<const void*>(o1), 0u, 0u);
         call_orig<void>(m_update_sub_hook, 48, ctx, static_cast<ID3D11Resource*>(s.standin[1]), 0u, static_cast<const D3D11_BOX*>(nullptr), static_cast<const void*>(o1), 0u, 0u);
@@ -1180,12 +1352,16 @@ void FarCry5Stereo::bow_pin_note(ID3D11DeviceContext* ctx, UINT count, UINT star
     ID3D11Buffer* cb[4]{};
     ctx->VSGetConstantBuffers(0, 4, cb);
     auto done = [&] { for (auto* b : cb) if (b) b->Release(); };
-    float obj[12]{};
-    bool  have = false;
+    float obj[20]{};   // (the rows, and the position fraction in [16..18]: bowfine)
+    bool  have = false, frac_ok = false;
     {
         std::lock_guard _{ m_obj_mtx };
         if (auto it = cb[1] ? m_obj_consts.find(cb[1]) : m_obj_consts.end(); it != m_obj_consts.end() && it->second.size >= 48) {
-            std::memcpy(obj, it->second.f, sizeof(obj));
+            std::memcpy(obj, it->second.f, 48);
+            if (it->second.size >= 76 && it->second.size <= 128) {
+                std::memcpy(obj + 16, it->second.f + 16, 12);
+                frac_ok = true;
+            }
             have = true;
         }
     }
@@ -1258,15 +1434,44 @@ void FarCry5Stereo::bow_pin_note(ID3D11DeviceContext* ctx, UINT count, UINT star
             if (auto it = m_ps_names.find(m_cur_ps); it != m_ps_names.end()) ps = it->second.substr(0, 80);
         }
         spdlog::info("[BowArrow] bow {}: bowpin: its sight's reticle draw {} indices ({} points, ps {}) at ({:.1f}, {:.1f}, {:.1f}) cm from the bow's grip (right, up, back); "
-                     "the dot goes on the smallest such draw (the pin's glow)", sig, count, n, ps, q.x * 100.0f, q.y * 100.0f, q.z * 100.0f);
+                     "the dot's point is chosen among these (bowpinmid; the smallest with it off)", sig, count, n, ps, q.x * 100.0f, q.y * 100.0f, q.z * 100.0f);
     }
     // The dot follows the smallest reticle draw seen lately (author 2 Nov 12:52: the dot): the pegs
     // sight draws its pin's glow (12 indices) and its pegs (1680, about 7 mm off), and the dot had followed whichever came last.
     const int fr = m_frame.load();
-    if (m_bow_pin_count != 0 && count > m_bow_pin_count && fr - m_bow_pin_count_frame <= 30) return done();
     // Not this bow's: a reticle more than half a metre from its grip (another weapon's, seen while switching: 6 indices 82 cm off at 14:36).
-    const glm::vec3 pq = hm.rot * (glm::vec3{ from_rows(obj) * glm::vec4{ pit->second, 1.0f } } - hm.cam);
+    glm::vec3 pq = hm.rot * (glm::vec3{ from_rows(obj) * glm::vec4{ pit->second, 1.0f } } - hm.cam);
+    if (fc5::bow::fine()) {   // bowfine: the same from small numbers (the product above is rounded at map size, new every frame)
+        const glm::vec3 pf{ glm::dmat3{ hm.rot } * (rows_rot(obj) * glm::dvec3{ pit->second } + fine_u(obj, frac_ok ? obj + 16 : nullptr, hm.cam, m_hand_map_cam_frac)) };
+        if (glm::length(pf - pq) < 0.005f) pq = pf;
+    }
     if (glm::length(pq - hm.grip) > 0.5f) return done();
+    if (fc5::bow::pin_mid()) {
+        // bowpinmid (author 13 Nov 21:45Z; his bow's ring sight: 2208 and 384 indices at the ring's
+        // middle, 132 on its rim 2.9 cm away, and the dot sat on the rim): a lone smallest draw gives way to the others that agree.
+        if (s.pin_seen_sig != sig) {
+            s.pin_seen.clear();
+            s.pin_seen_sig  = sig;
+            s.pin_pick_said = 0;
+        }
+        std::erase_if(s.pin_seen, [&](const BowArrowState::PinSeen& e) { return e.count == count || fr - e.frame > 30; });
+        s.pin_seen.push_back({ count, pq - hm.grip, fr });
+        bool       mid  = false;
+        const UINT pick = s.pin_pick(mid);
+        s.pin_pick_runs = pick == s.pin_pick_cur ? s.pin_pick_runs + 1 : 0;
+        s.pin_pick_cur  = pick;
+        if (s.pin_pick_runs == 20 && pick != s.pin_pick_said) {
+            s.pin_pick_said = pick;
+            std::string all;
+            for (const auto& e : s.pin_seen) all += fmt::format("{}{} at ({:.1f}, {:.1f}, {:.1f})", all.empty() ? "" : ", ", e.count, e.q.x * 100.0f, e.q.y * 100.0f, e.q.z * 100.0f);
+            spdlog::info("[BowArrow] bow {}: bowpinmid: the dot's point is the reticle draw of {} indices: {} (its reticle draws, cm from the bow's grip: {})", sig, pick,
+                         mid ? "the smallest of those that agree (a ring sight's middle); the smallest of all sits alone, 1.5 cm or more from the others"
+                             : "the smallest (the pin's glow)", all);
+        }
+        if (count != pick) return done();
+    } else if (m_bow_pin_count != 0 && count > m_bow_pin_count && fr - m_bow_pin_count_frame <= 30) {
+        return done();
+    }
     m_bow_pin_count       = count;
     m_bow_pin_count_frame = fr;
     m_bow_pin_q           = pq;
@@ -1280,7 +1485,8 @@ void FarCry5Stereo::bow_pin_note(ID3D11DeviceContext* ctx, UINT count, UINT star
         const auto ph = fc5::bow::phase();
         if ((ph == fc5::bow::Phase::Drawing || ph == fc5::bow::Phase::Loose) && hm.frame == fr && m_mo.ctrl_valid) {
             const float     ws  = std::max(1e-3f, m_world_scale.load());
-            const glm::vec3 L   = glm::transpose(m_mo.ctrl_rot_world) * (m_bow_pin_w - hm.w_pos);
+            // (bowfine: without the trip through a map-size float and back)
+            const glm::vec3 L   = glm::transpose(m_mo.ctrl_rot_world) * (fc5::bow::fine() ? hm.w_rot * (m_bow_pin_q - hm.grip) : m_bow_pin_w - hm.w_pos);
             const auto      now = std::chrono::steady_clock::now();
             const float     off = glm::length(L - m_bow_pin_l);
             if (!m_bow_pin_l_ok || m_bow_pin_l_sig != sig || off > 0.05f * ws) {

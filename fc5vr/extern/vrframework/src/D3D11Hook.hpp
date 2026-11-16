@@ -44,6 +44,12 @@ public:
     bool hook();
     bool unhook();
 
+    // Far Cry 5: the vtable of the game's real swap chain, noted by the mod's inline hook on the system CreateSwapChain
+    // (under OptiScaler's wrapper and every overlay). When it is known, hook() patches that class's vtable and creates no
+    // dummy device or swap chain (FSR tester crash, 12 Nov 2026: see hook()).
+    static void set_game_swap_chain_vtable(void** vtable) { s_game_swap_chain_vtable.store(vtable); }
+    static void** game_swap_chain_vtable() { return s_game_swap_chain_vtable.load(); }
+
     void on_present(OnPresentFn fn) { m_on_present = fn; }
     void on_post_present(OnPresentFn fn) { m_on_post_present = fn; }
     void on_resize_buffers(OnResizeBuffersFn fn) { m_on_resize_buffers = fn; }
@@ -80,6 +86,10 @@ protected:
     bool m_multithread_protection_set{ false };
     bool m_enable_multithread_protection{ false };
     void ensure_multithread_protection();
+
+    static inline std::atomic<void**> s_game_swap_chain_vtable{ nullptr };
+    bool m_tried_game_vtable{ false };
+    bool hook_swap_chain_vtable(void** vtable);
 
     static HRESULT WINAPI present(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags);
     static HRESULT WINAPI resize_buffers(IDXGISwapChain* swap_chain, UINT buffer_count, UINT width, UINT height, DXGI_FORMAT new_format, UINT swap_chain_flags);

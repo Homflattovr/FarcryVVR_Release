@@ -40,6 +40,19 @@
 //    vehicle, while throwing, while the game reloads or within 1.5 s of X (interact, pick up), which keep the game's animation.
 //  - offhandlog N: N per-frame lines.
 // Off: the game's turn of the free hand (before 24 Oct).
+//
+// offhandalign (author 15 Nov 21:47, AR-CL at a window; F11 Controls, default on, saved).
+// Standing still, offhandstill draws the game's own turn of the free hand, and its standing pose follows the game's whenever it is calm.
+// That is fine while the game's left hand rests on the fore-end, but the game also takes it off the gun for long spells: in his log the
+// game's gun stood 22-26 cm / 85 deg off its standing pose for 20 s after a reload at a window, its left hand raised and open by the
+// face (game-camera (-0.17, -0.08, -0.33) instead of (0.10, -0.13, -0.47) on the fore-end), and that open palm was drawn facing the
+// eyes on the left controller.
+//  - With a weapon in hand and the other hand free (offhandstill's conditions, either switch on), the free palm is turned to the
+//    empty hands' grip pose on its controller (emptyhandalign's target: emptyhandgrip, emptyhandpose, the left mirrored), whatever
+//    the game does with that hand. Eased in and out over 0.25 s.
+//  - Not while the left hand works a reload (a magazine out or in the hand, the handle racked: hides_game_reload) or while the game's
+//    reload is shown: offhandstill's hold then, as before, so the reload's hand snapping and learning see what they did.
+// Off: offhandstill alone (before 15 Nov).
 #include "FarCry5Stereo.h"
 #include "FarCry5Reload.h"
 #include "FarCry5Gesture.h"
@@ -98,6 +111,9 @@ struct FarCry5Stereo::EmptyHandsState
     int               off_turn_frame{ -100 };
     glm::quat         off_turn{ 1.0f, 0.0f, 0.0f, 0.0f };
     float             off_dev{ 0.0f }, off_left{ 0.0f };   // this frame: the game's palm from the target (deg), the drawn one
+    bool              off_align{ false };                  // offhandalign: this frame the free palm turned to the grip pose
+    float             off_align_alpha{ 0.0f };             // 1 = at the grip pose, 0 = offhandstill's (eased over 0.25 s)
+    int               off_aligned{ 0 };                    // the last second: frames fully at the grip pose
     int               off_n{ 0 }, off_held{ 0 }, off_sprint{ 0 };
     float             off_max_speed{ 0.0f }, off_max_dev{ 0.0f }, off_max_left{ 0.0f };
     clock::time_point off_sum_t{};
@@ -188,13 +204,25 @@ void FarCry5Stereo::empty_hands_frame()
     }
     const float out_s    = std::chrono::duration<float>(now - e.off_sig_t).count();
     const bool  reload   = gun_still_busy(true);
-    const bool  off_on   = off_mode != 0 && !m_unarmed && !m_mo.slung && !m_mo.bow && m_mo.other_valid && !m_two_hand.load() && on_foot && !throwing && wsig != 0;
-    if (off_on != e.off_active) spdlog::info("[Motion] offhandstill: {}", off_on ? "a weapon in hand, the other hand free: held while moving" : "no longer held");
+    const bool  off_align_sw = m_off_align.load();
+    const bool  free_hand = !m_unarmed && !m_mo.slung && !m_mo.bow && m_mo.other_valid && !m_two_hand.load() && on_foot && !throwing && wsig != 0;
+    const bool  off_on   = free_hand && (off_mode != 0 || off_align_sw);
+    if (off_on != e.off_active)
+        spdlog::info("[Motion] offhandstill: {}", off_on ? (off_align_sw ? "a weapon in hand, the other hand free: its palm at the grip pose on its controller (offhandalign)"
+                                                                     : "a weapon in hand, the other hand free: held while moving")
+                                                         : "no longer held");
     e.off_active = off_on;
     // reloadmanual (FarCry5Reload.cpp): while the game's reload runs unseen its animation turns the free hand; held to its standing pose then,
     // standing or not, and nothing learnt from it.
     const bool manual = fc5::reload::hides_game_reload();
-    e.off_want   = off_on && !reload && (manual || (since_x > 1.5f && since_throw > 1.0f && (off_mode == 2 || moving)));
+    e.off_want   = off_on && off_mode != 0 && !reload && (manual || (since_x > 1.5f && since_throw > 1.0f && (off_mode == 2 || moving)));
+    // offhandalign: the free palm at the grip pose, unless the left hand works a reload or the game's reload is shown.
+    const bool was_align = e.off_align;
+    e.off_align       = off_on && off_align_sw && !reload && !manual;
+    e.off_align_alpha = off_on ? std::clamp(e.off_align_alpha + (e.off_align ? 1.0f : -1.0f) * da / 0.25f, 0.0f, 1.0f) : 0.0f;
+    if (off_on && off_align_sw && e.off_align != was_align)
+        spdlog::info("[Motion] offhandalign: {}", e.off_align ? "the free palm at the grip pose on its controller"
+                                                              : (manual ? "the left hand works a reload: offhandstill's hold" : "the game's reload shown: offhandstill's hold"));
     e.off_calm   = off_on && !manual && !gun_still_busy() && speed < 0.4f && since_moving > 1.5f && since_x > 2.5f && since_throw > 1.5f && out_s > 3.0f;
     e.off_alpha  = off_on ? std::clamp(e.off_alpha + (e.off_want ? 1.0f : -1.0f) * da / 0.25f, 0.0f, 1.0f) : 0.0f;
     if (m_off_log.load() > 0 && off_on) {
@@ -203,9 +231,10 @@ void FarCry5Stereo::empty_hands_frame()
                      sprint ? " sprinting" : "", wsig, e.off_want, e.off_alpha, e.off_calm, reload ? " reload" : "", e.off_dev,
                      e.off_ref.contains(wsig) ? "its standing pose" : (e.off_last_ok ? "the pose the hold began with" : "itself (nothing to hold to yet)"), e.off_left);
     }
-    if (e.off_want || e.off_alpha > 0.0f) {
+    if (e.off_want || e.off_alpha > 0.0f || e.off_align_alpha > 0.0f) {
         e.off_n++;
         if (e.off_alpha >= 1.0f) e.off_held++;
+        if (e.off_align_alpha >= 1.0f) e.off_aligned++;
         if (sprint) e.off_sprint++;
         e.off_max_speed = std::max(e.off_max_speed, speed);
         e.off_max_dev   = std::max(e.off_max_dev, e.off_dev);
@@ -213,11 +242,12 @@ void FarCry5Stereo::empty_hands_frame()
     }
     if (now - e.off_sum_t > std::chrono::seconds(1)) {
         if (e.off_n > 0)
-            spdlog::info("[Motion] offhandstill (weapon {}): last second {} frames held ({} fully, {} sprinting, up to {:.1f} m/s); the game turned the free hand up to {:.0f} deg "
-                         "from its {} pose, drawn up to {:.1f} deg from it",
-                         wsig, e.off_n, e.off_held, e.off_sprint, e.off_max_speed, e.off_max_dev, e.off_ref.contains(wsig) ? "standing" : "held", e.off_max_left);
+            spdlog::info("[Motion] offhandstill (weapon {}): last second {} frames held ({} fully, {} at the grip pose, {} sprinting, up to {:.1f} m/s); the game turned the "
+                         "free hand up to {:.0f} deg from its {} pose, drawn up to {:.1f} deg from it",
+                         wsig, e.off_n, e.off_held, e.off_aligned, e.off_sprint, e.off_max_speed, e.off_max_dev,
+                         e.off_aligned > 0 ? "grip" : e.off_ref.contains(wsig) ? "standing" : "held", e.off_max_left);
         e.off_sum_t = now;
-        e.off_n = e.off_held = e.off_sprint = 0;
+        e.off_n = e.off_held = e.off_sprint = e.off_aligned = 0;
         e.off_max_speed = e.off_max_dev = e.off_max_left = 0.0f;
     }
     e.off_dev = e.off_left = 0.0f;
@@ -227,7 +257,7 @@ bool FarCry5Stereo::off_hand_active() const { return m_ehs && m_ehs->off_active;
 
 // The free hand's turn this frame, from its palm h (game camera's axes, the game's pose): once per frame, so every mesh of that
 // hand (a glove piece and the bare skin under it) turns the same.
-glm::quat FarCry5Stereo::off_hand_turn(const glm::quat& h)
+glm::quat FarCry5Stereo::off_hand_turn(int side, const glm::quat& h, const glm::quat& pre)
 {
     const glm::quat id{ 1.0f, 0.0f, 0.0f, 0.0f };
     if (!m_ehs) return id;
@@ -252,10 +282,21 @@ glm::quat FarCry5Stereo::off_hand_turn(const glm::quat& h)
     const glm::quat target = it != e.off_ref.end() ? it->second : e.off_last_ok ? e.off_last : h;
     glm::quat       full   = glm::normalize(target * glm::inverse(h));
     if (full.w < 0.0f) full = -full;
-    const glm::quat d = e.off_alpha >= 1.0f ? full : e.off_alpha <= 0.0f ? id : glm::normalize(glm::slerp(id, full, e.off_alpha));
-    e.off_dev        = angle_deg(h, target);
-    e.off_left       = angle_deg(d * h, target);
-    e.off_turn       = d;
+    glm::quat d = e.off_alpha >= 1.0f ? full : e.off_alpha <= 0.0f ? id : glm::normalize(glm::slerp(id, full, e.off_alpha));
+    e.off_dev   = angle_deg(h, target);
+    e.off_left  = angle_deg(d * h, target);
+    if (e.off_align_alpha > 0.0f && (side == 0 || side == 1)) {
+        // offhandalign: drawn, the palm is pre * turn * h on its controller; this turn makes that the grip pose (as empty_hand_turn's align).
+        const glm::quat tgt = glm::normalize(glm::inverse(pre) * empty_hand_target(side));
+        glm::quat       al  = glm::normalize(tgt * glm::inverse(h));
+        if (al.w < 0.0f) al = -al;
+        if (std::isfinite(al.w + al.x + al.y + al.z)) {
+            d          = e.off_align_alpha >= 1.0f ? al : glm::normalize(glm::slerp(d, glm::dot(d, al) < 0.0f ? -al : al, e.off_align_alpha));
+            e.off_dev  = angle_deg(h, tgt);
+            e.off_left = angle_deg(d * h, tgt);
+        }
+    }
+    e.off_turn = d;
     return d;
 }
 
@@ -361,6 +402,11 @@ bool FarCry5Stereo::empty_hands_command(const std::string& cmd, const std::strin
         m_persist[cmd] = arg == "always" ? "offhandstill always" : on ? "offhandstill on" : "offhandstill off";
         if (!from_settings) persist_changed = true;
         spdlog::info("[Motion] offhandstill {}", arg == "always" ? "always" : on ? "on (while moving)" : "off");
+    } else if (cmd == "offhandalign") {
+        m_off_align    = on;
+        m_persist[cmd] = on ? "offhandalign on" : "offhandalign off";
+        if (!from_settings) persist_changed = true;
+        spdlog::info("[Motion] offhandalign {}", on ? "on: the free hand's palm at the grip pose on its controller" : "off");
     } else if (cmd == "offhandlog") {
         m_off_log = arg.empty() ? 90 : std::max(0, (int)fv);
     } else if (cmd == "offhandreset") {

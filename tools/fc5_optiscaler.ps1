@@ -161,7 +161,10 @@ function Write-ModSettings([string]$path, [string]$up) {
         @('QualityOverrides', 'QualityRatioOverrideEnabled', 'false'),
         # Nothing else loaded or blocked.
         @('Plugins', 'LoadAsiPlugins', 'false'), @('Plugins', 'LoadReshade', 'false'), @('Plugins', 'LoadSpecialK', 'false'),
-        @('fakenvapi', 'UseFakenvapi', 'false'), @('Hotfix', 'CheckForUpdate', 'false'), @('Hotfix', 'DisableOverlays', 'false'),
+        @('fakenvapi', 'UseFakenvapi', 'false'), @('Hotfix', 'CheckForUpdate', 'false'),
+        # Game overlays (Ubisoft Connect, Steam, Discord) blocked: on AMD / Intel OptiScaler wraps the game's swap chain and the
+        # Ubisoft overlay crashed on that wrapper at start (tester report 12 Nov 2026). Not visible in the headset anyway.
+        @('Hotfix', 'DisableOverlays', 'true'),
         # A log to check which upscaler ran, at Info (Trace, the default, writes every frame).
         @('Log', 'LogToFile', 'true'), @('Log', 'LogLevel', '2'), @('Log', 'SingleFile', 'true')
     )
@@ -253,6 +256,7 @@ switch ($Action) {
         } else {
             if (-not (Test-Path -LiteralPath $on) -and (Test-Path -LiteralPath $off)) { Move-Item -LiteralPath $off -Destination $on }
             Set-IniValue $Ini 'Upscalers' 'Dx11Upscaler' $Upscaler
+            Set-IniValue $Ini 'Hotfix' 'DisableOverlays' 'true'
             Write-Host "OptiScaler on, Dx11Upscaler=$Upscaler (from the next game start)."
         }
     }

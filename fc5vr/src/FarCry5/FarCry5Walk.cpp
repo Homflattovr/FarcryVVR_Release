@@ -187,16 +187,19 @@ void FarCry5Stereo::draw_walk_menu(const std::function<void(const char*, std::st
                                    const std::function<void(const char*)>& section)
 {
     (void)section;
-    if (ImGui::CollapsingHeader("Walking")) {
+    if (ImGui::CollapsingHeader("Walking", ImGuiTreeNodeFlags_DefaultOpen)) draw_walk_basis(keep, hint);   // open by default (author 13 Nov 20:25Z)
+}
+
+// The walk direction row: in Motion control > Walking and in Main (author 14 Nov 22:02Z).
+void FarCry5Stereo::draw_walk_basis(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint)
+{
+    {
         int         wb = m_walk_basis.load();
-        const char* kBasis[]{ "Where the game aims (as before 22 Oct)", "Where you look", "Where your off hand points" };
+        const char* kBasis[]{ "Where the game aims", "Where you look", "Where your off hand points" };
         if (ImGui::Combo("Walk direction", &wb, kBasis, 3)) {
             m_walk_basis = wb;
             keep("walkbasis", fmt::format("walkbasis {}", basis_name(wb)));
         }
-        hint("Where pushing the left stick forward takes you. Where you look (default): the stick is turned so forward is where the headset faces, "
-             "also with a weapon in hand; walking stays straight while the gun turns, and while sprinting the game's aim follows your head (a shot, "
-             "aiming down sights or easing off the stick ends the sprint and the aim goes back to the gun). Where the game aims: the old way, forward "
-             "followed the gun while a weapon was in hand.");
+        hint("Where pushing the left stick forward takes you: where you look, or where the game aims.");
     }
 }

@@ -34,6 +34,8 @@ namespace fc5::padglyph
         LGripDown,
         LGripLeft,
         LGripRight,
+        StickRUp,     // right stick pushed up / down (stickjump: jump, crouch)
+        StickRDown,
         Count
     };
 

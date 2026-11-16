@@ -44,6 +44,22 @@
 //    pixel (1800,1610), and the red chevron from (1790,1740) to (2290,1190), moved the same way; in the marker image the chevron sat
 //    near the enemy as the eye sees it, ~300 marker pixels from where the game camera saw it (by the blue marker). They now get a copy of the game's own
 //    upload of that buffer (hud_prim_cb_swap), so they are placed for the game camera like every other marker.
+//  - hudmarkaim (author 15 Nov 21:26Z, 0E8620DD, his headset picture:
+//    three red enemy marks on the empty ground in front of him, the two enemies he could see each about 6 deg right and 13 deg below
+//    their mark's place in his view, the same for both, his gun held up along a wall): the game places its markers for its aim, the
+//    camera without the Extended View offset the mod hands it (the head look); the camera it uploads and draws with carries that offset.
+//    With a weapon in hand fireready keeps the aim on the barrel, so the head look is the head-to-barrel angle, and laying the markers
+//    through the drawn camera moved every one of them by it. They are now laid through the aim (the drawn camera less the offset it
+//    carries, Stereo.cpp at the world upload) and the hudprim chevrons are given that camera in their copy of the upload. Probe line
+//    every 5 s: "[HUD] world markers, last 5 s: ... turned from the game's aim by ...".
+//  - hudmarklabel (author 16 Nov 15:34 headset picture, 1CFD212C): a yellow objective marker, "63 m" over its icon
+//    and the action label "REJOIGNEZ" beside it, showed small on the house it marks and full size on the HUD panel. The label beside the
+//    icon made the grouping pass take the marker for a prompt (the 21 Oct rule: a label beside an icon is a prompt), so it went to the
+//    panel, at the game's flat-screen place and size, cut by the panel's edges; most likely the marker is drawn in layers (badge, then
+//    the diamond on it, its distance, its label), the badge with its distance stayed in the world and the diamond started a group of its
+//    own that the label made a prompt. Now an icon centred inside the world marker just started joins it, and a label beside an icon
+//    whose distance is centred over it (drawn before or after the label, before the next icon) stays part of the world marker. Prompts
+//    and the vehicle command list have no text centred over their button icon, so they stay on the panel. hudmarklabel off: as before.
 #include "FarCry5Stereo.h"
 #include "FarCry5Record.h"
 #include "FarCry5Dlss.h"
@@ -68,6 +84,9 @@ static R call_orig(safetyhook::InlineHook& h, int idx, ID3D11DeviceContext* ctx,
     if (fc5::rec::is_deferred(ctx)) return reinterpret_cast<R(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, A...)>(fc5::rec::deferred_method(idx))(ctx, a...);
     return h.call<R>(ctx, a...);
 }
+
+// hudmarklabel on|off (test, not saved; default on): an objective marker with an action label beside its icon stays in the world (kGroups).
+std::atomic<bool> g_hud_mark_label{ true };
 
 namespace
 {
@@ -107,10 +126,14 @@ void main(uint2 p : SV_DispatchThreadID)
     float2 t   = float2(lerp(tan.x, tan.y, uv.x), lerp(tan.z, tan.w, uv.y));
     float2 s   = (eye.xy + t * (eye.w + eye.z)) / eye.w;
     float2 huv = float2(0.5f + s.x / (2.0f * panel.x), 0.5f - (s.y - panel.z) / (2.0f * panel.y));
-    if (mul_on != 0 && all(huv > 0.0f) && all(huv < 1.0f)) c.rgb *= g_mul.SampleLevel(g_lin, huv, 0).rgb;
+    // This pixel's direction (at the markers' distance) in the game camera's clip, and its point in the game's picture.
+    float4 e   = float4(uv.x * 2.0f - 1.0f + moff.x, 1.0f - uv.y * 2.0f + moff.y, moff.z, 1.0f);
+    float4 g   = float4(dot(m[0], e), dot(m[1], e), dot(m[2], e), dot(m[3], e));
+    float2 guv = g.w > 1e-6f ? float2(g.x / g.w * 0.5f + 0.5f, 0.5f - g.y / g.w * 0.5f) : float2(-1.0f, -1.0f);
+    // mul_on 1: the multiplying draws where the panel hangs; 2 (bombhud): through the game camera, as the flat game multiplied its screen.
+    if (mul_on == 1u && all(huv > 0.0f) && all(huv < 1.0f)) c.rgb *= g_mul.SampleLevel(g_lin, huv, 0).rgb;
+    if (mul_on == 2u && all(guv > 0.0f) && all(guv < 1.0f)) c.rgb *= g_mul.SampleLevel(g_lin, guv, 0).rgb;
     if (mark_on != 0) {
-        float4 e = float4(uv.x * 2.0f - 1.0f + moff.x, 1.0f - uv.y * 2.0f + moff.y, moff.z, 1.0f);
-        float4 g = float4(dot(m[0], e), dot(m[1], e), dot(m[2], e), dot(m[3], e));
         bool   on_panel = all(huv > 0.0f) && all(huv < 1.0f);
         float4 k = 0.0f;
         bool   hint = false;
@@ -238,7 +261,7 @@ cbuffer P : register(b0) {
     uint4 masks;    // slots drawn from the glyph atlas (x: 0-31, y: 32-63), slots whose icon is no marker's (z, w)
     float4 G[4];    // camera-relative position -> the game camera's clip (rows)
     float4 Gi[4];   // its inverse
-    float4 pnl;     // x: the panel's angle per marker pixel (rad), y: hudmarkicon, the largest icon (rad, 0 = off)
+    float4 pnl;     // x: the panel's angle per marker pixel (rad), y: hudmarkicon, the largest icon (rad, 0 = off), z: hudmarklabel (1 = on)
 };
 bool bit(uint2 m, uint i) { return ((i < 32 ? m.x >> i : m.y >> (i - 32)) & 1u) != 0; }
 float3 dir_of(float2 px)
@@ -258,6 +281,26 @@ bool px_of(float3 d, out float2 px)
     return true;
 }
 bool taken_at(uint2 m, uint s) { return bit(m, s); }
+// hudmarklabel: a text draw that is a marker's distance: over the icon (its bottom no lower than a quarter into the icon), touching it
+// within the margin, its centre within the icon's width.
+bool dist_over(float4 b, float4 f)
+{
+    bool touch = b.x - margin <= f.z && b.z + margin >= f.x && b.y - margin <= f.w && b.w + margin >= f.y;
+    float cx   = 0.5f * (b.x + b.z);
+    return touch && b.w <= f.y + 0.25f * (f.w - f.y) && cx >= f.x && cx <= f.z;
+}
+// hudmarklabel: the icon f (draw i's group) gets its distance from a later text draw, before the next icon.
+bool dist_later(uint i, float4 f)
+{
+    for (uint k = i + 1; k < n && k < 64; ++k) {
+        uint4 r = uint4(g_box[k * 4], g_box[k * 4 + 1], g_box[k * 4 + 2], g_box[k * 4 + 3]);
+        if (r.z == 0 && r.x == 0) continue;
+        if (!bit(masks.xy, k)) break;   // the next icon: a new group
+        float4 b = float4(65535.0f - r.z - 4.0f, 65535.0f - r.w - 4.0f, r.x + 5.0f, r.y + 5.0f);
+        if (dist_over(b, f)) return true;
+    }
+    return false;
+}
 void take(inout uint2 m, uint s) { if (s < 32) m.x |= 1u << s; else m.y |= 1u << (s - 32); }
 [numthreads(1, 1, 1)]
 void main()
@@ -270,6 +313,7 @@ void main()
     float4 lb = 0.0f, lf = 0.0f;
     bool   ls = false;
     bool   ll = false;   // hudmarkcap: this group is one icon, screen-fixed only because it came after a prompt
+    bool   la = false;   // hudmarklabel: this group's icon has its distance over it (an objective marker)
     // The game draws the world markers first; from the first screen-fixed group on, the rest of the call is HUD (the vehicle
     // command list, prompts, the ammo counter in a vehicle), whatever its pictures look like (author 21 Oct 18:55 F6: the
     // command list's button icons start each line and were taken for markers, their labels with them).
@@ -284,7 +328,12 @@ void main()
             if (b.x - margin <= lf.z && b.z + margin >= lf.x && b.y - margin <= lf.w && b.w + margin >= lf.y) {
                 // A marker's distance sits above its icon; a label beside an icon makes it a prompt.
                 bool above = b.w <= lf.y + 0.25f * (lf.w - lf.y);
-                if (!ls && (scr || !above)) { ls = true; hud = true; }
+                if (!ls && dist_over(b, lf)) la = true;
+                // hudmarklabel (author 16 Nov 15:34: an objective marker twice, one in the world, one on a flat plane and cut off): an
+                // objective's action label ("REJOIGNEZ") sits beside its icon like a prompt's, but the icon has its distance over it,
+                // drawn before or after the label; such a marker stays in the world, label and all (pnl.z; off: hudmarklabel off).
+                bool objective = pnl.z != 0.0f && !scr && !above && (la || dist_later(i, lf));
+                if (!ls && (scr || !above) && !objective) { ls = true; hud = true; }
                 if (ls || !scr) {
                     lb = float4(min(lb.xy, b.xy), max(lb.zw, b.zw));
                     ll = false;
@@ -302,12 +351,22 @@ void main()
                 continue;
             }
         }
+        // hudmarklabel: an icon centred inside the world marker just started (its first icon's box) is another layer of that marker
+        // (an objective's diamond on its badge), not a new one: its label beside it is then the objective's, next to an icon with the
+        // distance over it. Without this the diamond started a marker of its own whose label made it a prompt (the panel copy).
+        if (!text && !scr && cnt > 0 && !ls && pnl.z != 0.0f) {
+            float2 c = 0.5f * (b.xy + b.zw);
+            if (all(c >= lf.xy) && all(c <= lf.zw)) {
+                lb = float4(min(lb.xy, b.xy), max(lb.zw, b.zw));
+                continue;
+            }
+        }
         if (cnt > 0) g_out[1 + 3 * (cnt - 1)] = lb;
         g_out[2 + 3 * cnt] = float4(0.5f * (b.xy + b.zw), 0, 0);
         g_out[3 + 3 * cnt] = float4(0.5f * (b.zw - b.xy), 0, 0);   // hudmarkicon: the icon's half size (read below, then replaced)
         if (cnt > 0) { g_out[2 + 3 * (cnt - 1)].z = ls ? 1.0f : 0.0f; g_out[2 + 3 * (cnt - 1)].w = ll ? 1.0f : 0.0f; }
         ll = !text && hud && !bit(masks.zw, i);
-        lb = b; lf = b; ls = text || scr; hud = hud || ls; cnt++;
+        lb = b; lf = b; ls = text || scr; hud = hud || ls; la = false; cnt++;
     }
     if (cnt > 0) { g_out[1 + 3 * (cnt - 1)] = lb; g_out[2 + 3 * (cnt - 1)].z = ls ? 1.0f : 0.0f; g_out[2 + 3 * (cnt - 1)].w = ll ? 1.0f : 0.0f; }
     uint2 taken = 0;
@@ -461,6 +520,8 @@ void main()
     bool                       g_log_have = false;
     glm::mat4                  g_game_vrp[8]{};                     // hudmarklag: the game camera of the last 8 calls
     int                        g_game_vrp_frame[8]{ -1, -1, -1, -1, -1, -1, -1, -1 };
+    glm::mat4                  g_game_vrp_aim[8]{};                 // hudmarkaim: the same calls' aim (the head-look offset taken out)
+    float                      g_game_ev_deg[8]{};
     bool                       g_failed = false;
     ID3D11Texture2D*           g_for    = nullptr;   // the eye texture the copies below were made for (not held)
     D3D11_TEXTURE2D_DESC       g_desc{};
@@ -796,7 +857,7 @@ void FarCry5Stereo::hud_world_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* ey
 {
     if (!ctx || !eye || m_menu_screen_on || m_hud_mode.load() != 1) return;
     const int fr = m_frame.load();
-    if (m_hud_game_vrp_frame == fr) { g_game_vrp[fr & 7] = m_hud_game_vrp; g_game_vrp_frame[fr & 7] = fr; }
+    if (m_hud_game_vrp_frame == fr) { g_game_vrp[fr & 7] = m_hud_game_vrp; g_game_vrp_aim[fr & 7] = m_hud_game_vrp_aim; g_game_ev_deg[fr & 7] = m_hud_game_ev_deg; g_game_vrp_frame[fr & 7] = fr; }
     // hudmarklag (test): the markers taken as placed with the game camera of that many calls before.
     const int lag      = std::clamp(m_hud_mark_lag.load(), 0, 6);
     const int gfr      = fr - lag;
@@ -805,14 +866,39 @@ void FarCry5Stereo::hud_world_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* ey
     // panel need neither (shown without the world markers in an eye picture that lacks them).
     const bool mark_on    = m_hud_markers.load() && m_hud_mark_srv && m_hud_mark_cleared_frame == fr;
     const bool mark_world = mark_on && m_hist[0].cur_frame == fr && g_game_vrp_frame[gfr & 7] == gfr;
-    const glm::mat4& game_vrp = g_game_vrp[gfr & 7];
+    // bombhud: the bomber view's HUD (all in the marker image) and its darkening laid through the game camera, at infinity, unscaled.
+    const bool bomb     = m_bomb_hud_now.load(std::memory_order_relaxed);
+    const bool bomb_cam = bomb && m_hist[0].cur_frame == fr && g_game_vrp_frame[gfr & 7] == gfr;
+    if (bomb && !bomb_cam) m_bomb_hud_nocam++;
+    // hudmarkaim: the markers were placed by the game for its aim; the drawn camera is turned from it by the head-look offset (the
+    // bomber view's HUD keeps the drawn camera, as built).
+    const bool       aim      = !bomb && m_hud_mark_aim.load();
+    const glm::mat4& game_vrp = aim ? g_game_vrp_aim[gfr & 7] : g_game_vrp[gfr & 7];
+    if (mark_world) {
+        // Probe line every 5 s: how far the drawn camera was turned from the aim while markers were shown.
+        const float ev = g_game_ev_deg[gfr & 7];
+        m_hud_aim_calls++;
+        if (ev > 2.0f) m_hud_aim_moved++;
+        m_hud_aim_sum += ev;
+        m_hud_aim_max = std::max(m_hud_aim_max, ev);
+        const auto now = std::chrono::steady_clock::now();
+        if (m_hud_aim_log.time_since_epoch().count() == 0) m_hud_aim_log = now;
+        if (now - m_hud_aim_log >= std::chrono::seconds(5)) {
+            m_hud_aim_log = now;
+            spdlog::info("[HUD] world markers, last 5 s: {} calls, the drawn camera turned from the game's aim by {:.1f} deg on average, up to {:.1f} deg, "
+                         "over 2 deg in {} calls; laid through the {} (hudmarkaim {})", m_hud_aim_calls, m_hud_aim_sum / float(std::max<uint64_t>(1, m_hud_aim_calls)),
+                         m_hud_aim_max, m_hud_aim_moved, aim ? "aim" : "drawn camera", m_hud_mark_aim.load() ? "on" : "off");
+            m_hud_aim_calls = m_hud_aim_moved = 0;
+            m_hud_aim_sum = m_hud_aim_max = 0.0f;
+        }
+    }
     if (!mul_on && !mark_on) return;
     const auto& v = m_xr_views[fr & 7];
     if (v.frame != fr) return;
     const int e = fr & 1;
 
     Cb cb{};
-    cb.mul_on  = mul_on ? 1u : 0u;
+    cb.mul_on  = !mul_on ? 0u : !bomb ? 1u : bomb_cam ? 2u : 0u;   // bombhud without the game camera: no darkening rather than a black panel
     cb.mark_on = mark_on ? 1u : 0u;
     for (int k = 0; k < 4; ++k) cb.tan[k] = std::tan(v.fov[e][k]);
     const glm::vec3 mid = 0.5f * (glm::vec3{ v.pos[0][0], v.pos[0][1], v.pos[0][2] } + glm::vec3{ v.pos[1][0], v.pos[1][1], v.pos[1][2] });
@@ -831,15 +917,15 @@ void FarCry5Stereo::hud_world_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* ey
     const float size   = std::clamp(m_hud_mark_size.load(), 0.2f, 2.0f);
     const float smooth = std::clamp(m_hud_mark_smooth.load(), 0.0f, 1.0f);
     const bool  cap_on = m_hud_mark_cap.load();
-    const bool  scaled = mark_on && (std::abs(size - 1.0f) >= 0.01f || smooth > 0.0f || cap_on) && g_box_call == fr && g_box_used > 0 && !g_box_over;
-    if (mark_on) {
+    const bool  scaled = mark_on && (std::abs(size - 1.0f) >= 0.01f || smooth > 0.0f || cap_on) && g_box_call == fr && g_box_used > 0 && !g_box_over && !bomb;
+    if (mark_on || bomb_cam) {
         // This eye's NDC -> world direction (rotation-only camera) -> the game camera's clip (all zero without them: no point
         // in front of the game camera, no world marker drawn).
-        const glm::mat4 mm = mark_world ? game_vrp * glm::inverse(m_hist[0].cur_vrp) : glm::mat4(0.0f);
+        const glm::mat4 mm = (mark_world || bomb_cam) ? game_vrp * glm::inverse(m_hist[0].cur_vrp) : glm::mat4(0.0f);
         for (int r = 0; r < 4; ++r)
             for (int c = 0; c < 4; ++c) cb.m[r * 4 + c] = mm[c][r];
         // Shown at hudmarkdist: each eye looks up the direction from the head centre to where its ray is at that distance.
-        const float d = std::max(1.0f, m_hud_mark_dist.load());
+        const float d = bomb ? 1000.0f : std::max(1.0f, m_hud_mark_dist.load());   // bombhud: the sight at infinity, on the ground it measures
         cb.moff[0] = 2.0f * (off.x / d) / std::max(1e-3f, cb.tan[1] - cb.tan[0]);
         cb.moff[1] = 2.0f * (off.y / d) / std::max(1e-3f, cb.tan[2] - cb.tan[3]);
         cb.moff[2] = 0.5f;
@@ -848,7 +934,7 @@ void FarCry5Stereo::hud_world_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* ey
         cb.msize[0] = (float)md.Width;
         cb.msize[1] = (float)md.Height;
         cb.msize[2] = 1.0f / size;
-        cb.msize[3] = scaled ? 1.0f : (g_box_call == fr && g_box_over) ? 2.0f : 0.0f;   // 2: over the box limit, all on the panel
+        cb.msize[3] = scaled ? 1.0f : (!bomb && g_box_call == fr && g_box_over) ? 2.0f : 0.0f;   // 2: over the box limit, all on the panel
         if (g_box_call == fr && g_box_over) m_hud_mark_over++;
     }
 
@@ -904,6 +990,7 @@ void FarCry5Stereo::hud_world_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* ey
         // The panel: hudscale wide at huddist across the panel image's width (the marker image has its size).
         gc.pnl[0]    = cb.msize[0] > 0.0f ? 2.0f * std::atan(cb.panel[0]) / cb.msize[0] : 0.0f;
         gc.pnl[1]    = cap_on ? glm::radians(std::clamp(m_hud_mark_icon.load(), 0.5f, 10.0f)) : 0.0f;   // hudmarkicon
+        gc.pnl[2]    = g_hud_mark_label.load() ? 1.0f : 0.0f;   // hudmarklabel
         const glm::mat4 gi = mark_world ? glm::inverse(game_vrp) : glm::mat4(1.0f);
         for (int r = 0; r < 4; ++r)
             for (int c = 0; c < 4; ++c) { gc.G[r * 4 + c] = game_vrp[c][r]; gc.Gi[r * 4 + c] = gi[c][r]; }
@@ -1032,5 +1119,6 @@ void FarCry5Stereo::hud_world_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* ey
     if (prev_s) prev_s->Release();
     ctx->CopyResource(eye, g_mid);
     m_hud_world_passes++;
+    if (bomb) m_bomb_hud_passes++;
     if (scaled) m_hud_mark_scaled++;
 }

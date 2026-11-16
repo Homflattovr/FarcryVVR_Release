@@ -426,6 +426,20 @@ struct FarCry5Stereo::ReloadMagState
     // manualreload31: each draw's object transform at its last draw, so a part drawn before the gun's main draw (a revolver's rounds) takes
     // the gun's body moved as its own object moved since (else the last frame's body: the rounds lagged out of the gun while it moved).
     std::map<uint32_t, std::pair<glm::mat4, int>> last_om;
+    // reloadheldfollow (author 15 Nov 22:20, build 0E8620DD, the RPG-7 and the M79; his log: "the revolver's rounds (draw 2778) drawn by the mod, before the gun's main draw (the last frame's body)"): a part drawn
+    // before the gun's main draw of its pass took the body of the last main draw, the last frame's or the other eye's pass, as it was in the game
+    // world. Walking moves the game's gun by several centimetres a frame, so the launcher's round (reloadzonesfollow keeps it off its own object)
+    // sat that far out of the tube, seated or sliding in. Now that body is carried into this pass as the drawn gun is held: on the weapon
+    // controller. The drawn world -> this pass's game world (d2w), the controller's move since that main draw, that draw's w2d.
+    glm::mat4                body_ctrl{ 1.0f };   // s.ctrl at the last main draw
+    glm::mat4                body_w2d{ 1.0f };    // s.w2d at the last main draw
+    glm::mat4                est_body{ 1.0f }, est_old{ 1.0f }, est_w2d{ 1.0f };   // this pass's carried body (and the old way's), checked at its main draw
+    int                      est_frame{ -100 };
+    int                      fol_draws{ 0 }, fol_n{ 0 };   // the last 5 s: draws placed on the carried body; carried bodies checked at their main draw
+    double                   fol_sum2{ 0.0 }, fol_old2{ 0.0 };
+    float                    fol_max{ 0.0f }, fol_old_max{ 0.0f };
+    clock::time_point        fol_t{};
+    uint32_t                 fol_said{ 0 };
     uint32_t                 rev_said_sig{ 0 };
     bool                     place_ok{ false };   // w2d, ctrl, back_c of this frame
     int                      place_frame{ -100 };
@@ -1803,8 +1817,38 @@ bool FarCry5Stereo::reload_mag_draw(ID3D11DeviceContext* ctx, UINT count, UINT s
     };
     auto world_of = [&](uint32_t b) { return skinned ? Om * bone_m(b) : Om; };   // rest space -> game world
     if (main_draw) {
-        s.body       = world_of(0);
+        const glm::mat4 nb = world_of(0);
+        // reloadheldfollow: a body carried into this pass before its main draw, against that main draw's own (drawn world, the body's origin and
+        // 30 cm ahead of it), and the old way's (the last main draw's body as it was, or moved with the part's own object).
+        if (s.est_frame == frame && s.est_w2d == s.w2d) {
+            const float wsc = std::max(m_world_scale.load(), 1e-3f);
+            auto        gap = [&](const glm::mat4& a) {
+                float g = 0.0f;
+                for (const glm::vec3& q : { glm::vec3{ 0.0f }, glm::vec3{ 0.0f, 0.3f * wsc, 0.0f } }) g = std::max(g, glm::length(point(s.w2d * a, q) - point(s.w2d * nb, q)));
+                return 1000.0f * g / wsc;   // mm
+            };
+            const float gn = gap(s.est_body), go = gap(s.est_old);
+            s.fol_n++;
+            s.fol_sum2 += double(gn) * gn;
+            s.fol_old2 += double(go) * go;
+            s.fol_max     = std::max(s.fol_max, gn);
+            s.fol_old_max = std::max(s.fol_old_max, go);
+            s.est_frame   = -100;
+        }
+        s.body       = nb;
         s.body_frame = frame;
+        s.body_ctrl  = s.ctrl;
+        s.body_w2d   = s.w2d;
+        if (const auto now = clock::now(); now - s.fol_t >= std::chrono::seconds(5)) {
+            if (s.fol_draws > 0)
+                spdlog::info("[ReloadMag] weapon {}: reloadheldfollow: last 5 s, {} draws before the gun's main draw placed on its body carried by the controller's move; "
+                             "{} checked at that pass's main draw: {:.1f} mm rms, {:.1f} max off it (the old way: {:.1f} mm rms, {:.1f} max)",
+                             sig, s.fol_draws, s.fol_n, s.fol_n ? std::sqrt(s.fol_sum2 / s.fol_n) : 0.0, s.fol_max, s.fol_n ? std::sqrt(s.fol_old2 / s.fol_n) : 0.0, s.fol_old_max);
+            s.fol_t     = now;
+            s.fol_draws = s.fol_n = 0;
+            s.fol_sum2 = s.fol_old2 = 0.0;
+            s.fol_max = s.fol_old_max = 0.0f;
+        }
     }
     // This draw's estimate of the body now (manualreload31): this frame's, or the last one moved as this draw's own object moved since.
     glm::mat4 body_x = s.body;
@@ -1829,6 +1873,25 @@ bool FarCry5Stereo::reload_mag_draw(ID3D11DeviceContext* ctx, UINT count, UINT s
             body_moved = true;
         }
     if (!main_draw) s.last_om[count] = { Om, frame };
+    // reloadheldfollow (above, the state): a draw before this pass's main draw takes the last main draw's body carried into this pass as the drawn
+    // gun is held, on the weapon controller: its drawn place then (w2d), moved as the controller moved since, back into this pass's game world.
+    // The same pass after its main draw: that body as it is. The other eye's pass of this frame, or the last frame's: carried.
+    bool body_follow = false;
+    if (!main_draw && fc5::reload::held_follow() && s.body_frame >= frame - 1 && !(s.body_frame == frame && s.body_w2d == s.w2d && s.body_ctrl == s.ctrl)) {
+        const glm::dmat4 F = glm::inverse(glm::dmat4{ s.w2d }) * glm::dmat4{ s.ctrl } * glm::inverse(glm::dmat4{ s.body_ctrl }) * glm::dmat4{ s.body_w2d };
+        s.est_old          = body_x;
+        body_x             = glm::mat4{ F * glm::dmat4{ s.body } };
+        body_follow        = true;
+        s.est_body         = body_x;
+        s.est_w2d          = s.w2d;
+        s.est_frame        = frame;
+        s.fol_draws++;
+        if (s.fol_said != sig) {
+            s.fol_said = sig;
+            spdlog::info("[ReloadMag] weapon {}: reloadheldfollow: draw {} comes before the gun's main draw ({}): placed on the last main draw's body carried by the weapon controller's move",
+                         sig, count, s.body_frame == frame ? "the other eye's pass drew it" : "the last frame's");
+        }
+    }
 
     // This draw's vertices by bone, read once per weapon (one draw every 15 frames, the immediate context).
     const auto mk = std::make_pair(sig, uint32_t(count));
@@ -2065,7 +2128,7 @@ bool FarCry5Stereo::reload_mag_draw(ID3D11DeviceContext* ctx, UINT count, UINT s
             for (size_t b = 0; (b + 1) * 12 <= pb.size(); ++b) to_rows(C, pb.data() + b * 12);
         }
         for (const auto& [k, X] : xd)
-            if (k.second != kRigid && (k.second + 1) * 12 <= pb.size()) to_rows(Oi * s.d2w * X, pb.data() + k.second * 12);
+            if (k.second != kRigid && (k.second + 1) * 12 <= pb.size()) to_rows(part_fine_x(Om, glm::dmat4{ s.d2w } * glm::dmat4{ X }, Oi * s.d2w * X), pb.data() + k.second * 12);   // handfine
         call_orig<void>(m_update_sub_hook, 48, ctx, static_cast<ID3D11Resource*>(s.pouch_pal), 0u, static_cast<const D3D11_BOX*>(nullptr), static_cast<const void*>(pb.data()), 0u, 0u);
         ID3D11Buffer* was[2]{};
         ctx->VSGetConstantBuffers(3, 2, was);
@@ -2097,8 +2160,16 @@ bool FarCry5Stereo::reload_mag_draw(ID3D11DeviceContext* ctx, UINT count, UINT s
             C[3]   = Oi * xs[0].second * glm::vec4{ s.centre(sig, xs[0].first), 1.0f };
             C[3].w = 1.0f;
             for (size_t b = 0; (b + 1) * 12 <= j.data.size(); ++b) to_rows(C, j.data.data() + b * 12);
-            for (const auto& [k, X] : xs)
-                if (k.second != kRigid && (k.second + 1) * 12 <= j.data.size()) to_rows(Oi * X, j.data.data() + k.second * 12);
+            for (const auto& [k, X] : xs) {
+                if (k.second == kRigid || (k.second + 1) * 12 > j.data.size()) continue;
+                const glm::mat4 fx = part_fine_x(Om, glm::dmat4{ X }, Oi * X);   // handfine
+                // hintfine (FarCry5Stereo.h): a part that is not moved (its place is the game's own bone taken to the world) glows with the
+                // game's own bone, not with the bone that came back from the world rounded.
+                const bool      own = X == world_of(k.second);
+                const glm::mat4 B   = bone_m(k.second);
+                if (own) s9_note(0, 1000.0f * glm::length(glm::mat3{ Om } * (glm::vec3{ fx[3] } - glm::vec3{ B[3] })));
+                to_rows(own && m_hint_fine.load() ? B : fx, j.data.data() + k.second * 12);
+            }
         }
         fc5::reloadhint::queue(std::move(j));
         m_hint_queued = true;
@@ -2177,7 +2248,7 @@ bool FarCry5Stereo::reload_mag_draw(ID3D11DeviceContext* ctx, UINT count, UINT s
             auto& x0           = s.fall_x0[count];
             x0.clear();
             if (fc5::reload::drop_fall_on())
-                for (const auto& [k, r] : mparts) x0.push_back({ k, body_now ? s.w2d * s.body * r.r : s.ctrl * r.rc });   // where it sat on the gun this frame
+                for (const auto& [k, r] : mparts) x0.push_back({ k, body_now ? s.w2d * body_x * r.r : s.ctrl * r.rc });   // where it sat on the gun this frame
         }
         if (dn != s.fall_drops) {
             s.fall_drops = dn;
@@ -2346,10 +2417,10 @@ bool FarCry5Stereo::reload_mag_draw(ID3D11DeviceContext* ctx, UINT count, UINT s
             for (const auto& [k, r] : mparts) {
                 glm::mat4 T{ 1.0f };
                 if (mode == kPin) {
-                    T = s.body * r.r;   // where it sits on the gun, wherever the game's reload moves the gun
+                    T = body_x * r.r;   // where it sits on the gun, wherever the game's reload moves the gun (reloadheldfollow: this pass's body)
                 } else if (mode == kInsert) {
                     const glm::vec3 d = s.c2b * (-axis_c * (1.0f - std::clamp(v.insert, -2.0f, 1.0f)) * v.travel * ws);
-                    T                 = s.body * shift(d) * r.r;
+                    T                 = body_x * shift(d) * r.r;
                     // reloadrockin (manualreload23): an AK's magazine tilted about its front lug (the well's front, 2 cm ahead of its centre),
                     // its bottom forward, rocked back into line as it goes home (the gun controller's axes, then the body's).
                     if (const float rk = fc5::reload::rock_deg(sig); rk > 0.0f) {
@@ -2359,7 +2430,7 @@ bool FarCry5Stereo::reload_mag_draw(ID3D11DeviceContext* ctx, UINT count, UINT s
                         const float     th    = glm::radians(rk) * (1.0f - std::clamp(v.insert, 0.0f, 1.0f));
                         const glm::vec3 pv    = well_c + fwd_c * (0.02f * ws);
                         const glm::mat4 Rc    = shift(pv) * glm::rotate(glm::mat4{ 1.0f }, th, rt) * shift(-pv);
-                        T                     = s.body * shift(d) * glm::inverse(s.b2c4) * Rc * s.b2c4 * r.r;
+                        T                     = body_x * shift(d) * glm::inverse(s.b2c4) * Rc * s.b2c4 * r.r;
                     }
                 } else {   // kHand: its top at reloadhandmag from the left controller, turned as it sits on the gun with the left controller for the gun
                     if (!m_mo.other_valid) return done(true);
@@ -2441,8 +2512,9 @@ bool FarCry5Stereo::reload_mag_draw(ID3D11DeviceContext* ctx, UINT count, UINT s
         if (count == rp.rounds && s.rev_said_sig != sig) {
             s.rev_said_sig = sig;
             spdlog::info("[ReloadMag] weapon {}: the {} rounds (draw {}) drawn by the mod, {}", sig, rp.brk ? "break action's" : "revolver's", count,
-                         s.body_frame == frame ? "after the gun's main draw" : body_moved ? "before the gun's main draw (the body moved with the rounds' own object)"
-                                                                                          : "before the gun's main draw (the last frame's body)");
+                         body_follow ? "before the gun's main draw (the body carried by the controller's move: reloadheldfollow)"
+                         : s.body_frame == frame ? "after the gun's main draw" : body_moved ? "before the gun's main draw (the body moved with the rounds' own object)"
+                                                                                            : "before the gun's main draw (the last frame's body)");
         }
         const glm::mat4 Ro = shift(rp.pivot) * glm::rotate(glm::mat4{ 1.0f }, glm::radians(rp.open_deg) * std::clamp(v.open_f, 0.0f, 1.0f), rp.axis) * shift(-rp.pivot);
         auto pinned = [&](const Key& k, glm::mat4& T) {
@@ -2627,7 +2699,7 @@ bool FarCry5Stereo::reload_mag_draw(ID3D11DeviceContext* ctx, UINT count, UINT s
         }
         if (v.hl_well && mag_here && !v.revolver && !mparts.empty() && body_now) {
             std::vector<std::pair<Key, glm::mat4>> xs;
-            for (const auto& [k, r] : mparts) xs.push_back({ k, s.body * r.r });   // where it sits on the gun
+            for (const auto& [k, r] : mparts) xs.push_back({ k, body_x * r.r });   // where it sits on the gun
             hint_job(fc5::reloadhint::kMag, false, xs, part->rigid);
             fc5::reloadhint::set_colour(fc5::reloadhint::kMag, 1.0f, 0.85f, 0.2f, v.well_near ? 1.7f : 1.0f);
         }
@@ -2706,7 +2778,7 @@ bool FarCry5Stereo::reload_mag_draw(ID3D11DeviceContext* ctx, UINT count, UINT s
             }
         for (const auto& [k, T] : moved) {
             if (k.second == kRigid || (k.second + 1) * 12 > bones.size()) continue;
-            to_rows(Oi * T, bones.data() + k.second * 12);
+            to_rows(part_fine_x(Om, glm::dmat4{ T }, Oi * T), bones.data() + k.second * 12);   // handfine: the last product in doubles
             set++;
         }
         if (set == 0) return done(mode == kHand);

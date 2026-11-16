@@ -33,7 +33,9 @@ namespace fc5::lua
     void        spawn_request(uint64_t item, uint64_t archetype, float fx, float fy, float yaw_add = 0.0f);
     // vehiclespawn (FarCry5Spawn.cpp): at the next game update, that vehicle dist metres ahead, turned the way the player faces; get_in: the player then seated in its driver seat.
     // vehicle_remove_request: the vehicles spawned this session removed, except the one the player is in. What happened: spawn_status.
-    void        vehicle_request(uint64_t archetype, float fx, float fy, float dist, bool get_in);
+    // clear (spawnvehicle[in] <id>@clear; author 11 Nov 19:13: test vehicles): the vehicle is placed on the first flat empty patch found around the player instead
+    // (12 to 42 m away, behind first), looked for with ground rays a metre apart over the vehicle's footprint; none: ahead, with a warning.
+    void        vehicle_request(uint64_t archetype, float fx, float fy, float dist, bool get_in, bool clear = false);
     void        vehicle_remove_request();
     // drive (FarCry5Drive.cpp): the archetype a vehicle entity was spawned from by vehicle_request this session (0: not one of those).
     uint64_t    spawned_vehicle_archetype(uint64_t id);
@@ -46,11 +48,26 @@ namespace fc5::lua
     bool        clip_fill_failed();   // the game's calls did not fill the clip (this session): the manual reload taps the game's reload as before
     bool        clip_fill_short();    // this fill not made (fewer rounds left than the clip lacks, or no answer): this one reload is the game's, whose count is exact. Read once
     std::string spawn_status();   // what the last one did, in words
+    // playerskin (FarCry5Skin.cpp; author 15 Nov; research\2026-11-15_playerskin\README.md): on the script thread at the next game update.
+    // skin_equip: EquipWolfskinItem's native (&player, id), then (force) ForceCharacterCustomization's (&player); the item looked up by the game
+    // (an id it does not know: nothing happens). skin_worn: HasCustomizationEquipped and IsWearingWolfskinItem asked for every row of
+    // FarCry5SkinTable.h with its shop and desc ids, the true ones logged ([Skin] lines). skin_menu: OpenAvatarCreationMenu's Lua binding.
+    void        skin_equip(uint64_t id, bool force, const char* name);
+    void        skin_force();
+    void        skin_worn();
+    void        skin_menu();
+    std::string skin_status();
+    bool        spawn_drawing(); // a spawnhand asked and its item not yet seen in the hand (melee fix 1: the game shows other weapons meanwhile)
     void        queue_damage_id(uint64_t id, float amount, bool send);   // meleeray: the entity the ray hit
     void        queue_damage(float x, float y, float z, float amount, bool send);
     std::string damage_status();
+    bool        damage_killed_recent(int64_t ms);   // melee fix 4: the mod's damage took a target to 0 or below within the last ms
     void        damage_self(float amount);                    // meleedamageself (test): the damage stim sent to the player itself
     void        probe_entities(float x, float y, float z);   // meleedamageprobe (test): the recorded entities nearest a point, logged
+    // melee fix 14b: ON THE GAME'S SCRIPT THREAD ONLY (gameray's tick). The recorded entity (damage_watch(true) records the game's entity lookups)
+    // nearest a body's root (world): within 0.7 m across the ground and 1.2 m up or down, not the player, reading a living pawn's health (above 0,
+    // below 100000). 0: none; why says what was looked at (or why nothing could be). dist: its root's distance across the ground.
+    uint64_t    entity_at_root(float x, float y, float z, float& health, float& dist, std::string& why);
     // vehscript (FarCry5Lua.cpp): on: the game's GetPawnVehicle asked for the local player every 150 ms on its script thread.
     // vehicle_state: -1 unknown (off, failed, or no answer in the last second), 0 on foot, 1 in a vehicle; driver -1 unknown, 0, 1;
     // type (in a vehicle): 0 wheeled, 1 boat, 2 paraglider, 3 motorcycle, 4 helicopter, 5 plane, 6 wingsuit, else -1.
@@ -89,6 +106,14 @@ namespace fc5::lua
     void        gamestate_query(bool on);
     void        gamestate_frame(bool mod_menu, bool mod_cine, bool mod_vehicle);
     std::string gamestate_status();
+    // Cutscenes (author 13 Nov 14:22): the
+    // game's scripts starting and stopping cinematic sequences, counted from the same Lua bindings gamestate logs. cine_watch()
+    // installs them once the game's script layer is ready, whatever gamestate says (true once installed); the counters only grow:
+    // starts = StartCinematicScene(_v2), StartCinematicMetaSequence and the StartCinematicSequence*WithMetaId calls; stops =
+    // StopCinematicSequence, StopCinematicMetaSequence and SkipCinematicSequence (both registrations of each).
+    bool        cine_watch();
+    uint64_t    cine_starts();
+    uint64_t    cine_stops();
     // gamestatebones (log only, test, not saved): with gamestate on, once a second the game's world positions of the player's body bones,
     // the holster/hand attach points its weapon data names and the equipped item's sight bones, relative to the player. False: not usable.
     bool        gamestate_bones(bool on);
@@ -96,4 +121,17 @@ namespace fc5::lua
     // body_bones_read: the bones the skeleton has (world positions), their names, how old the read is (ms; -1 none yet). False/0: not usable.
     bool        body_bones(bool on);
     int         body_bones_read(float (*pos)[3], const char** names, int max, int64_t& age_ms);
+    // firstgunpause (FarCry5FirstGun.cpp): the game's own PauseGame (its native +0x2FAC5C0), called on the game's script thread at the next game
+    // update or script string. pause_ready: the native checked (false: not usable, the popup only holds the controls). pause_request: asks a pause
+    // or the resume. paused_by_mod: paused or a pause asked. pause_byte: IsGamePaused's byte (-1 unknown). pause_frame (render thread, every
+    // frame): a resume not made within 1 s is made there (the game update may stop while paused); a pause not made within 3 s is given up.
+    // firstguntip's loot watch: gun_watch(true) asks the inventory for every gun of the weapon table every 250 ms in play (its first read the
+    // baseline); false stops it and drops the baseline (a load must not read as a loot). gun_new_count: new guns seen so far (grows), the last one's item.
+    void        gun_watch(bool on);
+    uint32_t    gun_new_count(uint64_t* item);
+    bool        pause_ready();
+    void        pause_request(bool pause);
+    bool        paused_by_mod();
+    int         pause_byte();
+    void        pause_frame();
 }

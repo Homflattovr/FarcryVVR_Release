@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0 (16 November 2026): first full release
+Full notes: [release/RELEASE_NOTES_v1.0.md](release/RELEASE_NOTES_v1.0.md).
+- **New:** full body and arms option with calibration, hands on the vehicle's own wheel, handlebars or stick, vehicle
+  turrets as mounted guns, cutscenes in 3D by default with their button prompts and a recenter at the end, a weapon
+  tips popup, melee with the weapon in hand (experimental), an F11 Main tab, the launcher's install checks.
+- **Fixes:** SteamVR's upside-down picture, black squares in the lighting, a doubled objective marker, short stutters,
+  a crash when starting a new game, bow aiming.
+- **Docs:** install steps first; Virtual Desktop with VDXR strongly recommended; if the hands or legs look wrong,
+  change your skin first.
+
 ## Beta 0.4.6 (9 November 2026): culling follows the headset, every round fires
 Full notes: [release/RELEASE_NOTES_beta_0_4_6.md](release/RELEASE_NOTES_beta_0_4_6.md).
 - **New:** culling from your eyes (no missing edges looking down, in or out of cars), every round of a magazine fires

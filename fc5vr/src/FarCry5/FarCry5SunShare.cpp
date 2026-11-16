@@ -6,11 +6,12 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <string>
 
 #include <spdlog/spdlog.h>
 
-// Render thread only, apart from the setters (atomics). See the header for what this does.
+// Render thread only, apart from the setters (atomics) and note_cb_other (other threads, under g_pub_mtx). See the header for what this does.
 
 namespace fc5::sunshare
 {
@@ -19,7 +20,8 @@ namespace fc5::sunshare
         std::atomic<bool>  g_on{ false };
         std::atomic<int>   g_stagger{ 1 };
         std::atomic<float> g_drift{ 0.0f };
-        std::atomic<int>   g_check_every{ 150 };
+        std::atomic<uint32_t> g_on_serial{ 0 };   // counts the switch-ons (the shadow pass's self-check starts again at each)
+        std::atomic<int>   g_check_every{ 0 };   // 9 Nov: was 150; a check pair shows the right eye its own map for one frame (a blink)
 
         constexpr int kSlices = 3;   // CSMSlice0..2 (census: 3 slices)
 
@@ -57,13 +59,27 @@ namespace fc5::sunshare
         // The right call's buffer at the same place gets them, whatever fit the right call made (8 Nov: its first slice can be
         // 7.7 % smaller than the left call's, past close_rows' 5 %, and was then left with its own rows on the left call's map).
         uint32_t g_l_idx = 0, g_r_idx = 0, g_l_mask = 0;
+        uint32_t g_l_size[32]{};             // byte size of the left call's buffer at each place (FC5 carries the rows in 320 and 448 B buffers)
+        uint32_t g_target_draws = 0;         // left-call draws into the target since the last forget()
         uint32_t g_seen_mask = 0;
         bool     g_seen_multi = false;
         uint32_t g_seen_draws = 0;
 
+        // Fix 4 (11 Nov): the pair's rows for uploads made on other threads (the game's command-list workers), which never
+        // reached note_cb. Written by the render thread in the left call, read by any thread in the right call.
+        std::mutex g_pub_mtx;
+        struct Pub { bool valid{ false }; uint32_t S{ 0 }; float rows[kSlices * 12]{}; float drawn[kSlices][12]{}; bool have[kSlices]{}; } g_pub;
+        std::atomic<uint64_t> c_cb_r_thread{ 0 };
+
+        void unpublish()
+        {
+            std::lock_guard _{ g_pub_mtx };
+            g_pub.valid = false;
+        }
+
         // Counters (since the last report).
         uint64_t c_pairs = 0, c_skip_r_draw = 0, c_skip_r_clear = 0, c_skip_stale_draw = 0, c_skip_stale_clear = 0, c_split_clear = 0;
-        uint64_t c_cb_r = 0, c_cb_stale = 0, c_cb_other = 0, c_cb_refit = 0, c_cb_size = 0, c_redraw[kSlices]{}, c_moved[kSlices]{};
+        uint64_t c_cb_r = 0, c_cb_stale = 0, c_cb_other = 0, c_cb_refit = 0, c_cb_size = 0, c_cb_r_own = 0, c_redraw[kSlices]{}, c_moved[kSlices]{};
         uint64_t c_checks = 0;
         uint64_t t_pairs = 0;                // since start
         std::string g_last_check = "none yet";
@@ -78,6 +94,17 @@ namespace fc5::sunshare
 
         float len3(const float* v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); }
 
+        // The same cascade set: slices 1 and 2 of the same width within 10 % (the right call's fit moves its boxes but keeps
+        // their widths; its first slice can differ more, 7.7 % seen).
+        bool same_widths(const float* x, const float* y)
+        {
+            for (int k = 1; k < kSlices; ++k) {
+                const float la = len3(x + k * 12), lb = len3(y + k * 12);
+                if (!(la > 0.0f) || std::abs(la - lb) > 0.1f * la) return false;
+            }
+            return true;
+        }
+
         // The same sun: slice 0's depth axis (row 2) points the same way in both sets of rows.
         bool same_sun(const float* x, const float* y)
         {
@@ -91,14 +118,14 @@ namespace fc5::sunshare
         // axis (row 2) in all three, and each wider than the one before (row 0's scale = 1 / width, smaller for the far slices).
         int g_reject_logs = 0;
 
-        bool is_csm(uint32_t size, const float* d, uint32_t& S)
+        bool is_csm(uint32_t size, const float* d, uint32_t& S, bool quiet = false)
         {
             if (size < 224 || size > 512) return false;
             const float s = d[40];
             if (!(s >= 256.0f && s <= 16384.0f) || std::abs(d[41] - s) > 0.5f || std::abs(d[42] * s - 1.0f) > 1e-3f || std::abs(d[43] * s - 1.0f) > 1e-3f) return false;
             // ShadowMapSize matches; the slice rows must look like three slices of one sun projection (else: logged a few times, left alone).
             auto reject = [&](const char* why, int k) {
-                if (g_reject_logs < 4) {
+                if (!quiet && g_reject_logs < 4) {
                     g_reject_logs++;
                     std::string r;
                     for (int i = 0; i < 36; i += 4) r += fmt::format("({:.4g} {:.4g} {:.4g} {:.4g}) ", d[i], d[i + 1], d[i + 2], d[i + 3]);
@@ -180,22 +207,27 @@ namespace fc5::sunshare
         {
             const double n = double(std::max<uint64_t>(1, c_pairs));
             spdlog::info("[SunShare] last {} pairs: right call skipped {:.1f} draws and {:.2f} clears per pair, {:.2f} buffers set to the left rows "
-                         "({:.2f} of them with another fit of its own), {:.2f} buffers of another map size left alone; "
+                         "({:.2f} of them with another fit of its own), {:.2f} left with their own rows, {:.2f} buffers of another map size left alone; "
                          "stagger {} ({}): far slices redrawn {:.0f} % / {:.0f} % of pairs (moved {:.0f} % / {:.0f} %), {:.1f} stale draws and {:.2f} stale clears skipped per pair, "
-                         "{:.2f} array clears split, {:.2f} buffers set to the drawn rows, {} other cascade buffers left alone; slices drawn in the last full pair 0x{:x}; checks {}, last {}",
-                         c_pairs, c_skip_r_draw / n, c_skip_r_clear / n, c_cb_r / n, c_cb_refit / n, c_cb_size / n, g_stagger.load(), g_slices_ok ? "per slice" : "not per slice", 100.0 * c_redraw[1] / n,
+                         "{:.2f} array clears split, {:.2f} buffers set to the drawn rows, {} other cascade buffers left alone, {} set from other threads; slices drawn in the last full pair 0x{:x}; checks {}, last {}",
+                         c_pairs, c_skip_r_draw / n, c_skip_r_clear / n, c_cb_r / n, c_cb_refit / n, c_cb_r_own / n, c_cb_size / n, g_stagger.load(), g_slices_ok ? "per slice" : "not per slice", 100.0 * c_redraw[1] / n,
                          100.0 * c_redraw[2] / n, 100.0 * c_moved[1] / n, 100.0 * c_moved[2] / n, c_skip_stale_draw / n, c_skip_stale_clear / n, c_split_clear / n,
-                         c_cb_stale / n, c_cb_other, g_mask_last, c_checks, g_last_check);
-            c_pairs = c_skip_r_draw = c_skip_r_clear = c_skip_stale_draw = c_skip_stale_clear = c_split_clear = c_cb_r = c_cb_stale = c_cb_other = c_cb_refit = c_cb_size = c_checks = 0;
+                         c_cb_stale / n, c_cb_other, c_cb_r_thread.exchange(0), g_mask_last, c_checks, g_last_check);
+            c_pairs = c_skip_r_draw = c_skip_r_clear = c_skip_stale_draw = c_skip_stale_clear = c_split_clear = c_cb_r = c_cb_stale = c_cb_other = c_cb_refit = c_cb_size = c_cb_r_own = c_checks = 0;
             for (int k = 0; k < kSlices; ++k) c_redraw[k] = c_moved[k] = 0;
         }
     }
 
     void set_on(bool on)
     {
-        if (g_on.exchange(on) != on) spdlog::info("[SunShare] sun shadows once per pair {}", on ? "on" : "off");
+        if (g_on.exchange(on) != on) {
+            if (on) g_on_serial++;
+            spdlog::info("[SunShare] sun shadows once per pair {}", on ? "on" : "off");
+        }
     }
     bool on() { return g_on.load(); }
+    uint32_t on_serial() { return g_on_serial.load(); }
+    bool sharing() { return g_on.load() && g_target && g_share_pair; }   // exactly when skip_draw skips the right call's cascade draws
     void set_stagger(int n)
     {
         n = std::clamp(n, 1, 16);
@@ -240,11 +272,19 @@ namespace fc5::sunshare
                 for (int k = 0; k < kSlices; ++k) {
                     if (g_fresh[k]) { std::memcpy(g_drawn[k], d + k * 12, 48); g_have_drawn[k] = true; }
                 }
+                {
+                    std::lock_guard _{ g_pub_mtx };
+                    g_pub.valid = g_share_pair;
+                    g_pub.S     = g_target_S;
+                    std::memcpy(g_pub.rows, g_rows, sizeof g_rows);
+                    std::memcpy(g_pub.drawn, g_drawn, sizeof g_drawn);
+                    std::memcpy(g_pub.have, g_have_drawn, sizeof g_have_drawn);
+                }
             } else if (!close_rows(g_rows, d)) {
                 c_cb_other++;
                 return;
             }
-            if (idx < 32) g_l_mask |= 1u << idx;
+            if (idx < 32) { g_l_mask |= 1u << idx; g_l_size[idx] = size; }
             if (!g_any_stale) return;
             for (int k = 0; k < kSlices; ++k) {
                 if (!g_fresh[k] && g_have_drawn[k]) std::memcpy(d + k * 12, g_drawn[k], 48);
@@ -258,12 +298,32 @@ namespace fc5::sunshare
         // every shadow in the right eye.
         const uint32_t idx = g_r_idx++;
         if (!g_share_pair || g_rows_pair != g_pair) return;
-        if (idx >= 32 || !(g_l_mask & (1u << idx)) || size != g_rows_size || !same_sun(g_rows, d)) { c_cb_other++; return; }
+        // 9 Nov (author: the right eye blinks): the size is the left buffer's at the same place, not the first buffer's; with the
+        // first one's, about 2 buffers per pair (another size, same rows) kept the right call's own rows on the left map.
+        // 9 Nov 16:00 (fix 3): shadow dumps of pairs with the map shared (7552, 7574, fix 1 build: CSM bit-identical L/R) still had
+        // the right resolve's CTileLightingBlendedParameterProvider rows differ from the left's (0.26-0.37). Matching by upload
+        // place depends on both calls uploading in the same order; any right-call cascade buffer of the shared map's size, same
+        // sun and same slice widths now gets the rows.
+        (void)idx;
+        if (!same_sun(g_rows, d) || !same_widths(g_rows, d)) { c_cb_other++; c_cb_r_own++; return; }
         if (!close_rows(g_rows, d)) c_cb_refit++;
         for (int k = 0; k < kSlices; ++k) {
             if (g_have_drawn[k]) std::memcpy(d + k * 12, g_drawn[k], 48);
         }
         c_cb_r++;
+    }
+
+    void note_cb_other(int call, uint32_t size, float* d)
+    {
+        if (!g_on.load() || call != 2) return;
+        uint32_t S = 0;
+        if (!is_csm(size, d, S, true)) return;
+        std::lock_guard _{ g_pub_mtx };
+        if (!g_pub.valid || S != g_pub.S || !same_sun(g_pub.rows, d) || !same_widths(g_pub.rows, d)) return;
+        for (int k = 0; k < kSlices; ++k) {
+            if (g_pub.have[k]) std::memcpy(d + k * 12, g_pub.drawn[k], 48);
+        }
+        c_cb_r_thread++;
     }
 
     void consider(ID3D11Resource* res, ID3D11Resource* asm_atlas, ID3D11Resource* asm_tmp)
@@ -317,6 +377,15 @@ namespace fc5::sunshare
 
     void forget()
     {
+        // 9 Nov: keep a target the left call still draws into. It is held (AddRef), so its address cannot be reused; dropping it
+        // every 5 s (the depth-target list clear) made the pair that learnt it again draw and use the right eye's own map: a
+        // blink every 5 s. Dropped as before when nothing was drawn into it since the last forget (a new map, a single call).
+        if (g_target && g_target_draws > 0) {
+            g_target_draws = 0;
+            return;
+        }
+        g_target_draws = 0;
+        unpublish();
         g_prev = g_target;
         if (g_target) g_target->Release();
         g_target = nullptr;
@@ -331,6 +400,7 @@ namespace fc5::sunshare
     void pair_begin()
     {
         ++g_pair;
+        unpublish();
         g_stashed    = false;
         g_seen_mask  = 0;
         g_seen_multi = false;
@@ -411,6 +481,7 @@ namespace fc5::sunshare
         if (!g_target || res != g_target) return false;
         if (call == 1) {
             g_seen_draws++;
+            g_target_draws++;
             if (slice < 0) g_seen_multi = true;
             else if (slice < 32) g_seen_mask |= 1u << slice;
             if (g_any_stale && slice >= 1 && slice < kSlices && !g_fresh[slice]) {

@@ -29,9 +29,15 @@ namespace fc5::bullet
     void  note_player_fire();   // the mod's fire gate, each frame the player's trigger is down
     // The mod let the trigger through to the game (press_ms after the press): the next shot code call logs how long the game took.
     void  note_shot_release(uint64_t press_ms, uint64_t weapon);
-    // shotbuzz (FarCry5Stereo::shot_buzz): called on the game thread at each of the player's shots, from the shot code above (the
-    // player's trigger down within 500 ms, and the weapon that fired the press's first shot, so enemies' shots are left out).
+    // shotbuzz (FarCry5Stereo::shot_buzz) and recoil: called on the game thread at each of the player's shots, from the shot code above:
+    // the player's trigger down within 500 ms, and (shotowner) the first call after each of the mod's releases or a later one from the
+    // player's weapon objects so found, so other characters' shots are left out.
     void  set_player_shot_callback(void (*cb)());
+    // drivegunthrottle rt's guard (ModConfig.cpp): every shot code call so far, any character's (the hook above; 0 while it is off).
+    uint64_t shot_calls();
+    // shotowner on|off (default on, not saved; F11 Tests): off is the rule before 15 Nov (the weapon of the press's first shot code call).
+    void  set_shot_owner(bool on);
+    bool  shot_owner();
 
     // FC2 VR item 2 (23 Oct): the weapon's fire function (FC_m64+0x1e37110) right after its protected call [vtbl+0x278] fills the shot's
     // origin [rbp-0x58] and direction [rbp-0x68] (hook at +0x1e375fa, bytes checked); the projectile spawn and the shot event read them.

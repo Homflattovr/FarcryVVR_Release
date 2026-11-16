@@ -44,12 +44,26 @@
 //    v2 (author 7 Nov 20:41): drivebuttons applies only in the driver's seat (vehscript's driver
 //    1, or not known yet); riding (driver 0, a passenger or gun seat, where the game's RT shoots) right A is pad A (change seat). So right A
 //    is RT only when driving with no sidearm about, and pad A everywhere else (jump on foot, change seat in a vehicle), which fires nothing.
+//  - carshoot (14 Nov; author 07:41):
+//    drivereadyaway default 0.18 m (was 0.30). Since drivehandsmodel (7 Nov 21:52, after his 12:01 "right grip readies the sidearm ...
+//    correctly") the drive's wheel sits on the car's own, about 43 cm ahead of and 33 cm below the head, radius 20 cm, tilted 19 deg; a
+//    30 cm keep-out from that rim covers nearly every place a seated right hand rests or points from (the lap about 14 cm from the rim, the
+//    hand out to the right window about 20-25 cm, beside the thigh about 30 cm), so the right grip drew nothing. 18 cm still leaves the
+//    10 cm grab plus 8 cm for a near miss.
+//    drivereadykeep on|off (new, saved, default on): a right grip that draws keeps the sidearm out after it is let go (ModConfig.cpp: Y
+//    tapped again 200 ms after the game puts it away), until the right hand takes the wheel or bars, the layout ends or 3 taps in a row
+//    bring nothing; while it is kept, right A pushes the left stick forward (the game's throttle while shooting) instead of RT, which would
+//    shoot. Off: as before (taps again only while the grip is held).
+//    drivekeephold on|off (new, saved, default on; FarCry5DsHold.cpp; simulator runs 2-3 of 14 Nov: the game put a Y-drawn sidearm away
+//    3.17 s after the draw whatever the hand did, so the keep re-drew it every 3.6 s): while the keep holds, the game's own drive-and-shoot
+//    put-away times (fDriveAndShootAutoHolsterDuration / Classic, 1.3 s in its data) are written as 600 s; put back when it ends.
 //  - drivehandsmodel (FarCry5Drive.h; author 7 Nov 21:30): set_model hands over the vehicle's own wheel, bars or stick, found from the game's
 //    hands (FarCry5VehHands.cpp). While no hand holds the control and the model is fresh (0.5 s), the drive's control eases onto it (0.25 s);
 //    while a hand holds it, it stays where it was (the steering is the hands' turn about it, and the car's wheel bobs with the camera). Not
 //    seen for 2 s: back to the drivewheel / drivebars / drivestick place.
 #include "FarCry5Drive.h"
 #include "FarCry5VehicleTable.h"
+#include "FarCry5DsHold.h"
 
 #include <imgui.h>
 #include <spdlog/spdlog.h>
@@ -81,9 +95,25 @@ namespace fc5::drive
             float bars_fwd{ 0.45f }, bars_down{ 0.22f }, bars_w{ 0.36f };                           // m (half width: centre to each grip)
             float bars_lock{ 30.0f };
             float stick_fwd{ 0.40f }, stick_down{ 0.38f };
-            float stick_range{ 0.08f };                                                             // m of hand move for full stick
+            // m of hand move for full stick. 12 cm since 12 Nov (was 8): in the author's 20:53 helicopter flight his hand was 8 to 16 cm from where
+            // it took the stick in 8 of the 14 readings, so the stick was at its end most of the time ("not very precise").
+            float stick_range{ 0.12f };
             bool  twist{ true };
             float twist_deg{ 40.0f };
+            // drivestickfine (author 12 Nov 19:57). The hand's move went to the left stick as it was: the game's own dead zone (an Xbox 360 pad's: 0.24 on
+            // the left stick, 0.265 on the right, full at 0.94) then swallowed the first quarter of it, so with the drive's own 12 % the
+            // first 2.6 of the 8 cm did nothing and the last 5.4 cm were the whole range; the hand's turn did nothing up to 16 of its 40 deg
+            // and then turned at the game's full rate, not driveheli's. On: what the stick sends starts just past the game's dead zone and
+            // is full at 0.94 (taken across the two axes together, so a small move aside while pushing forward does not jump); in a
+            // helicopter the hand's turn has driveheli's rate and curve, smoothed over half its time. drivestickcurve: the left stick as
+            // |x|^curve (1: in proportion).
+            bool  stick_fine{ true };
+            float stick_curve{ 1.0f };
+            // drivestickdead: the game's dead zone the left stick starts past. 0.24 (a car's steering) was assumed for the helicopter too and
+            // is wrong there: on CF345D2A (13 Nov 00:59, testruns\2026-11-13_vehround8) the helicopter's own stick leant 3 deg in the frame
+            // a left stick X of 0.15 began, after 22 s still, and 6 and 9 deg in the next two seconds. So the game answers at 0.15 or less,
+            // and a stick that starts at 0.24 starts with a jump. 0.05 until the dead zone is measured (a smaller step series); full at 1.
+            float stick_dead{ 0.05f };
             float grab{ 0.10f };
             float centre_s{ 0.30f };
             bool  react{ true };          // drivereact (see the top)
@@ -94,6 +124,9 @@ namespace fc5::drive
             float react_tau{ 0.25f };     // drivereacttau: s, the modelled game steering's time constant
             float steer_curve{ 1.7f };    // drivesteercurve: the game's measured stick-to-turn exponent undone (0: off)
             bool  right_brake{ true };
+            bool  model_steer{ true };    // drivemodelsteer (FarCry5Drive.h)
+            float wheel_ratio{ 1.0f };    // drivewheelratio
+            bool  model_show{ true };     // drivemodelshow
             bool  log{ true };
             // Vehicle controls (FarCry5Drive.h), not tied to drive on|off.
             bool  buttons{ true };
@@ -102,8 +135,9 @@ namespace fc5::drive
             int   hands{ 1 };
             HandOpts hand{};
             int   ready{ 1 };             // driveready: 0 off, 1 y, 2 lb
-            float ready_away{ 0.30f };    // drivereadyaway: m from the wheel or bars a right grip must start for driveready
-            int   gun_throttle{ 0 };      // drivegunthrottle: 0 off (A sends nothing while the sidearm is out), 1 stick (test)
+            float ready_away{ 0.18f };    // drivereadyaway: m from the wheel or bars a right grip must start for driveready (0.30 until 14 Nov)
+            bool  ready_keep{ true };     // drivereadykeep: a sidearm the right grip drew stays out until the right hand takes the wheel
+            int   gun_throttle{ 2 };      // drivegunthrottle: 0 off (A sends nothing while the sidearm is out), 1 stick (test), 2 rt (gunthrottle2)
             float quad_seat{ 0.15f };     // drivequadseat: m from the centre line (0: off)
             bool  heli{ true };           // driveheli
             float heli_gain{ 0.40f };     // driveheligain: the game's full rate times this at full stick
@@ -146,6 +180,7 @@ namespace fc5::drive
         bool              g_btn_x_was = false, g_btn_hb = false, g_btn_tap = false;
         clock::time_point g_btn_x_down{}, g_btn_x_up{};
         int               g_btn_hb_n = 0, g_btn_brake_n = 0, g_btn_type = -1;
+        std::atomic<int64_t> g_trig_test_until{ 0 };   // drivetrigtest (the simulator's controllers have no trigger): ms on the steady clock
         int               g_btn_test = 0, g_btn_test_ms = 0;   // drivebuttontest (the simulator's controllers have no A or X): 1 a, 2 x, 3 xx
         clock::time_point g_btn_test_t0{};
         // driveheli (under g_mtx): the smoothed right stick (game-relative, before the dead zone is added)
@@ -166,10 +201,37 @@ namespace fc5::drive
             float     radius{ 0.0f };
         };
         Cur               g_cur{};
+        // Each holding hand's own control, as it was when the hand took it (ref): the hand's angle is read about it. The control drawn and
+        // taken follows the vehicle's own model (Model::bone), which moves in the reference when the game's camera moves in the cabin (10 cm
+        // and more in hard turns, 12 Nov); a hand's angle read about that moving centre would steer by itself (a hand at 2 o'clock, the
+        // centre 10 cm aside: 26 deg).
+        struct Anchor
+        {
+            glm::vec3 c{ 0.0f }, u{ 1, 0, 0 }, v{ 0, 1, 0 }, n{ 0, 0, 1 };
+            float     r{ 0.0f };
+        };
+        Anchor            g_anchor[2]{};
+        float             g_tw_s = 0.0f;       // drivestickfine: the hand's turn, shaped and smoothed (the game's rate, before its dead zone)
+        bool              g_st_full = false, g_st_centre = true;   // drivestickfine: the stick at its end / at its centre (the hand's buzz at each)
+        int               g_fine_lines = 0;
+        clock::time_point g_fine_log_t{};
+        float             g_stray_max = 0.0f;  // the farthest the followed control was from a holding hand's own (m), this drive
+        clock::time_point g_stray_log_t{};
         int               g_cur_lines = 0;     // log lines this drive
         glm::vec3         g_cur_logged{ 0.0f };
         clock::time_point g_cur_log_t{};
         clock::time_point g_scan_until{};      // drivewheelscan
+        // drivemodelsteer (under g_mtx): the vehicle's own wheel's / bars' turn (Model.turn) against the steering sent.
+        float             g_mt_zero = 0.0f, g_mt_last = 0.0f, g_mt_sign = 1.0f, g_mt_lock = 0.0f, g_mt_cmd = 0.0f;
+        bool              g_mt_zero_ok = false, g_mt_dead = false;
+        clock::time_point g_mt_still{}, g_mt_cmd_t{}, g_mt_log_t{};
+        int               g_mt_opp = 0, g_mt_none = 0, g_mt_obs = 0;
+        bool              g_ms_on = false;     // drivemodelshow: the vehicle's own wheel drawn at g_ms_turn (Model.turn's units)
+        float             g_ms_turn = 0.0f;
+        clock::time_point g_ms_t{};
+        int               g_hint = kNone;      // set_shape_hint
+        clock::time_point g_hint_t{};
+        uint64_t          g_hint_veh = 0;      // the vehicle it was given for (kept while that vehicle is driven)
         // padecho (own lock: the pad pollers only)
         std::mutex        g_echo_mtx;
         bool              g_echo_on = false;
@@ -201,6 +263,7 @@ namespace fc5::drive
             if (in.veh_type < 0 && in.archetype == 0) {
                 if (g_style != kNone) { why = g_why; return g_style; }
                 if (g_unknown_since == clock::time_point{}) g_unknown_since = now;
+                if (g_hint != kNone && now - g_hint_t < std::chrono::seconds(2)) { why = "the vehicle's own model shows it (vehcontrol), before the game's type"; return g_hint; }
                 if (now - g_unknown_since < std::chrono::seconds(8)) { why = "type not known yet: waiting for the game's answer"; return kNone; }
                 why = "type not known for 8 s: wheel";
                 return kWheel;
@@ -221,13 +284,24 @@ namespace fc5::drive
                     break;
                 }
             }
-            if (in.veh_type == 1) { why = "boat (the game's type)"; return kWheel; }
+            if (in.veh_type == 1) {
+                // jetskibars: the game calls a jetski a boat, and only one spawned from F11 has its archetype. vehcontrol finds the
+                // handlebars in the vehicle's own model when no wheel is there and tells the drive (author 16 Nov; his 10:28 drive on a jetski found in the world: "wheel: boat (the game's type)", no wheel found in 3 tries).
+                if (g_hint == kBars && g_hint_veh == in.veh_id) { why = "boat; handlebars in the vehicle's own model (vehcontrol): a jetski"; return kBars; }
+                why = "boat (the game's type)";
+                return kWheel;
+            }
             if (in.veh_type == 0) {
                 // drivequadseat: the game calls a quad wheeled like a car; its driver sits on the vehicle's centre line, a car's 0.4 m to the side.
+                // vehcontrol: the vehicle's own model shows a wheel (the tractor: its driver on the centre line, as a quad's), or the game's
+                // hands hold handlebars (a quad whose seat was not learnt).
+                if (g_hint == kWheel && g_hint_veh == in.veh_id) { why = "wheeled; a wheel in the vehicle's own model (vehcontrol)"; return kWheel; }
+                if (g_hint == kBars && g_hint_veh == in.veh_id) { why = "wheeled; the game's hands hold handlebars (vehcontrol)"; return kBars; }
                 if (g_o.quad_seat > 0.0f) {
                     if (std::abs(in.seat_side) > 50.0f) {
                         if (g_style != kNone) { why = g_why; return g_style; }
                         if (g_seat_wait == clock::time_point{}) g_seat_wait = now;
+                        if (g_hint != kNone && now - g_hint_t < std::chrono::seconds(2)) { why = "the vehicle's own model shows it (vehcontrol), before the seat is known"; return g_hint; }
                         if (now - g_seat_wait < std::chrono::seconds(3)) { why = "wheeled: waiting for the seat (a quad or a car)"; return kNone; }
                         why = "wheeled (the game's type; the seat not learnt in 3 s)";
                         return kWheel;
@@ -278,6 +352,7 @@ namespace fc5::drive
             spdlog::info("[Drive] drivestyle back to auto (another vehicle)");
         }
         if (in.veh_id != 0) g_veh = in.veh_id;
+        if (!in.driving && now - g_off_since > std::chrono::seconds(3)) g_hint = kNone;   // set_shape_hint: for the vehicle it was given in
 
         const char* why   = "off";
         int         style = kNone;
@@ -300,6 +375,10 @@ namespace fc5::drive
                 drop_all("the control changed");
                 g_cur       = Cur{};   // drivehandsmodel: found again for this control
                 g_cur_lines = 0;
+                g_stray_max = 0.0f;
+                g_mt_zero_ok = g_mt_dead = false;   // drivemodelsteer: learnt again for this control
+                g_mt_sign    = 1.0f;
+                g_mt_opp = g_mt_none = g_mt_obs = 0;
                 g_angle = 0.0f;
                 g_react_prev = 0.0f;
                 g_react_game = 0.0f;
@@ -355,16 +434,30 @@ namespace fc5::drive
             C = glm::vec3{ 0.0f, -o.stick_down, -o.stick_fwd };
         }
         float wheel_r = wheel_r, bars_w = bars_w;
-        // drivehandsmodel: the vehicle's own control (set_model), eased onto while no hand holds it, kept while one does.
+        // drivehandsmodel: the vehicle's own control (set_model). From the game's hands: eased onto while no hand holds it, kept while one
+        // does. From the vehicle's own bone (vehcontrol): on it at once, and with it while a hand holds it too (each holding hand's angle is
+        // read about its own anchor, below).
         if (o.hand.model && o.hand.grab && o.hands == 1) {
             const bool held_now = g_held[0] || g_held[1];
             const bool fresh    = g_model.style == style && now - g_model_t < std::chrono::milliseconds(500);
-            if (!held_now && fresh) {
+            const bool live     = fresh && g_model.bone && style != kStick;   // (a stick's top moves with the hand that pushes it: kept while held)
+            if (fresh && (!held_now || live)) {
                 const bool first = !g_cur.on || g_cur.style != style;
-                const float a    = first ? 1.0f : std::min(1.0f, dt / 0.25f);
+                const float a    = first || g_model.bone ? 1.0f : std::min(1.0f, dt / 0.25f);
                 g_cur.centre     = glm::mix(g_cur.centre, g_model.centre, a);
                 g_cur.radius     = glm::mix(g_cur.radius, g_model.radius, a);
-                glm::vec3 nn     = first ? g_model.n : glm::mix(g_cur.n, glm::dot(g_cur.n, g_model.n) < 0.0f ? -g_model.n : g_model.n, a);
+                // drivefacefix (15 Nov, tester's fast travel in a car): the wheel's face points towards the driver's head. Before, the sign was
+                // kept from frame to frame only; after a map fast travel the wheel was first placed while the game's aim still pointed 176 deg
+                // off the car's front (16:56:22: centre +46 cm behind the head), and when vehheadingkeep turned the aim back, the face kept the
+                // reversed sign: tilted -20 deg instead of +20, the hand's angle read about the reversed axis, steering backwards for the rest
+                // of the drive. A wheel's face always looks at the driver, so the sign is taken from the head's side of the wheel.
+                glm::vec3 mn     = g_model.n;
+                if (style == kWheel && glm::dot(mn, -g_model.centre) < 0.0f) mn = -mn;
+                if (style == kWheel && !first && glm::dot(g_cur.n, mn) < 0.0f && o.log)
+                    spdlog::info("[Drive] drivefacefix: the {}'s face turned back towards you (it had kept a reversed side, tilted {:.0f} deg; now {:.0f} deg)", style_name(style),
+                                 glm::degrees(std::asin(std::clamp(g_cur.n.y, -1.0f, 1.0f))), glm::degrees(std::asin(std::clamp(mn.y, -1.0f, 1.0f))));
+                glm::vec3 nn     = first || (style == kWheel && glm::dot(g_cur.n, mn) < 0.0f) ? mn
+                                                                                              : glm::mix(g_cur.n, glm::dot(g_cur.n, mn) < 0.0f ? -mn : mn, a);
                 g_cur.n          = glm::length(nn) > 1e-3f ? glm::normalize(nn) : glm::vec3{ 0.0f, 0.0f, 1.0f };
                 g_cur.style      = style;
                 // Logged when placed, then every 5 s while it is still moving over 3 cm (12 lines a drive at most).
@@ -406,20 +499,25 @@ namespace fc5::drive
             g_cur.on = false;
         }
 
-        // Each hand's distance to the control (grab), and its angle about it (wheel, bars).
+        // Each hand's distance to the control (grab), and its angle about it (wheel, bars). A holding hand: about the control as it was when
+        // the hand took it (g_anchor); a free hand: about the control where it is now.
         auto reach = [&](int h, float& ang, bool& ang_ok) {
-            const glm::vec3 p = hp[h] - C;
-            ang_ok            = false;
+            const bool      own = g_held[h];
+            const glm::vec3 p   = hp[h] - (own ? g_anchor[h].c : C);
+            ang_ok              = false;
             if (style == kWheel) {
-                const float     hgt = glm::dot(p, n);
-                const glm::vec3 q   = p - n * hgt;
+                const glm::vec3 &au = own ? g_anchor[h].u : u, &av = own ? g_anchor[h].v : v, &an = own ? g_anchor[h].n : n;
+                const float     ar  = own ? g_anchor[h].r : wheel_r;
+                const float     hgt = glm::dot(p, an);
+                const glm::vec3 q   = p - an * hgt;
                 const float     r   = glm::length(q);
-                ang                 = std::atan2(glm::dot(q, v), glm::dot(q, u));
+                ang                 = std::atan2(glm::dot(q, av), glm::dot(q, au));
                 ang_ok              = r > 0.04f;
-                return std::sqrt((r - wheel_r) * (r - wheel_r) + hgt * hgt);
+                return std::sqrt((r - ar) * (r - ar) + hgt * hgt);
             }
             if (style == kBars) {
-                const glm::vec3 e{ bars_w * std::cos(g_angle), 0.0f, -bars_w * std::sin(g_angle) };   // the right end, the bar turned by g_angle about +y
+                const float     bw = own ? g_anchor[h].r : bars_w;
+                const glm::vec3 e{ bw * std::cos(g_angle), 0.0f, -bw * std::sin(g_angle) };   // the right end, the bar turned by g_angle about +y
                 const glm::vec3 d = e * 2.0f;
                 const float     s = std::clamp(glm::dot(p + e, d) / glm::dot(d, d), 0.0f, 1.0f);
                 const float     r = std::sqrt(p.x * p.x + p.z * p.z);
@@ -439,6 +537,7 @@ namespace fc5::drive
 
         float delta_sum = 0.0f;
         int   delta_n   = 0;
+        bool  took_alone = false;   // drivemodelsteer: a hand took the control this poll and no other holds it
         for (int h = 0; h < 2; ++h) {
             const bool grip  = in.hand[h].grip && in.hand[h].tracked;
             const bool press = grip && !g_grip_was[h];
@@ -458,6 +557,8 @@ namespace fc5::drive
             }
             if (!g_held[h] && press && d <= o.grab) {
                 g_held[h]        = true;
+                g_anchor[h]      = Anchor{ C, u, v, n, style == kWheel ? wheel_r : bars_w };
+                took_alone       = took_alone || !g_held[1 - h];
                 g_hand_ang[h]    = ang;
                 g_hand_ang_ok[h] = ang_ok;
                 g_grab_pos[h]    = hp[h];
@@ -484,9 +585,50 @@ namespace fc5::drive
             out.grip_taken[h] = g_held[h];
         }
         const bool any = g_held[0] || g_held[1];
+        // How far the followed control is from each holding hand's own (the cabin moving in the reference): a line when it passes 5 cm more
+        // than the drive's farthest so far, at most every 5 s.
+        for (int h = 0; h < 2 && o.log; ++h) {
+            if (!g_held[h] || style == kStick) continue;
+            const float dc = glm::length(C - g_anchor[h].c);
+            if (dc > g_stray_max + 0.05f && now - g_stray_log_t > std::chrono::seconds(5)) {
+                g_stray_max   = dc;
+                g_stray_log_t = now;
+                spdlog::info("[Drive] drivehandsmodel: the vehicle's own {} is {:.0f} cm ({:+.0f}, {:+.0f}, {:+.0f}; right, up, back) from where the {} hand took it, its face "
+                             "turned {:.0f} deg: the {} drawn and taken follows it, the hand's angle stays read about where it took it",
+                             style_name(style), dc * 100.0f, (C.x - g_anchor[h].c.x) * 100.0f, (C.y - g_anchor[h].c.y) * 100.0f, (C.z - g_anchor[h].c.z) * 100.0f, side_name(h),
+                             glm::degrees(std::acos(std::clamp(glm::dot(n, g_anchor[h].n), -1.0f, 1.0f))), style_name(style));
+            }
+        }
 
         if (style == kWheel || style == kBars) {
-            const float lock = glm::radians(std::max(5.0f, style == kWheel ? o.wheel_lock : o.bars_lock));
+            // drivemodelsteer: the vehicle's own wheel's turn from straight (theta, rad, positive: to the left), while vehcontrol follows it.
+            bool  mt    = false;
+            float theta = 0.0f;
+            if (o.model_steer && !g_mt_dead && o.hand.model && o.hand.grab && o.hands == 1 && g_model.style == style && g_model.turn_ok &&
+                now - g_model_t < std::chrono::milliseconds(500)) {
+                const float t = g_model.turn;
+                if (!g_mt_zero_ok) {
+                    g_mt_zero_ok = true;
+                    g_mt_zero = g_mt_last = t;
+                    g_mt_still   = now;
+                    g_mt_lock    = glm::radians(style == kWheel ? 143.0f : 25.0f);   // the cars' and the jetski's bones at full lock (9 Nov dumps), until seen
+                    g_mt_cmd     = 0.0f;
+                    g_mt_cmd_t   = now;
+                    g_ms_turn    = t;
+                }
+                if (std::abs(t - g_mt_last) > glm::radians(0.5f)) {
+                    g_mt_last  = t;
+                    g_mt_still = now;
+                }
+                // Straight: nobody holds it, the drive's own wheel is back at the centre and the model's has not moved for 0.75 s.
+                if (!any && g_angle == 0.0f && now - g_mt_still > std::chrono::milliseconds(750)) g_mt_zero = t;
+                theta = g_mt_sign * (t - g_mt_zero);
+                mt    = true;
+            }
+            const float ratio = style == kWheel ? std::clamp(o.wheel_ratio, 0.5f, 4.0f) : 1.0f;
+            const float lock  = mt ? g_mt_lock / ratio : glm::radians(std::max(5.0f, style == kWheel ? o.wheel_lock : o.bars_lock));
+            // Taken where the vehicle's own wheel is now (turned by the stick, or still coming back): no jump to straight.
+            if (mt && took_alone) g_angle = std::clamp(theta / ratio, -lock, lock);
             if (any) {
                 if (delta_n > 0) g_angle = std::clamp(g_angle + delta_sum / float(delta_n), -lock, lock);
             } else if (o.centre_s <= 0.0f) {
@@ -497,14 +639,66 @@ namespace fc5::drive
             }
             out.steer_on    = any || g_angle != 0.0f;
             out.steer       = std::clamp(-g_angle / lock, -1.0f, 1.0f);   // turned to the left (counter-clockwise from the driver) = steer left
+            // drivemodelshow: held, the vehicle's own wheel is drawn at the hand's angle; let go, it eases back onto the game's own.
+            if (mt) {
+                const float t = g_model.turn;
+                if (now - g_ms_t > std::chrono::milliseconds(300)) g_ms_turn = t;
+                if (any) g_ms_turn = g_mt_zero + g_mt_sign * std::clamp(g_angle * ratio, -g_mt_lock, g_mt_lock);
+                else g_ms_turn = t + (g_ms_turn - t) * std::exp(-dt / 0.10f);
+                g_ms_on = o.model_show && (any || std::abs(g_ms_turn - t) > glm::radians(0.3f));
+                g_ms_t  = now;
+            } else {
+                g_ms_on = false;
+            }
             if (o.react) {
                 // drivereact: more steering per degree of wheel, a lead on its change, and the game's dead zone skipped.
-                float s = std::clamp(-g_angle / lock * (style == kWheel ? o.react_gain : 1.0f), -1.0f, 1.0f);
+                float s = std::clamp(-g_angle / lock * (style == kWheel && !mt ? o.react_gain : 1.0f), -1.0f, 1.0f);
                 const float rate = dt > 1e-4f ? (s - g_react_prev) / dt : 0.0f;
                 g_react_prev     = s;
                 if (o.react_lead > 0.0f) s = std::clamp(s + o.react_lead * rate, -1.0f, 1.0f);
                 // drivereactboost (see the top): the wheel's steering plus B times the modelled game steering's lag behind it.
-                if (o.react_boost > 0.0f && o.react_tau > 0.01f) {
+                if (mt && any) {
+                    // drivemodelsteer: the lag measured on the vehicle's own wheel instead (B at most 1.5: its turn comes a few frames late).
+                    const float meas = std::clamp(-theta / g_mt_lock, -1.5f, 1.5f);
+                    const float us    = std::clamp(s + std::min(o.react_boost, 1.5f) * (s - meas), -1.0f, 1.0f);
+                    g_react_game     = std::clamp(meas, -1.0f, 1.0f);
+                    // The model's full lock, from what it shows for a steady command (0.4 s, its wheel still for 0.3 s): its turn itself when
+                    // the full stick is sent, else its turn per unit sent. Turning the other way twice: its sign is the other one. Not turning
+                    // three times: not usable this drive.
+                    if (std::abs(s - g_mt_cmd) > 0.05f) {
+                        g_mt_cmd   = s;
+                        g_mt_cmd_t = now;
+                    } else if (std::abs(s) >= 0.35f && now - g_mt_cmd_t > std::chrono::milliseconds(400) && now - g_mt_still > std::chrono::milliseconds(300)) {
+                        g_mt_cmd_t = now;
+                        const float lo = glm::radians(style == kWheel ? 30.0f : 8.0f), hi = glm::radians(style == kWheel ? 240.0f : 70.0f);
+                        if (std::abs(theta) < glm::radians(2.0f)) {
+                            if (++g_mt_none >= 3) {
+                                g_mt_dead = true;
+                                spdlog::info("[Drive] drivemodelsteer: the vehicle's own {} does not turn with the steering sent ({:+.2f} sent, {:+.1f} deg seen, three times): "
+                                             "the usual steering for this drive", style_name(style), s, glm::degrees(theta));
+                            }
+                        } else if ((-theta > 0.0f) != (s > 0.0f)) {
+                            if (++g_mt_opp >= 2) {
+                                g_mt_sign = -g_mt_sign;
+                                g_mt_opp  = 0;
+                                spdlog::info("[Drive] drivemodelsteer: the vehicle's own {} turns the other way round its axis: its turn's sign changed", style_name(style));
+                            }
+                        } else {
+                            g_mt_none = g_mt_opp = 0;
+                            const float seen = std::clamp(std::abs(us) >= 0.98f ? std::abs(theta) : std::abs(theta) / std::abs(s), lo, hi);
+                            g_mt_lock += 0.25f * (seen - g_mt_lock);
+                            if (o.log && g_mt_obs++ < 6)
+                                spdlog::info("[Drive] drivemodelsteer: the vehicle's own {} shows {:+.0f} deg for {:+.2f} sent{}: its full lock taken as {:.0f} deg", style_name(style),
+                                             glm::degrees(theta), us, std::abs(us) >= 0.98f ? " (full)" : "", glm::degrees(g_mt_lock));
+                        }
+                    }
+                    if (o.log && now - g_mt_log_t > std::chrono::seconds(2)) {
+                        g_mt_log_t = now;
+                        spdlog::info("[Drive] drivemodelsteer: the hand turned the {} {:+.0f} deg, the vehicle's own shows {:+.0f} deg (full lock {:.0f} deg, x{:.2f}); sent {:+.2f}",
+                                     style_name(style), glm::degrees(g_angle), glm::degrees(theta), glm::degrees(g_mt_lock), style == kWheel ? o.wheel_ratio : 1.0f, us);
+                    }
+                    s = us;
+                } else if (o.react_boost > 0.0f && o.react_tau > 0.01f) {
                     const float u = std::clamp(s + o.react_boost * (s - g_react_game), -1.0f, 1.0f);
                     g_react_game += (u - g_react_game) * std::min(1.0f, dt / o.react_tau);
                     s = u;
@@ -552,6 +746,54 @@ namespace fc5::drive
             out.sy       = axis(-g_defl.z, o.stick_range, 0.12f);   // pushed forward (-z) = stick up
             out.twist_on = any && o.twist;
             out.twist    = axis(-g_twist, glm::radians(std::max(5.0f, o.twist_deg)), glm::radians(8.0f) / glm::radians(std::max(5.0f, o.twist_deg)));   // turned right = right
+            // drivestickfine: sent past the game's dead zone.
+            if (o.stick_fine) {
+                const float raw_x = out.sx, raw_y = out.sy, raw_t = out.twist;
+                const float m     = std::sqrt(out.sx * out.sx + out.sy * out.sy);
+                // The hand feels where the stick's centre and end are (nothing holds it back, and the hand drawn rides the game's own stick):
+                // a short buzz when the stick reaches its end, a lighter one when it comes back to its centre.
+                if (any) {
+                    const bool full = m >= 0.999f, centre = m <= 1e-4f;
+                    for (int h = 0; h < 2; ++h) {
+                        if (!g_held[h]) continue;
+                        if (full && !g_st_full) out.buzz[h] = std::max(out.buzz[h], 0.30f);
+                        if (centre && !g_st_centre) out.buzz[h] = std::max(out.buzz[h], 0.12f);
+                    }
+                    g_st_full   = g_st_full ? m > 0.93f : full;
+                    g_st_centre = g_st_centre ? m < 0.08f : centre;
+                } else {
+                    g_st_full   = false;
+                    g_st_centre = true;
+                }
+                if (m > 1e-4f) {
+                    const float gd = std::clamp(o.stick_dead, 0.0f, 0.30f);
+                    const float g  = gd + (1.0f - gd) * std::pow(std::min(1.0f, m), std::clamp(o.stick_curve, 1.0f, 3.0f));
+                    out.sx *= g / m;
+                    out.sy *= g / m;
+                } else {
+                    out.sx = out.sy = 0.0f;
+                }
+                if (!any) {
+                    g_tw_s = 0.0f;
+                } else if (in.veh_type == 4 && o.heli) {
+                    const float t = std::copysign(o.heli_gain * std::pow(std::abs(out.twist), o.heli_curve), out.twist);
+                    const float s = 0.5f * o.heli_smooth;
+                    g_tw_s += (t - g_tw_s) * (s <= 0.0f ? 1.0f : 1.0f - std::exp(-dt / s));
+                    if (std::abs(g_tw_s) < 0.005f && t == 0.0f) g_tw_s = 0.0f;
+                } else {
+                    g_tw_s = out.twist;
+                }
+                const float a = std::abs(g_tw_s);
+                out.twist     = a < 0.005f ? 0.0f : std::copysign(std::min(1.0f, 0.27f + (0.94f - 0.27f) * a), g_tw_s);
+                if (o.log && any && g_fine_lines < 40 && now - g_fine_log_t > std::chrono::seconds(2)) {
+                    g_fine_log_t = now;
+                    g_fine_lines++;
+                    spdlog::info("[Drive] drivestickfine: the hand moved {:+.1f} cm right, {:+.1f} cm forward, turned {:+.0f} deg: the left stick ({:+.2f}, {:+.2f}) "
+                                 "(as before: ({:+.2f}, {:+.2f})), the right stick's X {:+.2f} (as before: {:+.2f}){}",
+                                 g_defl.x * 100.0f, -g_defl.z * 100.0f, glm::degrees(-g_twist), out.sx, out.sy, raw_x, raw_y, out.twist, raw_t,
+                                 in.veh_type == 4 && o.heli ? "; the turn at driveheli's rate and curve" : "");
+                }
+            }
         }
 
         out.log = o.log;
@@ -597,6 +839,12 @@ namespace fc5::drive
             if (len > r) { dd.x *= r / len; dd.z *= r / len; }
             vw.stick_top = T(C + glm::vec3{ dd.x, 0.0f, dd.z });
             vw.base      = T(C + glm::vec3{ 0.0f, -0.28f, 0.0f });
+            // Held, and the vehicle's own stick followed by its bone: drawn on it (it moves with the cabin, and the game leans it with what
+            // the hand sends), not where it was taken plus the hand's move.
+            if (any && o.hand.model && o.hand.grab && o.hands == 1 && g_model.bone && g_model.style == style && now - g_model_t < std::chrono::milliseconds(500)) {
+                vw.stick_top = T(g_model.centre);
+                vw.base      = T(g_model.centre + glm::vec3{ 0.0f, -0.28f, 0.0f });
+            }
             for (int h = 0; h < 2; ++h) {
                 vw.held[h] = g_held[h];
                 vw.in_reach[h] = g_near[h];
@@ -785,6 +1033,17 @@ namespace fc5::drive
         return g_o.ready_away;
     }
 
+    bool trig_test()
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count() < g_trig_test_until.load();
+    }
+
+    bool ready_keep()
+    {
+        std::lock_guard _{ g_mtx };
+        return g_o.ready_keep;
+    }
+
     int gun_throttle()
     {
         std::lock_guard _{ g_mtx };
@@ -808,6 +1067,22 @@ namespace fc5::drive
         std::lock_guard _{ g_mtx };
         g_model   = m;
         g_model_t = clock::now();
+    }
+
+    bool model_show(float& turn)
+    {
+        std::lock_guard _{ g_mtx };
+        if (!g_ms_on || g_style == kNone || clock::now() - g_ms_t > std::chrono::milliseconds(300)) return false;
+        turn = g_ms_turn;
+        return true;
+    }
+
+    void set_shape_hint(int style)
+    {
+        std::lock_guard _{ g_mtx };
+        g_hint     = style;
+        g_hint_t   = clock::now();
+        g_hint_veh = g_veh;
     }
 
     bool model_point(int side, glm::vec3& p)
@@ -928,8 +1203,19 @@ namespace fc5::drive
             o.stick_down = std::clamp(down, -0.2f, 1.0f);
             spdlog::info("[Drive] drivestick {:.3f} {:.3f} (m ahead, m down)", o.stick_fwd, o.stick_down);
         } else if (cmd == "drivestickrange") {
-            o.stick_range = std::clamp(num(0.08f), 0.03f, 0.25f);
+            o.stick_range = std::clamp(num(0.12f), 0.03f, 0.25f);
             spdlog::info("[Drive] drivestickrange {:.3f} m", o.stick_range);
+        } else if (cmd == "drivestickfine") {
+            o.stick_fine = on;
+            spdlog::info("[Drive] drivestickfine {}", on ? "on: the stick's left stick and turn start just past the game's dead zone (the whole of the hand's move counts); in a "
+                                                            "helicopter the hand's turn has driveheli's rate and curve"
+                                                         : "off: the hand's move and turn sent as they are");
+        } else if (cmd == "drivestickdead") {
+            o.stick_dead = std::clamp(num(0.05f), 0.0f, 0.30f);
+            spdlog::info("[Drive] drivestickdead {:.2f} (the left stick starts at this, just past the game's own dead zone)", o.stick_dead);
+        } else if (cmd == "drivestickcurve") {
+            o.stick_curve = std::clamp(num(1.0f), 1.0f, 3.0f);
+            spdlog::info("[Drive] drivestickcurve {:.1f}", o.stick_curve);
         } else if (cmd == "drivetwist") {
             o.twist = on;
             spdlog::info("[Drive] drivetwist {}", on ? "on: turning the hand on the stick turns the aircraft (right stick X)" : "off");
@@ -981,6 +1267,11 @@ namespace fc5::drive
         } else if (cmd == "drivebuttonsdbl") {
             o.dbl_ms = (int)std::clamp(num(350.0f), 150.0f, 800.0f);
             spdlog::info("[Drive] drivebuttonsdbl {} ms", o.dbl_ms);
+        } else if (cmd == "drivetrigtest") {   // test, not saved: drivetrigtest [ms] (default 1500): the right trigger held, as pressed on the controller
+            persist      = false;
+            const int ms = std::clamp(int(num(1500.0f)), 10, 10000);
+            g_trig_test_until = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count() + ms;
+            spdlog::info("[Drive] drivetrigtest: the right trigger held {} ms", ms);
         } else if (cmd == "drivebuttontest") {   // test, not saved: drivebuttontest a|x|xx [ms] (default 2000)
             persist = false;
             std::string ms;
@@ -1015,6 +1306,18 @@ namespace fc5::drive
                 if (arg == k[i] || arg == std::to_string(i)) o.hand.space = i;
             spdlog::info("[Drive] drivehandsspace {}", o.hand.space < 0 ? "auto: driving, the bare arms' palette space found against the arm hair each drive"
                                                                         : fmt::format("{} (test): the bare arms' palette taken as that space while driving", k[o.hand.space]));
+        } else if (cmd == "drivemodelsteer") {
+            o.model_steer = on;
+            g_mt_dead     = false;
+            spdlog::info("[Drive] drivemodelsteer {}", on ? "on: with the vehicle's own wheel or bars followed (vehcontrol), the steering makes it turn as far as the hand turned"
+                                                          : "off: the steering from drivewheellock and drivereactgain, as before");
+        } else if (cmd == "drivemodelshow") {
+            o.model_show = on;
+            spdlog::info("[Drive] drivemodelshow {}", on ? "on: while a hand holds it, the vehicle's own wheel or bars drawn at the hand's angle (the game eases its own behind)"
+                                                         : "off: the vehicle's own wheel where the game turns it");
+        } else if (cmd == "drivewheelratio") {
+            o.wheel_ratio = std::clamp(num(1.0f), 0.5f, 4.0f);
+            spdlog::info("[Drive] drivewheelratio {:.2f}: the vehicle's own wheel turns {:.2f} times the hand's turn (drivemodelsteer)", o.wheel_ratio, o.wheel_ratio);
         } else if (cmd == "drivehandsmodel") {
             o.hand.model = on;
             if (!on) g_cur.on = false;
@@ -1022,6 +1325,10 @@ namespace fc5::drive
                                                             "has turned 30 deg), and a hand that holds it goes where the game moves it (the car's wheel model, "
                                                             "the in-game stick)"
                                                           : "off: a hand that holds the control turns with the drive's own wheel, as before");
+        } else if (cmd == "drivegripfist") {
+            o.hand.fist = on;
+            spdlog::info("[Drive] drivegripfist {}", on ? "on: a hand holding the wheel, bars or stick closes all its fingers round it, index and thumb too, by the grip alone"
+                                                        : "off: a hand holding the wheel, bars or stick closes its fingers by grip and trigger, as on foot");
         } else if (cmd == "drivewheelscan") {   // test, not saved: drivewheelscan S (default 6)
             persist      = false;
             const float t = std::clamp(num(6.0f), 0.0f, 60.0f);
@@ -1033,13 +1340,22 @@ namespace fc5::drive
                                                   : o.ready == 2 ? "lb (test): driving, a right grip away from the wheel taps LB (the game's shoot, which draws the sidearm first)"
                                                                  : "y: driving, a right grip away from the wheel taps Y (the game's change weapon: the sidearm drawn, no shot); the right trigger shoots");
         } else if (cmd == "drivereadyaway") {
-            o.ready_away = std::clamp(num(0.30f), 0.0f, 1.0f);
+            o.ready_away = std::clamp(num(0.18f), 0.0f, 1.0f);
             spdlog::info("[Drive] drivereadyaway {:.2f} m: driveready draws only for a right grip pressed this far from the wheel or bars, and over 1 s after "
                          "that hand let go of them", o.ready_away);
+        } else if (cmd == "drivereadykeep") {
+            o.ready_keep = !(arg == "off" || arg == "0");
+            spdlog::info("[Drive] drivereadykeep {}", o.ready_keep ? "on: a sidearm the right grip drew stays out (drawn again when the game puts it away) until the right "
+                                                                     "hand takes the wheel or bars; right A pushes the left stick meanwhile"
+                                                                   : "off: the sidearm is drawn again only while the right grip stays held, as before");
+        } else if (cmd.rfind("drivekeephold", 0) == 0) {   // drivekeephold on|off (saved), drivekeepholdscan / list / set (tests): FarCry5DsHold.cpp
+            return fc5::dshold::command(cmd, arg, fv, rest, persist);
         } else if (cmd == "drivegunthrottle") {
-            o.gun_throttle = arg == "stick" || arg == "1" ? 1 : 0;
-            spdlog::info("[Drive] drivegunthrottle {}", o.gun_throttle == 1 ? "stick (test): while the sidearm is out, right A pushes the left stick forward instead of RT"
-                                                                             : "off: while the sidearm is out, right A sends nothing (RT would shoot it)");
+            o.gun_throttle = arg == "stick" || arg == "1" ? 1 : arg == "rt" || arg == "2" ? 2 : 0;
+            spdlog::info("[Drive] drivegunthrottle {}", o.gun_throttle == 2   ? "rt (default): while the sidearm is out, right A is still the throttle (RT); if the game ever shoots on it, A "
+                                                                                "stops sending RT with the sidearm out for the rest of that drive"
+                                                        : o.gun_throttle == 1 ? "stick (test): while the sidearm is out, right A pushes the left stick forward instead of RT"
+                                                                              : "off: while the sidearm is out, right A sends nothing (RT would shoot it)");
         } else if (cmd == "drivemenu") {
             o.menu = arg == "off" || arg == "0" ? 0 : arg == "vehicle" || arg == "1" ? 1 : 2;
             spdlog::info("[Drive] drivemenu {}", o.menu == 0 ? "off: the menu button is the pause menu (Start), left grip + menu the map (Back), as before"
@@ -1108,103 +1424,104 @@ namespace fc5::drive
         }
         bool bt = o.buttons;
         if (ImGui::Checkbox("Cars, quads, bikes and boats: A accelerates, X brakes, double X handbrake##drivebuttons", &bt)) cmds += bt ? "drivebuttons on\n" : "drivebuttons off\n";
-        hint("On (default): driving, right A is the throttle, left X brakes and reverses while held, and a quick second press of left X is the handbrake "
-             "(held as long as you hold it). The triggers, grips and right stick no longer accelerate or brake; the right trigger shoots. Right A no longer "
-             "changes seat while you drive. Helicopters and planes: unchanged. Off: as before. Command drivebuttons on/off.");
+        hint("Driving: right A accelerates, left X brakes and reverses, and a quick double X is the handbrake. The right trigger shoots. Aircraft are unchanged.");
         if (bt) {
             int ms = o.dbl_ms;
             if (ImGui::SliderInt("Double press within (ms)##drivebuttonsdbl", &ms, 150, 800)) cmds += fmt::format("drivebuttonsdbl {}\n", ms);
-            hint("The second X press counts as the handbrake when it comes this soon after a short first press. Default 350. Command drivebuttonsdbl ms.");
+            hint("How quickly the second X press must come to count as the handbrake.");
         }
         int mm = o.menu;
         if (ImGui::Combo("Menu button: short press map, long press pause menu##drivemenu", &mm, "Off\0In vehicles\0Everywhere\0")) {
             static const char* k[]{ "off", "vehicle", "all" };
             cmds += fmt::format("drivemenu {}\n", k[std::clamp(mm, 0, 2)]);
         }
-        hint("Everywhere (default): on foot and in any vehicle seat, a short press of the menu button opens the map (when you let go) and holding it opens "
-             "the pause menu (save, load, options); a short press closes that pause menu again. Left grip + menu still opens the map at once. In vehicles: "
-             "only there, on foot as before (menu = pause menu, left grip + menu = map). Off: as before everywhere. Command drivemenu all/vehicle/off.");
+        hint("A short press of the menu button opens the map, a long press opens the pause menu. Choose everywhere, in vehicles only, or off.");
         if (mm != 0) {
             int mh = o.menu_hold;
             if (ImGui::SliderInt("Long press from (ms)##drivemenuhold", &mh, 200, 1500)) cmds += fmt::format("drivemenuhold {}\n", mh);
-            hint("A press held this long opens the pause menu; a shorter one opens the map. Default 500. Command drivemenuhold ms.");
+            hint("How long to hold the menu button to open the pause menu instead of the map.");
         }
         bool hl = o.heli;
         if (ImGui::Checkbox("Helicopter: gentle right stick##driveheli", &hl)) cmds += hl ? "driveheli on\n" : "driveheli off\n";
-        hint("On (default): piloting a helicopter, the right stick turns and pitches more slowly, small pushes do little, and it eases in and out. "
-             "Off: as before. Command driveheli on/off.");
+        hint("In a helicopter the right stick turns more slowly and smoothly.");
         if (hl) {
             float hg = o.heli_gain * 100.0f;
             if (ImGui::SliderFloat("Right stick at full push (% of the game's)##driveheligain", &hg, 5.0f, 100.0f, "%.0f")) cmds += fmt::format("driveheligain {:.2f}\n", hg * 0.01f);
-            hint("Default 40 %. Lower: slower turns. Command driveheligain 0.05-1.");
+            hint("How fast the helicopter turns with the stick pushed all the way. Lower: slower.");
             float hc = o.heli_curve;
             if (ImGui::SliderFloat("Curve##drivehelicurve", &hc, 1.0f, 4.0f, "%.1f")) cmds += fmt::format("drivehelicurve {:.1f}\n", hc);
-            hint("Default 2: half a push gives a quarter of the rate. 1: straight. Higher: even gentler near the centre. Command drivehelicurve 1-4.");
+            hint("Higher: small stick pushes do less. 1: straight.");
             float hs = o.heli_smooth;
             if (ImGui::SliderFloat("Smoothing (s)##drivehelismooth", &hs, 0.0f, 1.5f, "%.2f")) cmds += fmt::format("drivehelismooth {:.2f}\n", hs);
-            hint("Default 0.30 s: how long the stick takes to ease in and out. 0: none. Command drivehelismooth s.");
+            hint("How long the stick takes to ease in and out. 0: none.");
         }
         bool ps = o.plane_stick;
         if (ImGui::Checkbox("Planes: the right stick moves the camera##driveplanestick", &ps)) cmds += ps ? "driveplanestick on\n" : "driveplanestick off\n";
-        hint("Off (default): in a plane the right stick (and turning the hand on the gesture stick) sends nothing to the game, so it never moves the camera. "
-             "Helicopters keep the right stick. Command driveplanestick on/off.");
+        hint("In a plane, the right stick moves the camera. Off: it does nothing.");
         int rd = o.ready;
         if (ImGui::Combo("Right grip while driving##driveready", &rd, "Nothing\0Readies the sidearm (change weapon)\0Readies the sidearm (shoot button, test)\0")) {
             static const char* k[]{ "off", "y", "lb" };
             cmds += fmt::format("driveready {}\n", k[std::clamp(rd, 0, 2)]);
         }
-        hint("Readies the sidearm (default): in a car, quad, bike or boat, pressing the right grip away from the wheel draws the sidearm (the game's change "
-             "weapon), and keeps it out while you hold the grip; the right trigger then shoots at once. A grip at the wheel still holds the wheel (gesture "
-             "driving). The shoot-button choice (test) presses the game's shoot instead, which may fire once. Nothing: as before. Command driveready y/lb/off.");
+        hint("Driving, a right grip away from the wheel draws your sidearm so you can shoot.");
         if (rd != 0) {
             float ra = o.ready_away * 100.0f;
             if (ImGui::SliderFloat("Right grip draws only this far from the wheel (cm)##drivereadyaway", &ra, 0.0f, 80.0f, "%.0f"))
                 cmds += fmt::format("drivereadyaway {:.2f}\n", ra * 0.01f);
-            hint("30 (default): a right grip that misses the wheel or handlebars by less than this, or comes within 1 s of letting go of them, does "
-                 "nothing, so grabbing at the wheel never brings the gun out. 0: any grip that does not hold the wheel draws (as before). Command drivereadyaway m.");
+            hint("A grip closer than this to the wheel does not draw the sidearm, so grabbing the wheel never brings the gun out.");
+            bool rk = o.ready_keep;
+            if (ImGui::Checkbox("The sidearm stays out until the right hand takes the wheel##drivereadykeep", &rk)) cmds += rk ? "drivereadykeep on\n" : "drivereadykeep off\n";
+            hint("Once drawn, the sidearm stays out until your right hand takes the wheel again.");
+            if (rk) {
+                bool kh = fc5::dshold::on();
+                if (ImGui::Checkbox("Hold off the game's own put-away (no re-draw)##drivekeephold", &kh)) cmds += kh ? "drivekeephold on\n" : "drivekeephold off\n";
+                hint("Stops the game from putting the sidearm away on its own while you keep it out.");
+            }
         }
         int gt = o.gun_throttle;
-        if (ImGui::Combo("A while the sidearm is out##drivegunthrottle", &gt, "Nothing (never shoots)\0Pushes the left stick (test)\0"))
-            cmds += gt == 1 ? "drivegunthrottle stick\n" : "drivegunthrottle off\n";
-        hint("While the game has the sidearm out in a car, quad, bike or boat, its throttle trigger shoots, so A no longer sends it then (nor for 1.5 s after "
-             "the sidearm goes away, when the trigger can draw it again). Nothing (default): the vehicle rolls on until the sidearm is put away. Left "
-             "stick (test): A pushes the left stick forward instead, the game's own throttle while shooting from a vehicle. Command drivegunthrottle off/stick.");
+        if (ImGui::Combo("A while the sidearm is out##drivegunthrottle", &gt, "Nothing (the vehicle rolls)\0Pushes the left stick (test)\0Still drives (default)\0"))
+            cmds += gt == 2 ? "drivegunthrottle rt\n" : gt == 1 ? "drivegunthrottle stick\n" : "drivegunthrottle off\n";
+        hint("What right A does while the sidearm is out: still accelerates, or does nothing.");
         int hm = o.hands;
         if (ImGui::Combo("Hands while driving##drivehands", &hm, "Hidden\0The game's hands on the wheel or stick\0The whole body (test)\0")) {
             static const char* k[]{ "off", "hands", "all" };
             cmds += fmt::format("drivehands {}\n", k[std::clamp(hm, 0, 2)]);
         }
-        hint("The game's hands (default): in the driver's or pilot's seat the hands the game animates on the wheel, handlebars or stick are drawn, the rest "
-             "of your body stays hidden. The whole body: everything the game draws of you (to compare). Hidden: as before. Command drivehands hands/all/off.");
+        hint("Which hands are drawn while driving: the game's hands on the wheel, your whole body, or none.");
         if (hm != 1) return;
         bool dd = o.hand.direct;
         if (ImGui::Checkbox("Always draw the bare arms (test)##drivehandsdirect", &dd)) cmds += dd ? "drivehandsdirect on\n" : "drivehandsdirect off\n";
-        hint("Off (default): the skin of the arms and hands is drawn as the game asks. On: in the driver's seat it is drawn once whatever the game's own "
-             "culling decided. Turn it on only if the hands show as arm hair alone. Command drivehandsdirect on/off.");
+        hint("For testing: always draws the bare arms while driving. Use it only if the hands show as just arm hair.");
         bool ot = o.hand.ontop;
         if (ImGui::Checkbox("Draw the bare arms over everything (test)##drivehandsontop", &ot)) cmds += ot ? "drivehandsontop on\n" : "drivehandsontop off\n";
-        hint("Off (default). On: in the driver's seat the skin of your hands is drawn in front of everything, even what should hide it. A test: if your "
-             "hands show only with it on, something in front of them covers them. Command drivehandsontop on/off.");
+        hint("For testing: draws your hands in front of everything while driving.");
         int sp = o.hand.space + 1;
         if (ImGui::Combo("Where the bare arms are drawn from##drivehandsspace", &sp, "Found each drive\0Their own object transform (test)\0The arm hair's transform (test)\0World (test)\0World less the camera (test)\0The camera's view (test)\0")) {
             static const char* k[]{ "auto", "object", "hair", "world", "camera", "view" };
             cmds += fmt::format("drivehandsspace {}\n", k[std::clamp(sp, 0, 5)]);
         }
-        hint("Found each drive (default): when you sit in, your hand's skin is set against the arm hair the game draws over it, and the way that puts "
-             "it on the hair is used to place the hands on the controllers (the hands appear a moment after you sit). The others force one way, to "
-             "compare. Command drivehandsspace auto/object/hair/world/camera/view.");
+        hint("How the bare arms are placed while driving. Leave on automatic; the others are for testing.");
         bool hg = o.hand.grab;
         if (ImGui::Checkbox("Your VR hands, stuck to the wheel when you grip it##drivehandsgrab", &hg)) cmds += hg ? "drivehandsgrab on\n" : "drivehandsgrab off\n";
-        hint("On (default): driving, your hands follow the controllers as on foot (grip and trigger close the fingers). With gesture driving on (F11 "
-             "Experimental), a hand whose grip holds the wheel, handlebars or stick sticks to it and turns with it until you let go. Off: the game's own hands, "
-             "where the game animates them. Command drivehandsgrab on/off.");
+        hint("Driving, your hands follow the controllers, and a hand that grips the wheel sticks to it. Off: the game's own hands.");
         if (!hg) return;
         bool mdl = o.hand.model;
         if (ImGui::Checkbox("Hands glued to the vehicle's own wheel and stick##drivehandsmodel", &mdl)) cmds += mdl ? "drivehandsmodel on\n" : "drivehandsmodel off\n";
-        hint("On (default): gesture driving's wheel, handlebars or stick is placed on the vehicle's own (found from where the game holds it), and a hand "
-             "that grips it stays on the car's wheel model as the game turns it, even in sharp turns, or on the helicopter's own stick as it moves. "
-             "The car's wheel is found the first time it turns (30 deg or more); until then the hand turns with the drive's own wheel. "
-             "Off: the hand turns with the drive's own wheel. Command drivehandsmodel on/off.");
+        hint("Your hands stay on the vehicle's own wheel or stick as it turns.");
+        bool gf = o.hand.fist;
+        if (ImGui::Checkbox("Whole hand closes on the wheel with the grip##drivegripfist", &gf)) cmds += gf ? "drivegripfist on\n" : "drivegripfist off\n";
+        hint("Gripping the wheel closes your whole hand on it.");
+        bool ms = o.model_steer;
+        if (ImGui::Checkbox("Steering follows the vehicle's own wheel (hand and wheel turn together)##drivemodelsteer", &ms)) cmds += ms ? "drivemodelsteer on\n" : "drivemodelsteer off\n";
+        hint("Turning your hand turns the car's wheel by the same angle, so your hand and the wheel move together.");
+        if (ms) {
+            bool sh = o.model_show;
+            if (ImGui::Checkbox("The car's wheel turns with your hand at once##drivemodelshow", &sh)) cmds += sh ? "drivemodelshow on\n" : "drivemodelshow off\n";
+            hint("The car's wheel turns with your hand straight away, instead of lagging behind.");
+            float wr = o.wheel_ratio;
+            if (ImGui::SliderFloat("Wheel turn per hand turn (x)##drivewheelratio", &wr, 0.5f, 4.0f, "%.2f")) cmds += fmt::format("drivewheelratio {:.2f}\n", wr);
+            hint("How far the car's wheel turns per hand turn. 2: twice as far, for quicker steering.");
+        }
         if (ImGui::TreeNode("Fit the hands to the controllers##drivehandfit")) {
             float t[3]{ o.hand.turn.x, o.hand.turn.y, o.hand.turn.z };
             bool  moved = false;
@@ -1212,15 +1529,14 @@ namespace fc5::drive
             moved |= ImGui::SliderFloat("Yaw (deg)##dhty", &t[1], -180.0f, 180.0f, "%.0f");
             moved |= ImGui::SliderFloat("Roll (deg)##dhtr", &t[2], -180.0f, 180.0f, "%.0f");
             if (moved) cmds += fmt::format("drivehandturn {:.0f} {:.0f} {:.0f}\n", t[0], t[1], t[2]);
-            hint("Turns the free hands in the controller's axes (the left hand's yaw and roll mirrored). Default 0 0 0. Command drivehandturn pitch yaw roll.");
+            hint("Turns the hands while driving.");
             float d[3]{ o.hand.shift.x * 100.0f, o.hand.shift.y * 100.0f, o.hand.shift.z * 100.0f };
             moved = false;
             moved |= ImGui::SliderFloat("Right (cm)##dhsx", &d[0], -30.0f, 30.0f, "%.0f");
             moved |= ImGui::SliderFloat("Up (cm)##dhsy", &d[1], -30.0f, 30.0f, "%.0f");
             moved |= ImGui::SliderFloat("Back (cm)##dhsz", &d[2], -30.0f, 30.0f, "%.0f");
             if (moved) cmds += fmt::format("drivehandshift {:.3f} {:.3f} {:.3f}\n", d[0] * 0.01f, d[1] * 0.01f, d[2] * 0.01f);
-            hint("Moves the free hands from the controllers (the left hand's right / left mirrored). With the sidearm drawn the right hand sits where the game "
-                 "holds it on the sidearm instead. Default 0 0 0. Command drivehandshift x y z (m).");
+            hint("Moves the hands while driving.");
             ImGui::TreePop();
         }
     }
@@ -1236,10 +1552,7 @@ namespace fc5::drive
         }
         bool v = o.on;
         if (ImGui::Checkbox("Drive with your hands (wheel, handlebars, stick)##drive", &v)) cmds += v ? "drive on\n" : "drive off\n";
-        hint("While driving, grab the wheel (cars, trucks, boats), the handlebars (quads, jetskis) or the stick (helicopters, planes) with a grip and turn it. "
-             "Either hand alone steers; both together share. A hand holds until you let go of its grip. The left trigger is the throttle; the right "
-             "trigger shoots while the right hand is off the wheel, and brakes / reverses while it holds it (cars, quads, bikes and boats with \"A accelerates, X "
-             "brakes\" on, F11 Layout > Vehicles: A and X instead, and the right trigger does nothing while it holds the wheel). The left stick still steers too. Command drive on/off.");
+        hint("Grab the wheel, handlebars or stick with a grip and turn it to steer. The left trigger accelerates.");
         if (!v) return;
         ImGui::TextWrapped("%s", status().c_str());
         int st = force < 0 ? 0 : force == kWheel ? 1 : force == kBars ? 2 : force == kStick ? 3 : 4;
@@ -1247,52 +1560,44 @@ namespace fc5::drive
             static const char* k[]{ "auto", "wheel", "bars", "stick", "off" };
             cmds += fmt::format("drivestyle {}\n", k[st]);
         }
-        hint("Automatic: helicopters and planes get the stick, motorcycles, quads and (spawned from F11) jetskis the handlebars, the rest the wheel. "
-             "A choice here lasts until you leave the vehicle. Command drivestyle auto/wheel/bars/stick/off.");
+        hint("Choose wheel, handlebars or stick for this vehicle. Automatic picks by vehicle type.");
         float qs = o.quad_seat * 100.0f;
         if (ImGui::SliderFloat("Quads: handlebars when you sit this near the middle (cm)##drivequadseat", &qs, 0.0f, 35.0f, "%.0f")) cmds += fmt::format("drivequadseat {:.2f}\n", qs * 0.01f);
-        hint("The game calls a quad a car. A quad's driver sits on its middle line, a car's about 40 cm to the side, so a vehicle where you sit within "
-             "this of the middle gets the handlebars. Default 15 cm. 0: off (the wheel, as before). Command drivequadseat m.");
+        hint("Sitting this close to the middle of the vehicle gives handlebars (quads). 0: off.");
         bool sh = o.show;
         if (ImGui::Checkbox("Show the wheel / handlebars / stick##driveshow", &sh)) cmds += sh ? "driveshow on\n" : "driveshow off\n";
-        hint("Drawn faintly where you can grab it; brighter where a hand is near or holds it. Command driveshow on/off.");
+        hint("Shows the wheel, handlebars or stick faintly where you can grab it.");
         bool rb = o.right_brake;
         if (ImGui::Checkbox("Right hand on the wheel: its trigger brakes##driverightbrake", &rb)) cmds += rb ? "driverightbrake on\n" : "driverightbrake off\n";
-        hint("On: while the right hand holds the wheel or handlebars, its trigger brakes and reverses; off the wheel it shoots. Off: it always shoots. Command driverightbrake on/off.");
+        hint("With your right hand on the wheel, its trigger brakes and reverses. Off: it always shoots.");
 
         bool re = o.react;
         if (ImGui::Checkbox("Very reactive wheel##drivereact", &re)) cmds += re ? "drivereact on\n" : "drivereact off\n";
-        hint("On (default): the car follows the wheel closely. Half the turn gives full steering, and the smallest turn already steers (the game's own dead "
-             "zone on the stick is skipped). The handlebars get the dead zone part only. Off: as before 6 Nov. Command drivereact on/off.");
+        hint("The car follows the wheel closely: half a turn gives full steering, and the smallest turn already steers.");
         if (re) {
             float rg = o.react_gain;
             if (ImGui::SliderFloat("Steering per wheel turn (x)##drivereactgain", &rg, 1.0f, 4.0f, "%.1f")) cmds += fmt::format("drivereactgain {:.2f}\n", rg);
-            hint("2 (default): full steering at half the wheel's lock (45 deg). Higher: even less turn needed. Command drivereactgain x.");
+            hint("How much steering you get per wheel turn. Higher: less turning needed.");
             bool sc = o.steer_curve >= 1.0f;
             if (ImGui::Checkbox("Car turns in proportion to the wheel##drivesteercurveon", &sc)) cmds += sc ? "drivesteercurve 1.7\n" : "drivesteercurve off\n";
-            hint("On (default, 8 Nov): the game turns the car very little for a small or medium stick and a lot near full, so small wheel turns did "
-                 "almost nothing. This undoes that: a tenth of the wheel's turn turns the car a tenth as fast as full lock. Off: as before. Command drivesteercurve 1.7|off.");
+            hint("Small wheel turns turn the car a little, large ones a lot, in proportion. Off: small turns do almost nothing.");
             if (sc) {
                 float pc = o.steer_curve;
                 if (ImGui::SliderFloat("Game's curve undone##drivesteercurve", &pc, 1.0f, 3.0f, "%.2f")) cmds += fmt::format("drivesteercurve {:.2f}\n", pc);
-                hint("1.7 (default, measured): higher makes small wheel turns stronger; if the car is twitchy near straight, lower it; 1: linear past the "
-                     "game's dead zone. Command drivesteercurve value.");
+                hint("Higher: small wheel turns steer more. Lower it if the car is twitchy near straight.");
             }
             float rd = o.react_dead;
             if (ImGui::SliderFloat("Game dead zone skipped##drivereactdead", &rd, 0.0f, 0.45f, "%.2f")) cmds += fmt::format("drivereactdead {:.2f}\n", rd);
-            hint("Default 0.20. If the car twitches when you barely touch the wheel, lower it; if small turns do nothing, raise it. Command drivereactdead value.");
+            hint("Lower it if the car twitches when you barely touch the wheel; raise it if small turns do nothing.");
             float rl = o.react_lead * 1000.0f;
             if (ImGui::SliderFloat("Lead (ms, test)##drivereactlead", &rl, 0.0f, 150.0f, "%.0f")) cmds += fmt::format("drivereactlead {:.3f}\n", rl * 0.001f);
-            hint("0 (default): none. A little (30-60 ms) makes the car start turning sooner as you turn the wheel; too much makes it nervous. Command drivereactlead s.");
+            hint("Makes the car start turning a little sooner. Too much makes it nervous. 0: none.");
             float rb2 = o.react_boost;
             if (ImGui::SliderFloat("Steering boost##drivereactboost", &rb2, 0.0f, 4.0f, "%.1f")) cmds += fmt::format("drivereactboost {:.2f}\n", rb2);
-            hint("1.5 (default): the game turns its wheels slowly towards what you steer; this pushes them past it while they catch up, so the car answers "
-                 "the wheel sooner (and straightens sooner when you let go). Higher: quicker; if the car overshoots or wobbles, lower it. 0: off (as before "
-                 "7 Nov). Command drivereactboost x.");
+            hint("Makes the car answer the wheel sooner. Lower it if the car overshoots or wobbles. 0: off.");
             float rt2 = o.react_tau * 1000.0f;
             if (ImGui::SliderFloat("Boost: the game's steering delay (ms)##drivereacttau", &rt2, 50.0f, 800.0f, "%.0f")) cmds += fmt::format("drivereacttau {:.3f}\n", rt2 * 0.001f);
-            hint("250 (default): how slowly the boost takes the game's own steering to follow. Longer: a stronger, longer push; shorter: a lighter one. "
-                 "Command drivereacttau s.");
+            hint("How long the steering boost lasts. Longer: a stronger push.");
         }
         if (ImGui::TreeNode("Wheel##drivewheelnode")) {
             float p[4]{ o.wheel_fwd * 100.0f, o.wheel_down * 100.0f, o.wheel_r * 100.0f, o.wheel_tilt };
@@ -1302,10 +1607,10 @@ namespace fc5::drive
             moved |= ImGui::SliderFloat("Radius (cm)##dwr", &p[2], 8.0f, 35.0f, "%.0f");
             moved |= ImGui::SliderFloat("Tilt (deg)##dwt", &p[3], -30.0f, 80.0f, "%.0f");
             if (moved) cmds += fmt::format("drivewheel {:.3f} {:.3f} {:.3f} {:.0f}\n", p[0] * 0.01f, p[1] * 0.01f, p[2] * 0.01f, p[3]);
-            hint("From the recentred head (sit straight and recentre in the vehicle). Default 38 cm ahead, 32 cm down, radius 18 cm, tilted 25 deg. Command drivewheel ahead down radius tilt (m, deg).");
+            hint("Where the wheel sits in front of you, and its size and tilt. Sit straight and recentre first.");
             float lk = o.wheel_lock;
             if (ImGui::SliderFloat("Turn for full lock (deg)##dwl", &lk, 20.0f, 360.0f, "%.0f")) cmds += fmt::format("drivewheellock {:.0f}\n", lk);
-            hint("How far the wheel turns for the game's full steering. Default 90. Command drivewheellock deg.");
+            hint("How far you turn the wheel for full steering.");
             ImGui::TreePop();
         }
         if (ImGui::TreeNode("Handlebars##drivebarsnode")) {
@@ -1315,10 +1620,10 @@ namespace fc5::drive
             moved |= ImGui::SliderFloat("Below the eyes (cm)##dbd", &p[1], -20.0f, 90.0f, "%.0f");
             moved |= ImGui::SliderFloat("Half width (cm)##dbw", &p[2], 10.0f, 45.0f, "%.0f");
             if (moved) cmds += fmt::format("drivebars {:.3f} {:.3f} {:.3f}\n", p[0] * 0.01f, p[1] * 0.01f, p[2] * 0.01f);
-            hint("Default 42 cm ahead, 45 cm down, grips 28 cm each side. Command drivebars ahead down halfwidth (m).");
+            hint("Where the handlebars sit and how wide they are.");
             float lk = o.bars_lock;
             if (ImGui::SliderFloat("Turn for full lock (deg)##dbl", &lk, 10.0f, 90.0f, "%.0f")) cmds += fmt::format("drivebarslock {:.0f}\n", lk);
-            hint("Default 30. Command drivebarslock deg.");
+            hint("How far you turn the handlebars for full steering.");
             ImGui::TreePop();
         }
         if (ImGui::TreeNode("Stick (helicopter, plane)##drivesticknode")) {
@@ -1327,22 +1632,33 @@ namespace fc5::drive
             moved |= ImGui::SliderFloat("Ahead of the eyes (cm)##dsf", &p[0], 5.0f, 90.0f, "%.0f");
             moved |= ImGui::SliderFloat("Below the eyes (cm)##dsd", &p[1], -20.0f, 100.0f, "%.0f");
             if (moved) cmds += fmt::format("drivestick {:.3f} {:.3f}\n", p[0] * 0.01f, p[1] * 0.01f);
-            hint("Where the stick's top is. Default 30 cm ahead, 50 cm down. Command drivestick ahead down (m).");
+            hint("Where the top of the flight stick sits.");
             float rg = o.stick_range * 100.0f;
             if (ImGui::SliderFloat("Hand move for full stick (cm)##dsr", &rg, 3.0f, 25.0f, "%.0f")) cmds += fmt::format("drivestickrange {:.3f}\n", rg * 0.01f);
-            hint("Measured from where you took the stick: forward / back and left / right are the left stick. Default 8 cm. Command drivestickrange m.");
+            hint("How far you move your hand for full stick.");
+            bool sf = o.stick_fine;
+            if (ImGui::Checkbox("Precise stick: the whole of the hand's move counts##drivestickfine", &sf)) cmds += sf ? "drivestickfine on\n" : "drivestickfine off\n";
+            hint("The aircraft answers from the first small stick move, and the hand buzzes at the stick's end and centre.");
+            if (sf) {
+                float sc = o.stick_curve;
+                if (ImGui::SliderFloat("Stick curve##drivestickcurve", &sc, 1.0f, 3.0f, "%.1f")) cmds += fmt::format("drivestickcurve {:.1f}\n", sc);
+                float sdz = o.stick_dead;
+                if (ImGui::SliderFloat("Stick start##drivestickdead", &sdz, 0.0f, 0.30f, "%.2f")) cmds += fmt::format("drivestickdead {:.2f}\n", sdz);
+                hint("Raise it if the aircraft ignores the first small move; lower it if it starts with a jump.");
+                hint("1: in proportion to your hand. Higher: finer near the centre.");
+            }
             bool tw = o.twist;
             if (ImGui::Checkbox("Turn the hand to turn the aircraft##drivetwist", &tw)) cmds += tw ? "drivetwist on\n" : "drivetwist off\n";
-            hint("Turning the hand about the vertical while holding the stick is the right stick's left / right (helicopter turn). Command drivetwist on/off.");
+            hint("Twisting your hand on the stick turns the aircraft left and right.");
             float td = o.twist_deg;
             if (ImGui::SliderFloat("Hand turn for full (deg)##dstd", &td, 10.0f, 120.0f, "%.0f")) cmds += fmt::format("drivetwistdeg {:.0f}\n", td);
             ImGui::TreePop();
         }
         float g = o.grab * 100.0f;
         if (ImGui::SliderFloat("Reach to grab (cm)##drivegrab", &g, 3.0f, 30.0f, "%.0f")) cmds += fmt::format("drivegrab {:.3f}\n", g * 0.01f);
-        hint("A grip pressed this close to the wheel's rim, the handlebars or the stick's top takes it. Default 10 cm. Command drivegrab m.");
+        hint("How close your hand must be to the wheel, handlebars or stick to grab it.");
         float c = o.centre_s;
         if (ImGui::SliderFloat("Back to straight when let go (s)##drivecentre", &c, 0.0f, 3.0f, "%.2f")) cmds += fmt::format("drivecentre {:.2f}\n", c);
-        hint("0: at once. Default 0.3 s. Command drivecentre s.");
+        hint("How quickly the wheel goes back to straight when you let go. 0: at once.");
     }
 }

@@ -139,6 +139,8 @@ private:
         std::vector<SwapchainContext> contexts{};
         std::recursive_mutex mtx{};
         std::array<uint32_t, 2> last_resolution{};
+        // Far Cry 5: images given to each eye swapchain since the last xrEndFrame (one per headset frame; see copy()).
+        std::array<uint32_t, 2> fc5_eye_images{};
     } m_openxr;
 
     bool setup();
