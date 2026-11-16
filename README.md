@@ -2,11 +2,11 @@
 
 An unofficial mod that turns Far Cry 5 into a full VR game: true stereo 3D through OpenXR, a weapon that sits in
 your hand and shoots where the barrel points, reloading by hand for every kind of weapon, a bow you draw with your
-own hands, an optional full body, body gestures to switch, sling and holster weapons and to throw grenades, your
+own hands, a full body (on by default), body gestures to switch, sling and holster weapons and to throw grenades, your
 hands on the real steering wheel, a HUD that floats in front of you, and comfort options for driving, flying and
 cutscenes.
 
-**[Download version 1.0](https://github.com/Homflattovr/FarcryVVR_Release/releases/latest)** (the `FC5VR_v1.0.zip` file)
+**[Download version 1.0.1](https://github.com/Homflattovr/FarcryVVR_Release/releases/latest)** (the `FC5VR_v1.0.1.zip` file)
 
 **Support this project**: https://ko-fi.com/homard47885
 
@@ -196,7 +196,7 @@ can also set them in the game's Options:
 - **The weapon is in your hand.** Shots leave along the barrel, through the centre of the red dot, scope or iron
   sights. Two-handed hold, recoil (on by default, tunable), gunstock calibration for controllers or a physical
   gunstock, weapon smoothing, magnified scopes with stepped zoom, red dot and laser modes, haptics on every shot.
-- **Full body** (F11 > Main > You see: Full body and arms): your body, arms and legs drawn under you, with a T-pose
+- **Full body** (on by default; F11 > Main > You see: Hands only or Full body and arms): your body, arms and legs drawn under you, with a T-pose
   calibration popup to fit your arm length and height, the body seated in vehicles, and your sling, holster and
   pouch worn on the drawn body. Hands only is the other choice.
 - **Hand models** whose fingers close round what they hold: the gun, a magazine, the bow string, the steering wheel.

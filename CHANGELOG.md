@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1 (16 November 2026): hotfix
+Full notes: [release/RELEASE_NOTES_v1.0.1.md](release/RELEASE_NOTES_v1.0.1.md).
+- **Changed:** the F11 test section is gone; foveated DLSS moved to F11 > Experimental (still off by default).
+- **New defaults** (the author's settings): full body on, realistic red dot, tracers from the barrel, gesture driving,
+  room scale, melee hits, mounted guns aimed with the head, 3072 sun shadows with contact shadows, HUD placement, F11 at
+  the Debug level, and learnt data for more weapons. Delete `fc5vr_settings.txt` in `bin` to get them.
+
 ## 1.0 (16 November 2026): first full release
 Full notes: [release/RELEASE_NOTES_v1.0.md](release/RELEASE_NOTES_v1.0.md).
 - **New:** full body and arms option with calibration, hands on the vehicle's own wheel, handlebars or stick, vehicle

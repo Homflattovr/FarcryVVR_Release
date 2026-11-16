@@ -23173,28 +23173,7 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
                     save_settings();
                 }
                 hint("Preset K (default) keeps the ground sharp.");
-                {
-                    // dlssfovea (foveated DLSS thread, 12 Nov)
-                    static const float kFvPct[7]{ 0.0f, 85.0f, 80.0f, 75.0f, 70.0f, 60.0f, 50.0f };
-                    const float        fd = fc5::dlss::fovea();
-                    int                fi = 0;
-                    if (fd > 0.0f) {   // the nearest entry (a command can set any share)
-                        fi = 1;
-                        for (int i = 2; i < 7; ++i)
-                            if (std::abs(fd - kFvPct[i]) < std::abs(fd - kFvPct[fi])) fi = i;
-                    }
-                    if (combo("DLSS on the centre only (test)", &fi, "Off (DLSS on the whole image)\0Centre 85% of the view\0Centre 80% of the view\0Centre 75% of the view\0Centre 70% of the view\0Centre 60% of the view\0Centre 50% of the view\0")) {
-                        fc5::dlss::set_fovea(kFvPct[fi]);
-                        m_persist["dlssfovea"] = fi == 0 ? std::string("dlssfovea off") : fmt::format("dlssfovea {:.0f}", kFvPct[fi]);
-                        save_settings();
-                        spdlog::info("[DLSS] F11: dlssfovea {}", fi == 0 ? std::string("off") : fmt::format("{:.0f}", kFvPct[fi]));
-                    }
-                    hint(fmt::format("Foveated DLSS: DLSS works only on the middle of the view, one binocular-shaped area at the same place for both eyes, and a "
-                                     "lighter anti-aliasing of the mod's own covers the outer part, blended in gradually. Saves GPU time; the edges of the view are a "
-                                     "little softer. A smaller centre saves a little more. The centre's DLSS level is the DLSS render scale above. Now: {}.",
-                                     fc5::dlss::fovea_status()).c_str());
-                    // Fix 5: no "Outer area level" any more (13 Nov: lower levels cost as much as native and blurred the view; dlssfoveaouter is a test)
-                }
+                // Foveated DLSS (dlssfovea): in F11 Experimental since hotfix 1.0.1 (author 16 Nov 22:07Z).
                 int               step  = (int)std::lround(m_res_scale.load() * 10.0f);
                 const std::string label = fmt::format("x{:.1f}", step / 10.0f);
                 if (slider_int("Resolution multiplier", step, 10, 20, label.c_str(), 1)) {
@@ -24772,6 +24751,36 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
     // Removed in the 19 Oct switch audit (author): afwobjmv (AFW), xrrate, gunsteady and aimsquare (Fixes under test).
     // "Fixes under test": its last switch, "No black blink when this menu opens or closes" (f11layer keep), was removed (author 24 Oct:
     // the blink is gone without it).
+    // Experimental, again (hotfix 1.0.1, author 16 Nov 22:07Z): foveated DLSS (dlssfovea), moved
+    // from Display > Rendering, shown at every settings level. Same command, saved line and default (off). menutab 10 opens it (it was Tests).
+    if (ImGui::BeginTabItem("Experimental", nullptr, tab_flag(10))) {
+        tab_body_begin();
+        ImGui::TextWrapped("Experimental features: they may change, cost more than they save, or look wrong in places.");
+        if (ImGui::CollapsingHeader("Foveated DLSS (experimental)", ImGuiTreeNodeFlags_DefaultOpen)) {
+            // dlssfovea (foveated DLSS thread, 12 Nov)
+            static const float kFvPct[7]{ 0.0f, 85.0f, 80.0f, 75.0f, 70.0f, 60.0f, 50.0f };
+            const float        fd = fc5::dlss::fovea();
+            int                fi = 0;
+            if (fd > 0.0f) {   // the nearest entry (a command can set any share)
+                fi = 1;
+                for (int i = 2; i < 7; ++i)
+                    if (std::abs(fd - kFvPct[i]) < std::abs(fd - kFvPct[fi])) fi = i;
+            }
+            if (combo("DLSS on the centre only", &fi, "Off (DLSS on the whole image)\0Centre 85% of the view\0Centre 80% of the view\0Centre 75% of the view\0Centre 70% of the view\0Centre 60% of the view\0Centre 50% of the view\0")) {
+                fc5::dlss::set_fovea(kFvPct[fi]);
+                m_persist["dlssfovea"] = fi == 0 ? std::string("dlssfovea off") : fmt::format("dlssfovea {:.0f}", kFvPct[fi]);
+                save_settings();
+                spdlog::info("[DLSS] F11: dlssfovea {}", fi == 0 ? std::string("off") : fmt::format("{:.0f}", kFvPct[fi]));
+            }
+            hint(fmt::format("Experimental. Foveated DLSS: DLSS works only on the middle of the view, one binocular-shaped area at the same place for both eyes, and a "
+                             "lighter anti-aliasing of the mod's own covers the outer part, blended in gradually. Saves GPU time; the edges of the view are a "
+                             "little softer. A smaller centre saves a little more. The centre's DLSS level is Display > Rendering > DLSS render scale. Now: {}.",
+                             fc5::dlss::fovea_status()).c_str());
+            // Fix 5: no "Outer area level" any more (13 Nov: lower levels cost as much as native and blurred the view; dlssfoveaouter is a test)
+        }
+        ImGui::EndChild();
+        ImGui::EndTabItem();
+    }
 
     if (level >= 2 && ImGui::BeginTabItem("Debug", nullptr, tab_flag(5))) {
         tab_body_begin();
@@ -25773,84 +25782,10 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
         ImGui::EndTabItem();
     }
     // The "Tests" tab (HEADSET_QUEUE's open checks with Pass / Fail / Unsure) was removed (author 30 Oct); HEADSET_QUEUE.md keeps the list.
-    // Tests tab, again (author 14 Nov 19:52Z): the switches checked in the
-    // headset now, shown at every settings level. Not saved: a restart puts them back as they were.
-    if (ImGui::BeginTabItem("Tests", nullptr, tab_flag(10))) {
-        tab_body_begin();
-        ImGui::TextWrapped("Far trees moving with the head: look at the forest, turn one switch off, see if the trees change, then turn it "
-                           "back on before the next. These are not saved: a restart puts them back as they were.");
-        v = fc5::cullhead::is_on();
-        if (ImGui::Checkbox("Culling camera follows the headset (cullhead)", &v)) {
-            fc5::cullhead::command("cullhead", v ? "on" : "off");
-            fc5::cullhead::apply_mode();
-        }
-        hint("The game decides what to draw from the headset's view. Command cullhead.");
-        v = m_upright_billboards.load();
-        if (ImGui::Checkbox("Far tree cards stay upright (upright)", &v)) m_upright_billboards = v;
-        hint("Flat far trees, grass and particles stay upright when you tilt your head. Command upright.");
-        v = m_impostor_up.load();
-        if (ImGui::Checkbox("Horizon tree line stays upright (impostorup)", &v)) m_impostor_up = v;
-        hint("The far tree line on the horizon stays upright when you tilt your head. Command impostorup.");
-        if (ImGui::Button("Log 30 horizon tree draws")) m_impostor_up_log = 30;
-        hint("For testing: logs the next 30 horizon tree draws. Move your head over the forest while it runs.");
-        v = m_cull_heads.load();
-        if (ImGui::Checkbox("Culling covers both eyes (terrain, grass, far trees)", &v)) m_cull_heads = v;
-        hint("The same switch as in Debug.");
-        v = m_afw_foliage.load();
-        if (ImGui::Checkbox("AFW: trees and grass steady (afwfoliage)", &v)) m_afw_foliage = v;
-        hint("AFW only. The same switch as in Debug.");
-        v = m_afw_speck.load();
-        if (ImGui::Checkbox("AFW: trees steady against the other eye's needles (afwspeck)", &v)) m_afw_speck = v;
-        hint("AFW only. The same switch as in Debug.");
-        // Hiccups (author 15 Nov 19:34Z; research\2026-11-15_stutter): his headset log
-        // of 15 Nov 20:25 has a 60-130 ms frame in nearly every 5 s, the four of 14 Nov before gilayered 35-60 ms, same settings.
-        v = m_gi_layered.load();
-        if (ImGui::Checkbox("Black squares in the shade fixed (gilayered)", &v)) {
-            m_gi_layered = v;
-            spdlog::info("[GILayered] gilayered {} (F11 Tests)", v ? "on" : "off");
-        }
-        hint("Shaded ground no longer stays as black squares. Command gilayered.");
-        // hitchlog from the headset (15 Nov stutter: the gilayered A/B showed nothing in the simulator, which has no hiccups; the cause has
-        // to be caught in a headset session that stutters, research\2026-11-15_stutter and 2026-10-28_freezes_fps_review.md).
-        v = fc5::hitch::count() > 0;
-        if (ImGui::Checkbox("Log slow frames (hitchlog)", &v)) {
-            if (v) {
-                fc5::hitch::set_threshold(50.0f);
-                fc5::hitch::set_count(6);
-            } else {
-                fc5::hitch::set_count(0);
-            }
-        }
-        hint("For testing: logs slow frames and where their time went. Command hitchlog.");
-        // shotowner (author 15 Nov 21:22; FarCry5BulletSpeed.cpp ShotOwner).
-        v = fc5::bullet::shot_owner();
-        if (ImGui::Checkbox("Recoil on every shot in a firefight (shotowner)", &v)) m_ui_cmds += v ? "shotowner on\n" : "shotowner off\n";
-        hint("The recoil kick and shot pulse work on every shot, even when others fire at the same time. Command shotowner.");
-        ImGui::Separator();
-        // Daytime clarity (author 14 Nov 20:12Z: the picture is much less clear by day than at night; research\2026-11-14_dayclarity).
-        ImGui::TextWrapped("Daytime clarity: in full daylight, look at trees against the sky and at sunlit ground 10-50 m away, head still, "
-                           "then turning slowly. Change one switch, compare, put it back before the next. Not saved: a restart puts them back.");
-        v = m_flare_test.load();
-        if (ImGui::Checkbox("Sun lens flare back (flaretest)", &v)) set_flare_test(v);
-        hint("For testing: brings back the sun's lens flare. Command flaretest.");
-        v = m_bloom_off.load();
-        if (ImGui::Checkbox("No bloom (bloomtest)", &v)) set_bloom_test(v);
-        hint("For testing: turns off the glow around bright surfaces. Command bloomtest.");
-        v = m_haze_off.load();
-        if (ImGui::Checkbox("No sunlit haze or fog (hazetest)", &v)) set_haze_test(v);
-        hint("For testing: turns off the distance haze and fog. Command hazetest.");
-        v = m_shadow_mv.load();
-        if (ImGui::Checkbox("Sun shadows smoothed over time (shadowmv)", &v)) m_shadow_mv = v;
-        hint("The same switch as in Debug > Sun shadows.");
-        v = m_shadow_kernel.load();
-        if (ImGui::Checkbox("Shadow filter centred (shadowkernel)", &v)) m_shadow_kernel = v;
-        hint("The same switch as in Debug > Sun shadows.");
-        v = m_contact_shadows.load();
-        if (ImGui::Checkbox("Small contact shadows (contactshadows)", &v)) m_contact_shadows = v;
-        hint("The same switch as in Debug > Sun shadows.");
-        ImGui::EndChild();
-        ImGui::EndTabItem();
-    }
+    // The second Tests tab (author 14 Nov 19:52Z) is gone too (hotfix 1.0.1, author 16 Nov 22:07Z): only its
+    // rows; every switch it held still works from fc5vr_cmd.txt with the same default (cullhead, upright, impostorup, impostoruplog,
+    // cullheads, afwfoliage, afwspeck, gilayered, hitchlog, shotowner, flaretest, bloomtest, hazetest, shadowmv, shadowkernel,
+    // contactshadows); those also in Debug keep their rows there.
     ImGui::EndTabBar();
 }
 

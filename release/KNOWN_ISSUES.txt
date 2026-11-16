@@ -1,4 +1,4 @@
-Far Cry 5 VR - 1.0: known issues
+Far Cry 5 VR - 1.0.1: known issues
 
 Things we already know about (no need to report them, unless they look worse than described):
 
@@ -6,8 +6,8 @@ Things we already know about (no need to report them, unless they look worse tha
 - Hands or legs missing or wrong: change your skin (outfit) first. Some outfits are drawn in ways the mod does not read yet.
 - Performance on an RTX 4090: about 50 fps in Stereo, 80+ in AFW. If it is too slow, use AFW (F8), a lower DLSS mode, or OFXR Bridge for frame generation.
 - Cutscenes play in 3D around you. If one feels uncomfortable, F11 > Main > Cutscenes can show them on a flat screen instead.
-- The full body (F11 > Main > You see) is newer than the hands-only view: arms or legs can sometimes take an odd pose, mostly in vehicles and scripted scenes.
-- Melee with the weapon in your hand is experimental.
+- The full body (F11 > Main > You see) is newer than the hands-only view: arms or legs can sometimes take an odd pose, mostly in vehicles and scripted scenes. It is on by default: F11 > Main > You see > Hands only turns it off.
+- Melee with the weapon in your hand is experimental (its hits are on by default).
 - Small culling flashes can still happen at the edges of the view.
 - Water: short black flickers on the water while turning, and far rivers that end in a straight line (that last one is the game's own).
 - With frame generation, menus can blink black.
