@@ -441,7 +441,10 @@ namespace
     constexpr float kPouchZoneDefault = 0.14f;
     constexpr float kHandMagDefault[3]{ 0.0f, 0.07f, -0.01f };
     constexpr float kTravelDefault = 0.05f, kRackDefault = 0.06f;
-    constexpr int   kTapDefault    = 250;    // ms: a quick press of B drops the magazine; longer, it is the game's Y (heal)
+    // ms: a quick press of B drops the magazine; longer, it is the game's Y (heal). 400 since hotfix 1.0.2 (was 250; author 17 Nov 07:48Z
+    //): his 08:46:29 and 08:47:19 presses with a listed gun in hand passed 250 ms, so they
+    // were heals (and the game paused into a menu 0.4 s later), and the reload came only at a later press; his quick presses last 56-222 ms.
+    constexpr int   kTapDefault    = 400;
     // reloadwellzone2 (author 15 Nov 21:20Z): every
     // way in, for every weapon, 20 % larger: the well's distance off its axis and below it (and the distances that pull it out again, so the
     // magazine is not lost sooner than before), the AK's and the wide well's, the belt tray, a launcher's open back and muzzle, a shell into an
@@ -2428,6 +2431,13 @@ void update(const In& in_game, Out& out)
         g_b_mine = (active || slung_b) && (!in.b_mod || g_hand_mag || g_racking);   // the left grip holding the reload's magazine or handle is no modifier
         g_b_pass = !g_b_mine;
         g_b_t0   = now;
+        // hotfix 1.0.2: why a right B with a listed gun is not the reload's (the menu screen, a vehicle, the sling, the throw's modifier).
+        if (listed && !g_b_mine && g_log.load()) {
+            static int said = 0;
+            if (said++ < 60)
+                spdlog::info("[Reload] right B pressed with weapon {}: not a reload ({})", in.sig,
+                             in.b_mod ? "the left grip or left trigger held: the throw's modifier" : "not in the hand for the reload: a menu or flat screen, a vehicle, or the bow");
+        }
     }
     if (in.b_down) {
         if (g_b_mine && !g_b_pass && ms_since(g_b_t0, now) >= float(g_tap_ms.load())) {
@@ -2436,7 +2446,10 @@ void update(const In& in_game, Out& out)
         }
         if (g_b_mine && !g_b_pass) out.y_off = true;
     } else if (g_b_mine) {
-        if (!g_b_pass && active) drop = true;   // let go before reloadtap: a quick press
+        if (!g_b_pass && active) {
+            drop = true;   // let go before reloadtap: a quick press
+            if (g_log.load()) spdlog::info("[Reload] right B let go after {:.0f} ms (under {} ms): the reload's, at once", ms_since(g_b_t0, now), g_tap_ms.load());
+        }
         else if (!g_b_pass && slung_b && g_log.load())
             spdlog::info("[Reload] quick right B with weapon {} on the sling: nothing (grip the gun first; the game's previous weapon held back)", in.sig);
         g_b_mine = false;
@@ -5172,7 +5185,7 @@ void draw_menu(std::string& cmds, const std::function<void(const char*)>& hint, 
         hint("When the game shows a prompt on the reload button (search, pick up, open), the button works exactly as you hold it. Command reloadbuttonprompt.");
         int tap = g_tap_ms.load();
         if (ImGui::SliderInt("Quick B press: shorter than (ms)##reloadtap", &tap, 100, 600)) cmds += fmt::format("reloadtap {}\n", tap);
-        hint("A right B press shorter than this drops the magazine; a longer one heals.");
+        hint("A right B press shorter than this drops the magazine; a longer one heals (default 400 ms).");
         if (bh) {
             int hm = g_heal_ms.load();
             if (ImGui::SliderInt("Heal: hold the game's button at least (ms)##bhealms", &hm, 300, 2000)) cmds += fmt::format("bhealms {}\n", hm);

@@ -22281,6 +22281,7 @@ void FarCry5Stereo::on_post_present()
             if (m_sig_counts[i] > optic && fc5::sighttable::find_optic(m_sig_counts[i])) optic = m_sig_counts[i];
         if (optic != 0 || !optic_now(m_weapon_sig.load())) m_sight_optic_count = optic;
     }
+    sight_optic_frame();   // sightoptic (hotfix 1.0.2): the fitted optic against the one the gun's learnt data belongs to
     m_sig_counts_n      = 0;
     if (m_weapon_sig_frame != 0 && m_weapon_sig_frame != m_weapon_sig.load()) {
         std::lock_guard _{ m_weapon_cal_mtx };

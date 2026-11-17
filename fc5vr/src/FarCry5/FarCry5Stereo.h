@@ -2743,6 +2743,7 @@ private:
     // drawn, the sight line goes through the weapon model's own sight point (FarCry5SightTable.h, 129 weapons) instead of needing a learned line. Off by
     // default: it changes where shots go, and the Shooting checks (CLAUDE.md) have not been run (no simulator on 2 Nov).
     std::atomic<bool>  m_sight_data{ false };
+    void               sight_optic_frame();   // sightoptic (hotfix 1.0.2, FarCry5Sight.cpp): the gun's learnt sight and scope data follows its fitted optic
     std::atomic<uint32_t> m_sight_optic_count{ 0 };   // sightdata: the draw of this weapon's optic (FarCry5SightTable.h kOptics), 0 none seen; set at each frame's end
     std::atomic<bool>  m_sight_learn{ true };    // cmd sightlearn on|off: a short aim-down-sights press reads a weapon with no sight line yet
     std::atomic<bool>  m_sight_probe_lt{ false };

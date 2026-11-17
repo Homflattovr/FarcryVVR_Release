@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.2 (17 November 2026): hotfix
+Full notes: [release/RELEASE_NOTES_v1.0.2.md](release/RELEASE_NOTES_v1.0.2.md).
+- **Changed:** no learnt scope or sight data shipped; each gun learns its fitted optic and learns again only when the
+  optic changes (weapon switch, store or workbench), keeping the old optic's data.
+- **Fixed:** a quick B (up to 0.4 s) reloads at once instead of healing.
+
 ## 1.0.1 (16 November 2026): hotfix
 Full notes: [release/RELEASE_NOTES_v1.0.1.md](release/RELEASE_NOTES_v1.0.1.md).
 - **Changed:** the F11 test section is gone; foveated DLSS moved to F11 > Experimental (still off by default).

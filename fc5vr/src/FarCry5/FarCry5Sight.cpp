@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <map>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -61,6 +62,15 @@ struct FarCry5Stereo::SightState
     };
     std::unordered_map<uint32_t, Line> lines{};
     std::unordered_set<uint32_t>       data_said{};   // sightdata: weapons logged
+
+    // sightoptic (hotfix 1.0.2): the optic each gun's learnt sight and scope data belongs to (sightoptic <sig> <optic>, saved), and the
+    // data set aside for the gun's other optics (sightopticdata <sig> <optic> <line>, saved), by kind (sightcal, scopecal, scopeglassat, scopezoom).
+    std::map<uint32_t, std::string>                                                optic_of{};
+    std::map<std::pair<uint32_t, std::string>, std::map<std::string, std::string>> optic_store{};
+    uint32_t    ow_sig{ 0 };    // the optic watch: the gun in hand, the optic seen, for how many frames in a row
+    std::string ow_val{};
+    int         ow_n{ 0 };
+    bool        ow_said{ false };
 
     // Aim down sights under way (the game's LT): the camera's zoom and the gun's pose, per game update.
     bool              lt_was{ false };
@@ -513,6 +523,101 @@ float FarCry5Stereo::sight_depth_tick(float hit_held, float conv)
     return 1.0f / m_sd_inv;
 }
 
+// sightoptic (hotfix 1.0.2, author 17 Nov 07:48Z; 07:49Z: no relearning from scratch, only when the optic
+// changed from its previous state). Once per frame (on_post_present, after the frame's optic is known): the optic fitted to the gun in hand is the
+// model of its largest known optic draw (FarCry5SightTable.h kOptics), "glass" for sight glass of an optic not in the table, "none" for iron
+// sights. Seen the same for kOpticSteady frames in a row (in hand, drawn, not the flat screen, not a mounted gun), it is compared with the optic
+// the gun's learnt data belongs to (sightoptic): the same: the data is used as it is. None recorded (no data yet, or a line saved before
+// 1.0.2): this optic is recorded as theirs, nothing relearnt. Another optic: the gun's sightcal, scopecal, scopeglassat and scopezoom lines are
+// set aside for the old optic (sightopticdata, saved: nothing is wiped), the lines kept for the new optic, if any, are used again, else the new
+// optic is learnt at the next aim down sights (sightlearn, scopelearn), as for a new gun. A weapon switch, a store or workbench change: the same
+// check the next time the gun is in hand.
+void FarCry5Stereo::sight_optic_frame()
+{
+    constexpr int kOpticSteady = 60;
+    if (!m_sight) m_sight = new SightState{};
+    auto&          s   = *m_sight;
+    const uint32_t sig = m_weapon_sig.load();
+    if (sig == 0 || m_weapon_draws_last_frame == 0 || flat_screen_on() || mounted_now()) {
+        s.ow_n = 0;
+        return;
+    }
+    const auto*       o   = fc5::sighttable::find_optic(m_sight_optic_count.load());
+    const std::string val = o ? std::string{ o->model } : optic_now(sig) ? std::string{ "glass" } : std::string{ "none" };
+    if (sig != s.ow_sig) {
+        s.ow_sig  = sig;
+        s.ow_val  = val;
+        s.ow_n    = 0;
+        s.ow_said = false;
+    }
+    if (val != s.ow_val) {
+        s.ow_val = val;
+        s.ow_n   = 0;
+        return;
+    }
+    if (s.ow_n < kOpticSteady) ++s.ow_n;
+    if (s.ow_n < kOpticSteady) return;
+    static const char* kKinds[]{ "sightcal", "scopecal", "scopeglassat", "scopezoom" };
+    auto has_data = [&] {
+        for (const char* k : kKinds)
+            if (m_persist.count(fmt::format("{} {}", k, sig))) return true;
+        return false;
+    };
+    const auto it = s.optic_of.find(sig);
+    if (it == s.optic_of.end()) {
+        const bool had = has_data();
+        s.optic_of[sig] = val;
+        m_persist[fmt::format("sightoptic {}", sig)] = fmt::format("sightoptic {} {}", sig, val);
+        save_settings();
+        spdlog::info("[Sight] weapon {}: optic {} fitted, no optic recorded for its learnt data: {}", sig, val,
+                     had ? "recorded as theirs, the data used as it is (a line saved before 1.0.2)" : "recorded (nothing learnt yet)");
+        s.ow_said = true;
+        return;
+    }
+    if (it->second == val) {
+        if (!s.ow_said) spdlog::info("[Sight] weapon {}: optic {} fitted, learnt data for {}: used", sig, val, it->second);
+        s.ow_said = true;
+        return;
+    }
+    // Another optic: the data set aside for the old one, the new one's kept data back, or learnt again.
+    const std::string old = it->second;
+    auto&             keep = s.optic_store[{ sig, old }];
+    for (const auto& [k, line] : keep) m_persist.erase(fmt::format("sightopticdata {} {} {}", sig, old, k));
+    keep.clear();
+    for (const char* k : kKinds) {
+        const auto p = m_persist.find(fmt::format("{} {}", k, sig));
+        if (p == m_persist.end()) continue;
+        keep[k]                                                         = p->second;
+        m_persist[fmt::format("sightopticdata {} {} {}", sig, old, k)] = fmt::format("sightopticdata {} {} {}", sig, old, p->second);
+        m_persist.erase(p);
+    }
+    const size_t kept = keep.size();
+    if (keep.empty()) s.optic_store.erase({ sig, old });
+    s.lines.erase(sig);
+    s.tries.erase(sig);
+    {
+        std::lock_guard _{ m_scope_mtx };
+        m_scope_cal.erase(sig);
+        m_scope_zoom.erase(sig);
+    }
+    m_glass_learn.erase(sig);
+    size_t back = 0;
+    if (const auto st = s.optic_store.find({ sig, val }); st != s.optic_store.end()) {
+        for (const auto& [k, line] : st->second) {
+            m_ui_cmds += line + "\n";   // the kept lines run again (poll_commands, this frame): the data and its saved lines back
+            m_persist.erase(fmt::format("sightopticdata {} {} {}", sig, val, k));
+            ++back;
+        }
+        s.optic_store.erase(st);
+    }
+    it->second                                   = val;
+    m_persist[fmt::format("sightoptic {}", sig)] = fmt::format("sightoptic {} {}", sig, val);
+    save_settings();
+    spdlog::info("[Sight] weapon {}: optic {} fitted, learnt data for {}: {} line(s) set aside for {}; {}", sig, val, old, kept, old,
+                 back ? fmt::format("the {} line(s) kept for {} used again", back, val) : fmt::format("relearn for {} (at the next aim down sights)", val));
+    s.ow_said = true;
+}
+
 bool FarCry5Stereo::sight_command(const std::string& cmd, const std::string& arg, std::istringstream& ls, bool from_settings, bool& persist_changed)
 {
     if (cmd.rfind("sight", 0) != 0 || cmd == "sightspread") return false;
@@ -542,6 +647,28 @@ bool FarCry5Stereo::sight_command(const std::string& cmd, const std::string& arg
         m_sight_eye_pitch = std::clamp(p, -60.0f, 60.0f);
         spdlog::info("[Sight] sighteye {}{}", m_sight_eye_test.load() ? "on" : "off",
                      m_sight_eye_test.load() ? fmt::format(" ({:.2f} m behind the eye point, aimed {:.1f} deg down)", m_sight_eye_back.load(), m_sight_eye_pitch.load()) : std::string{});
+    } else if (cmd == "sightoptic") {
+        // sightoptic <sig> <optic> (saved, written by sight_optic_frame): the optic the gun's learnt sight and scope data belongs to.
+        const uint32_t sig   = (uint32_t)std::strtoul(arg.c_str(), nullptr, 10);
+        std::string    optic;
+        ls >> optic;
+        if (sig != 0 && !optic.empty()) {
+            s.optic_of[sig] = optic;
+            persist(fmt::format("sightoptic {}", sig), fmt::format("sightoptic {} {}", sig, optic));
+        }
+    } else if (cmd == "sightopticdata") {
+        // sightopticdata <sig> <optic> <line> (saved, written by sight_optic_frame): a learnt line of the gun kept for another optic.
+        const uint32_t sig = (uint32_t)std::strtoul(arg.c_str(), nullptr, 10);
+        std::string    optic, line;
+        ls >> optic;
+        std::getline(ls, line);
+        line.erase(0, line.find_first_not_of(" \t"));
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        const std::string kind = line.substr(0, line.find(' '));
+        if (sig != 0 && !optic.empty() && (kind == "sightcal" || kind == "scopecal" || kind == "scopeglassat" || kind == "scopezoom")) {
+            s.optic_store[{ sig, optic }][kind] = line;
+            persist(fmt::format("sightopticdata {} {} {}", sig, optic, kind), fmt::format("sightopticdata {} {} {}", sig, optic, line));
+        }
     } else if (cmd == "sightcal") {
         // sightcal <sig> ox oy oz dx dy dz ux uy uz (saved by the learning)
         const uint32_t sig = (uint32_t)std::strtoul(arg.c_str(), nullptr, 10);
