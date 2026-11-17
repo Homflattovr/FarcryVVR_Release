@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.3 (17 November 2026): hotfix
+Full notes: [release/RELEASE_NOTES_v1.0.3.md](release/RELEASE_NOTES_v1.0.3.md).
+- **Fixed:** magnifying scopes (ACOG, SPECTER...) get the scope picture again, also after an optic change; data from
+  another kind of optic is set aside and learnt again.
+- **Fixed:** the spare magazine stays at the left hip when the drawn body's place for it is wrong.
+
 ## 1.0.2 (17 November 2026): hotfix
 Full notes: [release/RELEASE_NOTES_v1.0.2.md](release/RELEASE_NOTES_v1.0.2.md).
 - **Changed:** no learnt scope or sight data shipped; each gun learns its fitted optic and learns again only when the

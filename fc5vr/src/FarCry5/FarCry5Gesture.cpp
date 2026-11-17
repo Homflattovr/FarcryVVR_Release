@@ -574,8 +574,24 @@ glm::vec3 pouch_pos(const glm::mat4& head, bool mirror, glm::vec3& fwd)
     // bodyikworn: at the drawn belt, facing the body's heading (the place's -z).
     glm::mat4 wb;
     if (carry_base(head, kCarryMag, wb)) {
-        fwd = glm::normalize(glm::vec3{ wb * glm::vec4{ 0.0f, 0.0f, -1.0f, 0.0f } });
-        return glm::vec3{ wb[3] };
+        // hotfix 1.0.3 (author 17 Nov 09:08Z): the drawn body's belt is used only while it is near the head-based hip place (within kMagWornMax) and well below the eyes
+        // (at least kMagWornBelow: the throwables' pouch on the chest is about 0.33 m down, the belt about 0.6 m). Otherwise (the drawn body
+        // lagging, lost or posed wrong) the head-based hip place below, as with the full body off; one log line per change.
+        constexpr float   kMagWornMax = 0.30f, kMagWornBelow = 0.45f;
+        const glm::mat3   body0 = glm::mat3{ glm::rotate(glm::mat4{ 1.0f }, g_body_yaw.load(), glm::vec3{ 0.0f, 1.0f, 0.0f }) };
+        const glm::vec3   hip   = glm::vec3{ head[3] } + body0 * glm::vec3{ m * p[0], -p[1], -p[2] };
+        const glm::vec3   worn  = glm::vec3{ wb[3] };
+        const float       off   = glm::length(worn - hip);
+        const float       below = head[3].y - worn.y;
+        const bool        good  = std::isfinite(off) && off <= kMagWornMax && below >= kMagWornBelow;
+        static std::atomic<int> was{ -1 }, said{ 0 };
+        if (was.exchange(good ? 1 : 0) != (good ? 1 : 0) && said.fetch_add(1) < 60)
+            spdlog::info("[Gesture] reload magazine: {} (the drawn belt {:.2f} m from the head-based hip place, {:.2f} m below the eyes)",
+                         good ? "at the drawn body's belt" : "the drawn body's belt is off: at the head-based hip place instead", off, below);
+        if (good) {
+            fwd = glm::normalize(glm::vec3{ wb * glm::vec4{ 0.0f, 0.0f, -1.0f, 0.0f } });
+            return worn;
+        }
     }
     if (fc5::reload::pouch_neck()) {
         // reloadpouchneck: from the neck (the head's pitch and roll no longer move it), on the pouch's own heading; the same point as before with

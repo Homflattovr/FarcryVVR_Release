@@ -1652,7 +1652,14 @@ void FarCry5Stereo::scope_learn_tick(bool on_foot, bool at_scope, UINT sig, bool
         spdlog::info("[Scope] scopelearn: weapon {}: zooms x{:.2f} but its optic is a reflex or red dot sight (scopereflex off): not a scope", a.sig, zoom);
         optic = false;
     }
-    const float mag  = zoom >= 3.0f && optic ? std::round(zoom * 10.0f) / 10.0f : 1.0f;
+    // hotfix 1.0.3 (author 17 Nov 09:08Z; his 10:02:23 and 10:06:22 log: the AR-C's ACOG zooms
+    // the game camera x2.77 and its SPECTER x2.38, its reflex x2.72, so the x3.0 rule took both scopes for red dots): with a magnifying scope
+    // fitted (FarCry5SightTable.h kOptics: any optic but WPN_ATT_REFLEX and WPN_ATT_REDDOT), the game's own zoom is the scope's from x1.5 on.
+    const auto* fitted   = fc5::sighttable::find_optic(m_sight_optic_count.load());
+    const bool  mag_kind = optic && fitted && fitted->model && std::strcmp(fitted->model, "WPN_ATT_REFLEX") != 0 && std::strcmp(fitted->model, "WPN_ATT_REDDOT") != 0;
+    const float mag      = optic && (zoom >= 3.0f || (mag_kind && zoom >= 1.5f)) ? std::round(zoom * 10.0f) / 10.0f : 1.0f;
+    if (mag_kind && zoom < 3.0f && mag > 1.0f)
+        spdlog::info("[Scope] scopelearn: weapon {}: zooms x{:.2f} with a magnifying scope fitted ({}): a scope at the game's own zoom", a.sig, zoom, fitted->model);
     if (a.upgrade && mag <= 1.0f) return;   // the 1x entry was right
     ScopeCal    c    = m_scope_default;
     c.mag            = mag;
