@@ -434,6 +434,39 @@ static class Launcher
             int s, n;
             if (FindAttr(t, o.Element, o.Attr, out s, out n) && !SameValue(t.Substring(s, n), o.Want)) t = t.Substring(0, s) + o.Want + t.Substring(s + n);
         }
+        t = ReticleOffText(t) ?? t;
+        WriteGameProfile(p, t);
+    }
+
+    // reticleoff: Play in VR turns the game's reticle off without asking (author 19 Nov: many testers still had it, it stays
+    // fixed in the middle of the HUD). HelpCrosshair="0" in <ProfileSpecificGameProfile>, added when the file does not have it
+    // (the game's default is on). The same backups as FixGameOptions. True when the file was changed.
+    public static bool ForceReticleOff()
+    {
+        var p = GameProfilePath;
+        if (!File.Exists(p)) return false;
+        var t = ReticleOffText(File.ReadAllText(p));
+        if (t == null) return false;
+        WriteGameProfile(p, t);
+        return true;
+    }
+
+    // The file's text with HelpCrosshair="0" (set, or added to the element), or null when nothing changes.
+    static string ReticleOffText(string t)
+    {
+        int s, n;
+        if (FindAttr(t, "ProfileSpecificGameProfile", "HelpCrosshair", out s, out n))
+            return SameValue(t.Substring(s, n), "0") ? null : t.Substring(0, s) + "0" + t.Substring(s + n);
+        int tag = t.IndexOf("<ProfileSpecificGameProfile ", StringComparison.Ordinal);
+        if (tag < 0) return null;
+        int at = tag + "<ProfileSpecificGameProfile".Length;
+        return t.Substring(0, at) + " HelpCrosshair=\"0\"" + t.Substring(at);
+    }
+
+    // Backups first: the file as it was the first time is kept as gamerprofile.xml.fc5vr_backup (never overwritten), and the
+    // file as it was just before this change as gamerprofile.xml.fc5vr_last.
+    static void WriteGameProfile(string p, string t)
+    {
         var bak = p + ".fc5vr_backup";
         if (!File.Exists(bak)) File.Copy(p, bak);
         File.Copy(p, p + ".fc5vr_last", true);
@@ -871,19 +904,36 @@ class LauncherForm : Form
     readonly TableLayoutPanel checkList = new TableLayoutPanel();
     readonly ToolTip checkTips = new ToolTip { AutoPopDelay = 20000, InitialDelay = 300 };
     DateTime checkedAt = DateTime.MinValue;
+    // Resizable window (author 20 Nov): the settings and checks scroll inside the window and the buttons stay at its bottom.
+    // Wide enough, the install checks are a third column and both columns share the extra width; narrower, the checks move
+    // under the settings. Relayout() sets the column widths and the labels' wrap widths from the window's width.
+    readonly TableLayoutPanel table = new TableLayoutPanel();
+    readonly Panel scroller = new Panel { Dock = DockStyle.Fill, AutoScroll = true };
+    readonly FlowLayoutPanel buttons = new FlowLayoutPanel();
+    readonly GroupBox checksBox = new GroupBox();
+    readonly Label checkHint = new Label();
+    readonly List<Label> rowLabels = new List<Label>();
+    readonly List<Label> infoLabels = new List<Label>();
+    readonly List<Label> checkLabels = new List<Label>();
+    int settingsRows;          // table rows of the settings; the narrow layout puts the checks in the row after them
+    int checkTextWidth = 250;  // wrap width of a check's name and result (pixels at the current DPI once loaded)
+    bool loaded, laying;
 
     public LauncherForm()
     {
         Text = "Far Cry 5 VR";
-        FormBorderStyle = FormBorderStyle.FixedDialog;
-        MaximizeBox = false;
+        FormBorderStyle = FormBorderStyle.Sizable;
         StartPosition = FormStartPosition.CenterScreen;
         AutoScaleMode = AutoScaleMode.Dpi;
         AutoScaleDimensions = new SizeF(96f, 96f);
         Font = new Font("Segoe UI", 9.5f);
         try { Icon = Icon.ExtractAssociatedIcon(Path.Combine(Launcher.GameDir, "FarCry5.exe")); } catch { }
 
-        var table = new TableLayoutPanel { ColumnCount = 3, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(14), Dock = DockStyle.Fill };
+        table.ColumnCount = 3;
+        table.AutoSize = true;
+        table.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        table.Padding = new Padding(14);
+        table.Location = Point.Empty;
         table.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 300));
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 350));
@@ -961,18 +1011,26 @@ class LauncherForm : Form
         AddRow(table, "Headset", headset);
         AddInfo(table, headsetInfo);
 
-        // Install checks: a third column beside every row above.
-        var checksBox = new GroupBox { Text = "Install checks", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
-                                       Margin = new Padding(18, 3, 0, 0), Padding = new Padding(8, 6, 8, 8) };
-        var checksPanel = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, Dock = DockStyle.Fill, Margin = new Padding(0) };
+        // Install checks: a third column beside every row above (under them when the window is narrow, Relayout).
+        settingsRows = table.RowCount;
+        checksBox.Text = "Install checks";
+        checksBox.AutoSize = true;
+        checksBox.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        checksBox.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        checksBox.Margin = new Padding(18, 3, 0, 0);
+        checksBox.Padding = new Padding(8, 6, 8, 8);
+        var checksPanel = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, Dock = DockStyle.Top, Margin = new Padding(0) };
         checkList.ColumnCount = 2;
         checkList.AutoSize = true;
         checkList.AutoSizeMode = AutoSizeMode.GrowAndShrink;
         checkList.Margin = new Padding(0);
         checkList.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 52));
         checkList.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 250));
-        var checkHint = new Label { Text = "Click a line for what it means and how to fix it.", AutoSize = true, MaximumSize = new Size(300, 0), ForeColor = SystemColors.GrayText,
-                                    Margin = new Padding(0, 6, 0, 0) };
+        checkHint.Text = "Click a line for what it means and how to fix it.";
+        checkHint.AutoSize = true;
+        checkHint.MaximumSize = new Size(300, 0);
+        checkHint.ForeColor = SystemColors.GrayText;
+        checkHint.Margin = new Padding(0, 6, 0, 0);
         var recheck = new Button { Text = "Check again", AutoSize = true, Margin = new Padding(0, 6, 0, 0) };
         recheck.Click += delegate { FillChecks(); };
         checksPanel.Controls.Add(checkList);
@@ -980,10 +1038,15 @@ class LauncherForm : Form
         checksPanel.Controls.Add(recheck);
         checksBox.Controls.Add(checksPanel);
         table.Controls.Add(checksBox, 2, 0);
-        table.SetRowSpan(checksBox, table.RowCount);
+        table.SetRowSpan(checksBox, settingsRows);
+        table.RowCount = settingsRows + 1;   // the narrow layout's row for the checks (empty, no height, when wide)
 
-        // Buttons
-        var buttons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Fill, Margin = new Padding(0, 12, 0, 0) };
+        // Buttons: docked at the window's bottom, outside the scrolling part, so Play is always in view.
+        buttons.AutoSize = true;
+        buttons.FlowDirection = FlowDirection.RightToLeft;
+        buttons.Dock = DockStyle.Bottom;
+        buttons.Padding = new Padding(14, 8, 14, 12);
+        buttons.Margin = new Padding(0);
         var close = new Button { Text = "Close", AutoSize = true, DialogResult = DialogResult.Cancel };
         play.Text = "Play"; play.AutoSize = true; play.MinimumSize = new Size(90, 0);
         var report = new Button { Text = "Make a report", AutoSize = true };
@@ -991,13 +1054,12 @@ class LauncherForm : Form
         buttons.Controls.Add(close);
         buttons.Controls.Add(play);
         buttons.Controls.Add(report);
-        table.Controls.Add(buttons, 0, table.RowCount);
-        table.SetColumnSpan(buttons, 3);
-        table.RowCount++;
 
-        Controls.Add(table);
-        AutoSize = true;
-        AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        scroller.Controls.Add(table);
+        Controls.Add(buttons);
+        Controls.Add(scroller);
+        scroller.BringToFront();   // docked last: fills what the buttons leave
+        scroller.Resize += delegate { Relayout(); };
         AcceptButton = play;
         CancelButton = close;
 
@@ -1041,6 +1103,7 @@ class LauncherForm : Form
         catch (Exception e) { checks = new List<Launcher.InstallCheck> { new Launcher.InstallCheck("Install checks").Set(Launcher.CheckState.Warn, "could not run", e.Message) }; }
         checkList.SuspendLayout();
         checkTips.RemoveAll();
+        checkLabels.Clear();
         while (checkList.Controls.Count > 0) checkList.Controls[0].Dispose();
         checkList.RowStyles.Clear();
         checkList.RowCount = 0;
@@ -1048,17 +1111,19 @@ class LauncherForm : Form
             var c = check;
             var badge = new Label {
                 Text = c.State == Launcher.CheckState.Pass ? "PASS" : c.State == Launcher.CheckState.Warn ? "WARN" : "FAIL",
-                AutoSize = false, Size = new Size(44, 18), TextAlign = ContentAlignment.MiddleCenter, Margin = new Padding(0, 3, 8, 0),
+                AutoSize = false, Size = loaded ? new Size(Px(44), Px(18)) : new Size(44, 18), TextAlign = ContentAlignment.MiddleCenter, Margin = new Padding(0, 3, 8, 0),
                 Font = new Font(Font.FontFamily, 7.5f, FontStyle.Bold),
                 BackColor = c.State == Launcher.CheckState.Pass ? PassColor : c.State == Launcher.CheckState.Warn ? WarnColor : FailColor,
                 ForeColor = c.State == Launcher.CheckState.Warn ? Color.Black : Color.White,
             };
-            var text = new Label { Text = c.Name, AutoSize = true, MaximumSize = new Size(250, 0), Margin = new Padding(0, 2, 0, 0), Font = new Font(Font, FontStyle.Bold) };
-            var summary = new Label { Text = c.Summary, AutoSize = true, MaximumSize = new Size(250, 0), Margin = new Padding(0, 0, 0, 5),
+            var text = new Label { Text = c.Name, AutoSize = true, MaximumSize = new Size(checkTextWidth, 0), Margin = new Padding(0, 2, 0, 0), Font = new Font(Font, FontStyle.Bold) };
+            var summary = new Label { Text = c.Summary, AutoSize = true, MaximumSize = new Size(checkTextWidth, 0), Margin = new Padding(0, 0, 0, 5),
                                       ForeColor = c.State == Launcher.CheckState.Fail ? FailColor : SystemColors.GrayText };
             var lines = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, Margin = new Padding(0) };
             lines.Controls.Add(text);
             lines.Controls.Add(summary);
+            checkLabels.Add(text);
+            checkLabels.Add(summary);
             foreach (Control ctl in new Control[] { badge, text, summary, lines }) {
                 ctl.Cursor = Cursors.Hand;
                 ctl.Click += delegate { ShowCheck(c); };
@@ -1237,23 +1302,95 @@ class LauncherForm : Form
         }
     }
 
-    static void AddRow(TableLayoutPanel t, string label, Control c)
+    void AddRow(TableLayoutPanel t, string label, Control c)
     {
         var l = new Label { Text = label, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 6, 16, 0) };
+        rowLabels.Add(l);
         c.Margin = new Padding(0, 3, 0, 0);
         t.Controls.Add(l, 0, t.RowCount);
         t.Controls.Add(c, 1, t.RowCount);
         t.RowCount++;
     }
 
-    static void AddInfo(TableLayoutPanel t, Label info)
+    void AddInfo(TableLayoutPanel t, Label info)
     {
+        infoLabels.Add(info);
         info.AutoSize = true;
         info.MaximumSize = new Size(300, 0);
         info.ForeColor = SystemColors.GrayText;
         info.Margin = new Padding(0, 2, 0, 8);
         t.Controls.Add(info, 1, t.RowCount);
         t.RowCount++;
+    }
+
+    // Pixels at the window's DPI for a size given at 96 DPI (the controls made in the constructor are scaled by the form itself).
+    int Px(int v)
+    {
+        float k = CurrentAutoScaleDimensions.Width / 96f;
+        return (int)Math.Round(v * (k > 0 ? k : 1f));
+    }
+
+    int LabelColumnWidth()
+    {
+        int w = 0;
+        foreach (var l in rowLabels) w = Math.Max(w, l.PreferredSize.Width + l.Margin.Horizontal);
+        return w;
+    }
+
+    // First size: both columns side by side, at most the screen's working area (smaller, the checks go under the settings and
+    // the window scrolls). The smallest window keeps the settings column at its old width with Play in view.
+    protected override void OnLoad(EventArgs e)
+    {
+        base.OnLoad(e);   // DPI scaling of the controls happens here
+        loaded = true;
+        var area = Screen.FromPoint(Cursor.Position).WorkingArea;
+        int frameW = Width - ClientSize.Width, frameH = Height - ClientSize.Height;
+        int side = LabelColumnWidth() + table.Padding.Horizontal + SystemInformation.VerticalScrollBarWidth;
+        int w = Math.Min(side + Px(300) + Px(350), area.Width - frameW);
+        ClientSize = new Size(w, ClientSize.Height);
+        Relayout();
+        int h = table.GetPreferredSize(Size.Empty).Height + buttons.GetPreferredSize(new Size(w, 0)).Height;
+        ClientSize = new Size(w, Math.Min(h, area.Height - frameH));
+        MinimumSize = new Size(side + Px(300) + frameW, Math.Min(buttons.Height + Px(200) + frameH, Height));
+        CenterToScreen();
+    }
+
+    // The columns and wrap widths for the window's current width (scroller.Resize; once loaded).
+    void Relayout()
+    {
+        if (!loaded || laying) return;
+        laying = true;
+        try {
+            int col0 = LabelColumnWidth();
+            int avail = scroller.Width - SystemInformation.VerticalScrollBarWidth - table.Padding.Horizontal - col0;
+            int setMin = Px(300), chkMin = Px(350);
+            bool wide = avail >= setMin + chkMin;
+            int setW = wide ? setMin + (avail - setMin - chkMin) * 300 / 650 : Math.Max(setMin, avail);
+            int chkW = wide ? avail - setW : 0;
+            table.SuspendLayout();
+            table.ColumnStyles[1].Width = setW;
+            table.ColumnStyles[2].Width = chkW;
+            table.SetRowSpan(checksBox, 1);
+            table.SetColumnSpan(checksBox, 1);
+            if (wide) {
+                table.SetCellPosition(checksBox, new TableLayoutPanelCellPosition(2, 0));
+                table.SetRowSpan(checksBox, settingsRows);
+                checksBox.Margin = new Padding(Px(18), Px(3), 0, 0);
+            } else {
+                table.SetCellPosition(checksBox, new TableLayoutPanelCellPosition(0, settingsRows));
+                table.SetColumnSpan(checksBox, 2);
+                checksBox.Margin = new Padding(0, Px(10), 0, 0);
+            }
+            // Inside the box: its padding and border, the badge column, a little room.
+            int boxW = wide ? chkW - Px(18) : col0 + setW;
+            checkTextWidth = Math.Max(Px(150), boxW - Px(16) - Px(52) - Px(14));
+            checkList.ColumnStyles[0].Width = Px(52);
+            checkList.ColumnStyles[1].Width = checkTextWidth;
+            foreach (var l in checkLabels) l.MaximumSize = new Size(checkTextWidth, 0);
+            checkHint.MaximumSize = new Size(checkTextWidth + Px(52), 0);
+            foreach (var l in infoLabels) l.MaximumSize = new Size(setW, 0);
+            table.ResumeLayout(true);
+        } finally { laying = false; }
     }
 
     float Multiplier() { return (10 + Math.Max(0, scale.SelectedIndex)) / 10.0f; }
@@ -1379,6 +1516,9 @@ class LauncherForm : Form
     // False: the player went back to the launcher.
     bool CheckGameOptions()
     {
+        try {
+            Launcher.ForceReticleOff();   // the reticle off without asking (no file yet: the mod sets it once the game has written one)
+        } catch { }
         var wrong = Launcher.WrongGameOptions();
         if (wrong == null || wrong.Count == 0) return true;
         var list = new StringBuilder();

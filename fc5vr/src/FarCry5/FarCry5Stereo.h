@@ -3075,7 +3075,7 @@ private:
     bool                      m_menu_yuv_fire{ false };   // drawn by the menu UI shader (else the scene one)
     bool                      m_menu_overlay_next{ false };   // the next draw may be the main menu's darkening quad over its video
     std::atomic<bool>         m_menu_unclip{ true };   // menuunclip: menus clipped to the 16:9 corner shown whole
-    int                       m_menu_unclip_logged{ 0 };
+    int                       m_menu_unclip_logged[2]{};   // the video's 1920x1080, the game's own resolution
     void                      menu_unclip(float* data, uint32_t size);
     int                       m_menu_overlay_logged{ 0 };
     void               menu_blit(ID3D11DeviceContext* ctx);

@@ -6,7 +6,7 @@ own hands, a full body (on by default), body gestures to switch, sling and holst
 hands on the real steering wheel, a HUD that floats in front of you, and comfort options for driving, flying and
 cutscenes.
 
-**[Download version 1.0.3](https://github.com/Homflattovr/FarcryVVR_Release/releases/latest)** (the `FC5VR_v1.0.3.zip` file)
+**[Download version 1.0.4](https://github.com/Homflattovr/FarcryVVR_Release/releases/latest)** (the `FC5VR_v1.0.4.zip` file)
 
 **Support this project**: https://ko-fi.com/homard47885
 
@@ -157,7 +157,7 @@ can also set them in the game's Options:
 | Motion blur | Off |
 | Resolution scale | 100 %, dynamic resolution off |
 | HDR | Off |
-| Reticle (Interface) | Off |
+| Reticle (Interface) | Off (the mod and the launcher turn it off for you in VR) |
 | Controls | The game's default gamepad layout |
 
 ## If something goes wrong
@@ -187,7 +187,7 @@ can also set them in the game's Options:
 - **NVIDIA DLSS per eye** (Native/DLAA, Quality, Balanced, Performance) on its own D3D12 queue, with a choice of
   model and sharpening; FSR through OptiScaler for other cards.
 - **AFW mode** (experimental): one eye per frame, the other rebuilt from depth. Faster, with visible artifacts.
-  Switch between Stereo and AFW with **F8**.
+  Switch between Stereo and AFW in **F11 > Display > Rendering** (or in the launcher).
 - **Resolution multiplier**, field of view, sun shadow and texture detail, a scope quality preset, and a clean picture
   in the headset (no depth of field on your sights, no vignette, grain or chromatic aberration).
 - Fixes for VR-only artifacts such as the black squares in the lighting and the doubled objective markers.
@@ -244,7 +244,7 @@ own reload sound, the ammo count shows under your wrist, and every round of a ma
 ### Launcher
 - **FC5VR_Launcher.exe** picks VR or flat screen, Stereo or AFW, the resolution multiplier, DLSS or FSR, cutscenes
   and your headset.
-- An **install checks** panel, and a button that sets the game options the mod needs.
+- An **install checks** panel, and a button that sets the game options the mod needs. The window can be resized.
 - It warns about a missing OpenXR runtime, ViGEmBus driver or Visual C++ runtime, and other mods' DLLs.
 - If the game fails to start in VR or crashes, it offers a **report zip** for you to send. Nothing is uploaded.
 
@@ -273,7 +273,6 @@ right nudges the slider under the pointer. Every change is saved at once in `fc5
 | --- | --- |
 | **F11** | Open / close the menu (or click both sticks) |
 | **F9** | Recenter the view |
-| **F8** | Switch Stereo / AFW |
 | **F7** | Motion controls on / off |
 | **F12** | Flat screen on / off (or left grip + left stick click) |
 

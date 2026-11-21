@@ -483,6 +483,10 @@ namespace fc5::padglyph
         static uint64_t  probe_last = ~0ull;
         static int       probe_lines = 0;
         const ULONGLONG  now = GetTickCount64();
+        // The icon rewrites are done after g_mtx is let go: no mod lock is held across a D3D11 call (19 Nov, the deadlock with
+        // CheekyFoveatedDLSS FG: a thread inside D3D11 waiting on a mod lock while its holder waits on D3D11's lock).
+        struct Write { ID3D11Resource* tex; std::vector<uint8_t> data; UINT row; };
+        std::vector<Write> writes;
         {
             std::lock_guard _{ g_mtx };
             if (prof != g_profile) {
@@ -496,9 +500,8 @@ namespace fc5::padglyph
                 if (w == k.shown && (w == Icon::None || k.shown_letters == l.letters)) continue;
                 const std::vector<uint8_t>* p = data_for(*k.known, w, l.letters);
                 if (!p) continue;
-                t_self_write = true;
-                ctx->UpdateSubresource(k.tex, 0, nullptr, p->data(), row_bytes(k.known->w), 0);
-                t_self_write = false;
+                k.tex->AddRef();
+                writes.push_back({ k.tex, *p, UINT(row_bytes(k.known->w)) });
                 k.shown = w;
                 k.shown_letters = l.letters;
                 g_st.rewrites++;
@@ -521,6 +524,12 @@ namespace fc5::padglyph
                     }
                 }
             }
+        }
+        for (auto& wr : writes) {
+            t_self_write = true;
+            ctx->UpdateSubresource(wr.tex, 0, nullptr, wr.data.data(), wr.row, 0);
+            t_self_write = false;
+            wr.tex->Release();
         }
         static Layout last{};
         static bool   first = true;

@@ -1,6 +1,6 @@
 FAR CRY 5 VR MOD - {RELEASE}, build of {DATE} (commit {SHA})
 
-Version 1.0.3. Read KNOWN_ISSUES.txt before you report something.
+Version 1.0.4. Read KNOWN_ISSUES.txt before you report something.
 It works with the Steam copy and the Ubisoft Connect copy of Far Cry 5. A copy bought on the Epic Games Store
 runs through Ubisoft Connect too: follow the Ubisoft Connect steps for it.
 
@@ -51,7 +51,7 @@ STRONGLY RECOMMENDED (foliage: trees and grass judder at a low frame rate and sm
   Each choice has a short explanation under it in the launcher.
   Mode: VR (in the headset) or Flatscreen (the normal game on the monitor, the mod turned off).
   Rendering: Stereo (both eyes every frame, sharpest) or AFW (one eye per frame, faster; early experimental,
-  with visible artifacts). F8 switches in game.
+  with visible artifacts). F11 > Display > Rendering switches in game.
   Resolution multiplier: x1.0 to x2.0. Higher is sharper and slower. Start at x1.0.
   DLSS: keep it on. Native (DLAA) is the sharpest; Quality, Balanced and Performance are faster and softer.
   Upscaler: DLSS, or FSR for AMD, Intel or GTX cards (experimental). For FSR, download OptiScaler 0.9.4's .7z file
@@ -80,7 +80,8 @@ of the file as gamerprofile.xml.fc5vr_backup). You can also set them yourself in
 - HDR: Off
 - Controls: the game's default gamepad layout (not checked by the launcher)
 - Crosshair: Off (Options > Interface > Reticle: Off). The game's crosshair stays fixed in the middle of the HUD and
-  does not follow the gun in your hand.
+  does not follow the gun in your hand. The mod and the launcher now turn it off for you in VR, also when you start
+  the game without the launcher. To keep it, add the line "reticleoff off" to fc5vr_settings.txt.
 
 Tips: F11 opens the mod's menu (its Main tab has the common choices). If the hands or legs look wrong, change
 your skin (outfit) first. If the picture looks blurry on the very first start, restart the game once.

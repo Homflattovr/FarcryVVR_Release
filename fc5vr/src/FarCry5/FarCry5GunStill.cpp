@@ -2613,6 +2613,17 @@ bool FarCry5Stereo::gun_still_command(const std::string& cmd, const std::string&
         spdlog::info("[Motion] gunposebuiltin {} (from the next launch)", on ? "on: a gun not learnt yet starts from its built-in pose, grip point and right hand" : "off: each gun learnt in play only");
         return true;
     }
+    if (cmd == "reticleoff") {   // on (default) | off, saved, read at start (Main.cpp ReticleOffInProfile): the game's Reticle option set off in gamerprofile.xml
+        persist = true;
+        spdlog::info("[Launcher] reticleoff {} (from the next launch)", on ? "on: the game's Reticle option set off at each start" : "off: the game's Reticle option left as the player sets it");
+        return true;
+    }
+    if (cmd == "cheeky") {   // on (default) | off, saved, read at start (Main.cpp LoadCheekyIfInstalled): CheekyFoveatedDLSS loaded when it is in bin
+        persist = true;
+        spdlog::info("[Cheeky] cheeky {} (from the next launch)", on ? "on: CheekyFoveatedDLSS loaded by the mod when its version.dll and folder are in bin"
+                                                                    : "off: CheekyFoveatedDLSS not loaded even when installed");
+        return true;
+    }
     if (cmd == "gripnearweapon") {   // on (default) | off: a press of the left grip near the weapon in hand is the weapon's, never the D-pad modifier
         m_grip_near_weapon = on;
         if (!on) m_other_near = false;

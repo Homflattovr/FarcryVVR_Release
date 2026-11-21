@@ -146,7 +146,9 @@ namespace fc5::ctxvar
             if (++g_cand_n[s.idx] < kStable) continue;
             g_cand_n[s.idx] = 0;
             due++;
-            if (cur) { g_cur[s.idx].store(nullptr, std::memory_order_release); cur->hook.reset(); }
+            // Disabled, not reset: call_orig calls through the trampoline without safetyhook's lock (deadlock with CheekyFoveatedDLSS FG,
+            // 19 Nov), so another thread may still be inside it; the trampoline stays allocated (a few bytes per switch, switches are rare).
+            if (cur) { g_cur[s.idx].store(nullptr, std::memory_order_release); (void)cur->hook.disable(); }
             if (!want) { back++; continue; }
             auto hook = safetyhook::create_inline(want, s.handler);
             if (!hook) { failed++; continue; }
@@ -164,6 +166,10 @@ namespace fc5::ctxvar
 
 // The original of a hooked context method: the deferred context's own while recording (stereo
 // research), the current set's own after D3D11 switched the immediate context (ctxvar), else the hook's trampoline.
+// Always unsafe_call (no safetyhook lock): call() holds the hook's mutex across the original, and with D3D11's
+// context lock that deadlocked (19 Nov, CheekyFoveatedDLSS FG on): Cheeky's OpenXR thread held D3D11's lock and
+// entered PSSetShader's hook, waiting on its mutex, held by the render thread waiting on D3D11's lock. The hooks
+// are never removed while the game runs (ctxvar only disables a replaced set's), so the lock guarded nothing.
 template <typename R, typename... A>
 static R call_orig_impl(safetyhook::InlineHook& h, int idx, ID3D11DeviceContext* ctx, A... a)
 {
@@ -177,13 +183,13 @@ static R call_orig_impl(safetyhook::InlineHook& h, int idx, ID3D11DeviceContext*
             int& depth = fc5::ctxvar::t_depth[idx];
             if (depth > 0) {
                 fc5::ctxvar::g_nested++;
-                return h.call<R>(ctx, a...);
+                return h.unsafe_call<R>(ctx, a...);
             }
             struct Guard { int& d; ~Guard() { d--; } } g{ ++depth };
-            return v->hook.call<R>(ctx, a...);
+            return v->hook.unsafe_call<R>(ctx, a...);
         }
     }
-    return h.call<R>(ctx, a...);
+    return h.unsafe_call<R>(ctx, a...);
 }
 // perfsplit (FarCry5Hitch.h): inside an outermost render-thread hook, the original method's time is the driver's share.
 template <typename R, typename... A>
@@ -240,6 +246,20 @@ namespace
     inline bool foreign_thread()
     {
         if (fc5::ownpass::active()) return true;   // the mod's own short passes (hidmask, sunshare's split clears): straight to D3D11
+        if (!g_foreign_pass.load(std::memory_order_relaxed)) return false;
+        const DWORD rt = g_wd_render_tid.load(std::memory_order_relaxed);
+        const DWORD me = GetCurrentThreadId();
+        if (rt == 0 || me == rt) return false;
+        g_foreign_calls.fetch_add(1, std::memory_order_relaxed);
+        g_foreign_tid.store(me, std::memory_order_relaxed);
+        return true;
+    }
+    // Another thread than the render thread (cmd foreignpass, default on), without foreign_thread's own-pass case: the
+    // hooks that did their bookkeeping on any thread (map, unmap, update subresource, render
+    // targets, clears) pass such calls straight to D3D11, so no mod lock or state is touched by them (19 Nov: Cheeky's
+    // OpenXR thread calls the game's immediate context while holding D3D11's lock).
+    inline bool other_thread()
+    {
         if (!g_foreign_pass.load(std::memory_order_relaxed)) return false;
         const DWORD rt = g_wd_render_tid.load(std::memory_order_relaxed);
         const DWORD me = GetCurrentThreadId();
@@ -1175,6 +1195,98 @@ namespace
     thread_local PendingMap t_light_pending[4]{}; // muzzlelight: the light lists (Lights 48 B, LightsLightingData 144 B elements)
     thread_local PendingMap t_menu_pending[4]{};  // menuunclip: constant buffers written while a menu shows on the flat screen
 
+    // mapshadow (1.0.4; AMD players at 2-5 fps in the world, menus fine). Everything above reads the game's buffer back through the
+    // pointer its WRITE_DISCARD Map returned (the camera rewrite, the object constants of every draw, the light lists, the matrix
+    // scan). On NVIDIA that pointer is ordinary cached memory. On Radeon cards it is write-combined or video memory, where every CPU
+    // read crosses the bus: a tester's RX 7900 XT spent 160-210 ms of CPU per eye in the world against 2 ms in menus (log of 19 Nov).
+    // With mapshadow the game writes into a plain copy of ours; the mod reads and changes that, and at Unmap the whole copy goes to
+    // the driver's memory in one forward write (what write-combined memory is fast at). Only buffers the mod keeps a pointer to are
+    // copied. "mapshadow on|off|auto" (not saved; default auto: on when the game's GPU is not NVIDIA's).
+    struct MapShadow
+    {
+        ID3D11DeviceContext* ctx{ nullptr };
+        ID3D11Resource*      res{ nullptr };
+        void*                real{ nullptr };
+        uint32_t             size{ 0 };
+        std::vector<uint8_t> buf{};
+    };
+    constexpr int                 kMapShadows = 64;
+    MapShadow                     g_map_shadow[kMapShadows]{};
+    std::atomic<int>              g_map_shadow_open{ 0 };   // slots in use (Unmap looks only when some are)
+    std::mutex                    g_map_shadow_mtx{};
+    std::atomic<int>              g_map_shadow_mode{ 2 };   // 0 off, 1 on, 2 auto
+    std::atomic<int>              g_map_shadow_auto{ -1 };  // auto's answer for the game's GPU (-1: not asked yet)
+    std::atomic<uint64_t>         g_map_shadow_n{ 0 }, g_map_shadow_bytes{ 0 }, g_map_shadow_full{ 0 }, g_map_shadow_lost{ 0 };
+
+    bool map_shadow_wanted(ID3D11DeviceContext* ctx)
+    {
+        const int mode = g_map_shadow_mode.load(std::memory_order_relaxed);
+        if (mode != 2) return mode == 1;
+        int a = g_map_shadow_auto.load(std::memory_order_relaxed);
+        if (a >= 0) return a == 1;
+        UINT          vendor = 0;
+        std::string   name;
+        ID3D11Device* dev = nullptr;
+        ctx->GetDevice(&dev);
+        IDXGIDevice*  dd = nullptr;
+        IDXGIAdapter* ad = nullptr;
+        if (dev && SUCCEEDED(dev->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dd))) && dd && SUCCEEDED(dd->GetAdapter(&ad)) && ad) {
+            DXGI_ADAPTER_DESC d{};
+            if (SUCCEEDED(ad->GetDesc(&d))) {
+                vendor = d.VendorId;
+                for (const wchar_t* p = d.Description; *p && name.size() < 120; ++p) name.push_back(*p < 128 ? char(*p) : '?');
+            }
+        }
+        if (ad) ad->Release();
+        if (dd) dd->Release();
+        if (dev) dev->Release();
+        a = (vendor != 0 && vendor != 0x10DE) ? 1 : 0;   // 0x10DE: NVIDIA. Not known: off, as before.
+        int expected = -1;
+        if (g_map_shadow_auto.compare_exchange_strong(expected, a))
+            spdlog::info("[MapShadow] auto: the game's GPU is {} (vendor 0x{:04X}): the mod reads the game's constant buffers from {}", name.empty() ? "unknown" : name, vendor,
+                         a ? "its own copy (mapshadow on)" : "the driver's memory (mapshadow off)");
+        return g_map_shadow_auto.load() == 1;
+    }
+
+    // In the game's WRITE_DISCARD Map of a buffer the mod will read: hand the game our copy instead of the driver's pointer.
+    void map_shadow_begin(ID3D11DeviceContext* ctx, ID3D11Resource* res, D3D11_MAPPED_SUBRESOURCE* mapped, uint32_t size)
+    {
+        if (size == 0 || size > (4u << 20) || !map_shadow_wanted(ctx)) return;
+        std::lock_guard _{ g_map_shadow_mtx };
+        MapShadow* slot = nullptr;
+        for (auto& s : g_map_shadow) {
+            if (s.res == res && s.ctx == ctx) { slot = &s; g_map_shadow_lost++; break; }   // mapped again without our Unmap: the old copy is dropped
+            if (!slot && s.res == nullptr) slot = &s;
+        }
+        if (!slot) { g_map_shadow_full++; return; }   // table full: this map reads the driver's memory, as before
+        if (slot->res == nullptr) g_map_shadow_open++;
+        if (slot->buf.size() < size) slot->buf.resize(std::max<size_t>(size, 16384));   // grows only; operator new: 16-byte aligned, as a mapped pointer is
+        slot->ctx  = ctx;
+        slot->res  = res;
+        slot->real = mapped->pData;
+        slot->size = size;
+        mapped->pData = slot->buf.data();
+    }
+
+    // Before the real Unmap: our copy, with the mod's changes, goes to the driver's memory.
+    void map_shadow_end(ID3D11DeviceContext* ctx, ID3D11Resource* res)
+    {
+        if (g_map_shadow_open.load(std::memory_order_relaxed) == 0 || res == nullptr) return;
+        std::lock_guard _{ g_map_shadow_mtx };
+        for (auto& s : g_map_shadow) {
+            if (s.res == res && s.ctx == ctx) {
+                std::memcpy(s.real, s.buf.data(), s.size);
+                g_map_shadow_n++;
+                g_map_shadow_bytes += s.size;
+                s.res  = nullptr;
+                s.ctx  = nullptr;
+                s.real = nullptr;
+                g_map_shadow_open--;
+                return;
+            }
+        }
+    }
+
     using D3DReflectFn = HRESULT(WINAPI*)(const void*, SIZE_T, REFIID, void**);
     D3DReflectFn g_reflect{ nullptr };
     std::mutex   g_reflect_mtx{};
@@ -1252,6 +1364,15 @@ namespace
     safetyhook::InlineHook g_factory_create_sc_hwnd_hook{};
     safetyhook::InlineHook g_resize_buffers_hook{};
     UINT g_force_w = 0, g_force_h = 0;
+    // The size the game asked for its swap chain (its profile resolution: the desktop's in borderless), before it is forced
+    // to the headset's. menuunclip opens the menus' clip rectangle of that size too (a Pimax tester on a 2560x1440 desktop,
+    // 17 Nov: the Skills menu cut to its top-left 2560x1440 and the loading prompt after Continue missing).
+    std::atomic<UINT> g_game_w{ 0 }, g_game_h{ 0 };
+    void note_game_size(UINT w, UINT h)
+    {
+        if (w < 1024 || h < 576) return;
+        if ((g_game_w.exchange(w) != w) | (g_game_h.exchange(h) != h)) spdlog::info("[Menu] the game's own resolution {}x{} (menu clip rectangles of that size opened too)", w, h);
+    }
     UINT g_out_w = 0, g_out_h = 0;     // the eye images' size (headset eye size x resscale)
     float g_res_scale_start = 1.0f;     // resscale in effect this run
     float g_render_ratio_start = 1.0f;  // the "auto" render ratio of fc5vr_resolution.txt this run (1: DLAA)
@@ -1539,6 +1660,7 @@ namespace
         if (live) live_commit();
         if (g_live_state.load() != 0) ++g_live_calls;
         if (static int stacks = 0; stacks++ < 6) log_own_stack("the game's ResizeBuffers");
+        if (w != g_force_w || h != g_force_h) note_game_size(w, h);   // a Resolution change in its Video options
         if (force_applies(w, h)) { w = g_force_w; h = g_force_h; }
         if (auto& self = FarCry5Stereo::Get()) self->release_backbuffer_views();
         const HRESULT hr = g_resize_buffers_hook.call<HRESULT>(sc, count, w, h, fmt, flags);
@@ -1591,6 +1713,7 @@ namespace
             xr_size_check_apply();
             spdlog::info("[Res] the game creates its swap chain: {}x{} windowed={} buffers={} effect={}", d.BufferDesc.Width, d.BufferDesc.Height, d.Windowed, d.BufferCount,
                          (int)d.SwapEffect);
+            note_game_size(d.BufferDesc.Width, d.BufferDesc.Height);
             if (force_applies(d.BufferDesc.Width, d.BufferDesc.Height)) {
                 d.BufferDesc.Width       = g_force_w;
                 d.BufferDesc.Height      = g_force_h;
@@ -1621,6 +1744,7 @@ namespace
         if (desc) {
             xr_size_check_apply();
             spdlog::info("[Res] the game creates its swap chain (hwnd): {}x{} fullscreen desc={}", d.Width, d.Height, fs != nullptr);
+            note_game_size(d.Width, d.Height);
             if (force_applies(d.Width, d.Height)) {
                 d.Width  = g_force_w;
                 d.Height = g_force_h;
@@ -2860,6 +2984,7 @@ HRESULT WINAPI FarCry5Stereo::hk_map(ID3D11DeviceContext* ctx, ID3D11Resource* r
     fc5::hitch::HookTimer hitch_t{ fc5::hitch::kMapHooks };   // hitchlog
     FC5_TRACE("hk_map");
     static auto& self = Get();
+    if (other_thread()) return call_orig<HRESULT>(self->m_map_hook, 14, ctx, res, sub, type, flags, mapped);
     HRESULT hr;
     {
         fc5::hitch::HookTimer ht{ fc5::hitch::kMapOrig };
@@ -2882,6 +3007,12 @@ HRESULT WINAPI FarCry5Stereo::hk_map(ID3D11DeviceContext* ctx, ID3D11Resource* r
     if (FAILED(hr) || type != D3D11_MAP_WRITE_DISCARD || mapped == nullptr || mapped->pData == nullptr || res == nullptr) {
         return hr;
     }
+    // mapshadow: the first time this map is kept for reading, the game is handed our copy (the same pointer for every list below).
+    bool shadowed   = false;
+    auto shadow_ptr = [&](uint32_t bytes) -> float* {
+        if (!shadowed) { shadowed = true; map_shadow_begin(ctx, res, mapped, bytes); }
+        return static_cast<float*>(mapped->pData);
+    };
     if (self->m_cd_state.load() == 2) {
         D3D11_RESOURCE_DIMENSION dcd{};
         res->GetType(&dcd);
@@ -2889,7 +3020,7 @@ HRESULT WINAPI FarCry5Stereo::hk_map(ID3D11DeviceContext* ctx, ID3D11Resource* r
             D3D11_BUFFER_DESC bcd{};
             static_cast<ID3D11Buffer*>(res)->GetDesc(&bcd);
             for (auto& p : t_cd_pending) {
-                if (p.res == nullptr || p.res == res) { p = { res, static_cast<float*>(mapped->pData), bcd.ByteWidth }; break; }
+                if (p.res == nullptr || p.res == res) { p = { res, shadow_ptr(bcd.ByteWidth), bcd.ByteWidth }; break; }
             }
         }
     }
@@ -2902,25 +3033,25 @@ HRESULT WINAPI FarCry5Stereo::hk_map(ID3D11DeviceContext* ctx, ID3D11Resource* r
     static_cast<ID3D11Buffer*>(res)->GetDesc(&desc);
     if ((desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) != 0 && desc.ByteWidth >= 96 && self->m_menu_unclip.load() && (self->m_menu_screen_on || self->m_menu_fill_force.load())) {
         for (auto& p : t_menu_pending) {
-            if (p.res == nullptr || p.res == res) { p = { res, static_cast<float*>(mapped->pData), desc.ByteWidth }; break; }
+            if (p.res == nullptr || p.res == res) { p = { res, shadow_ptr(desc.ByteWidth), desc.ByteWidth }; break; }
         }
     }
     if ((desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) && (desc.StructureByteStride == 48 || desc.StructureByteStride == 144) &&
         desc.ByteWidth % desc.StructureByteStride == 0) {
         if (self->m_fast_lights.load() && self->m_muzzle_light.load() == 0) return hr;   // fastlights: nothing to do with the list
         for (auto& p : t_light_pending) {
-            if (p.res == nullptr || p.res == res) { p = { res, static_cast<float*>(mapped->pData), desc.ByteWidth }; break; }
+            if (p.res == nullptr || p.res == res) { p = { res, shadow_ptr(desc.ByteWidth), desc.ByteWidth }; break; }
         }
         return hr;
     }
     if ((desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) != 0 && desc.ByteWidth >= 64 && desc.ByteWidth <= 8192 && desc.ByteWidth != 1984 &&
         (self->m_eye_mats.load() || self->m_matscan_frames.load() > 0)) {
         for (auto& p : t_scan_pending) {
-            if (p.res == nullptr || p.res == res) { p = { res, static_cast<float*>(mapped->pData), desc.ByteWidth }; break; }
+            if (p.res == nullptr || p.res == res) { p = { res, shadow_ptr(desc.ByteWidth), desc.ByteWidth }; break; }
         }
     }
     if ((desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) != 0 && (desc.ByteWidth == 64 || desc.ByteWidth == 80 || desc.ByteWidth == 128 || desc.ByteWidth == 12288)) {
-        t_obj_pending = { res, static_cast<float*>(mapped->pData), desc.ByteWidth };
+        t_obj_pending = { res, shadow_ptr(desc.ByteWidth), desc.ByteWidth };
         if (g_bonesrc_left.load() > 0) bonesrc_note_map(res, desc.ByteWidth);   // bonesrc
         return hr;
     }
@@ -2929,13 +3060,13 @@ HRESULT WINAPI FarCry5Stereo::hk_map(ID3D11DeviceContext* ctx, ID3D11Resource* r
     // too, only while the weapon pass's camera is bound; everything else done with such a buffer below goes on as before.
     if ((desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) != 0 && (desc.ByteWidth == 192 || desc.ByteWidth == 384) && self->m_gst_wide_obj.load() && self->m_vs_cb0 &&
         self->is_weapon_cb(self->m_vs_cb0))
-        t_obj_wide_pending = { res, static_cast<float*>(mapped->pData), desc.ByteWidth };
+        t_obj_wide_pending = { res, shadow_ptr(desc.ByteWidth), desc.ByteWidth };
     if ((desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) == 0 || desc.ByteWidth < kMinBytes || desc.ByteWidth > 65536) {
         return hr;
     }
     for (auto& p : t_pending) {
         if (p.res == nullptr || p.res == res) {
-            p = { res, static_cast<float*>(mapped->pData), desc.ByteWidth };
+            p = { res, shadow_ptr(desc.ByteWidth), desc.ByteWidth };
             break;
         }
     }
@@ -2968,7 +3099,12 @@ void WINAPI FarCry5Stereo::hk_unmap(ID3D11DeviceContext* ctx, ID3D11Resource* re
     fc5::hitch::HookTimer hitch_t{ fc5::hitch::kMapHooks };   // hitchlog
     FC5_TRACE("hk_unmap");
     static auto& self = Get();
-    fc5::locallights::note_write(res);   // lampeye: a lamp list uploaded again is copied again
+    fc5::locallights::note_write(res);   // lampeye: a lamp list uploaded again is copied again (every thread)
+    if (other_thread()) {
+        map_shadow_end(ctx, res);   // mapshadow: a copy handed out on the render thread still reaches the driver if the Unmap comes from another thread
+        call_orig<void>(self->m_unmap_hook, 15, ctx, res, sub);
+        return;
+    }
     if (res != nullptr && fc5::rec::stereo_capture() && fc5::rec::is_deferred(ctx)) {
         // Stereo recording: both eyes' versions of this buffer; the left one goes into the recording,
         // and an eye-dependent buffer gets a stand-in fed per eye at execution.
@@ -2995,6 +3131,7 @@ void WINAPI FarCry5Stereo::hk_unmap(ID3D11DeviceContext* ctx, ID3D11Resource* re
             self->note_object_constants(res, t_obj_wide_pending.data, t_obj_wide_pending.size);
             t_obj_wide_pending = {};
         }
+        map_shadow_end(ctx, res);   // mapshadow: our copy to the driver's memory, before the real Unmap
         call_orig<void>(self->m_unmap_hook, 15, ctx, res, sub);
         return;
     }
@@ -3051,6 +3188,7 @@ void WINAPI FarCry5Stereo::hk_unmap(ID3D11DeviceContext* ctx, ID3D11Resource* re
             if (p.res == res) { self->cd_record('B', res, p.data, p.size, nullptr, 0, 0, 0); p = {}; break; }
         }
     }
+    map_shadow_end(ctx, res);   // mapshadow: our copy to the driver's memory, before the real Unmap
     fc5::hitch::HookTimer ht{ fc5::hitch::kMapOrig };
     call_orig<void>(self->m_unmap_hook, 15, ctx, res, sub);
 }
@@ -3749,6 +3887,8 @@ void WINAPI FarCry5Stereo::hk_update_subresource(ID3D11DeviceContext* ctx, ID3D1
     asm_note_other(dst, "UpdateSubresource");   // asmlog
     fc5::padglyph::on_update_subresource(dst, sub, box, src, row);   // padglyphs: a button icon written whole gets the controller's
     fc5::locallights::note_write(dst);            // lampeye
+    // These three stay on every thread (texture streaming writes the game's icons from its own threads); the rest only on the render thread.
+    if (other_thread()) { call_orig<void>(self->m_update_sub_hook, 48, ctx, dst, sub, box, src, row, depth); return; }
     if (self->m_lp_watch_log.load() > 0 && dst && (dst == self->m_lp_watch[0] || dst == self->m_lp_watch[1])) {
         self->m_lp_watch_log--;
         spdlog::info("[LightProbe] UpdateSubresource on light buffer {} box {} (frame {}, thread {})", (void*)dst, box ? fmt::format("{}..{}", box->left, box->right) : std::string("whole"),
@@ -9654,6 +9794,13 @@ bool FarCry5Stereo::weapon_draw_impl(ID3D11DeviceContext* ctx, UINT count, UINT 
         ID3D11PixelShader* ps = nullptr;
         ctx->PSGetShader(&ps, nullptr, nullptr);
         bool arm = false, bare = false;
+        // The input layout for the bait check below, read before m_ps_mtx is taken (no mod lock across a D3D11 call; 19 Nov,
+        // the deadlock with CheekyFoveatedDLSS FG). Only when that check can run: bare hands come only from these two switches.
+        ID3D11InputLayout* bait_il = nullptr;
+        if (ps != nullptr && count > 0 && m_hands_float.load() && (m_bare_hands.load() || fc5::bodyik::hand_roles_on())) {
+            ctx->IAGetInputLayout(&bait_il);
+            if (bait_il) bait_il->Release();   // compared by pointer only, as before
+        }
         if (ps != nullptr) {
             std::lock_guard _{ m_ps_mtx };
             arm = m_arm_shaders.contains(ps);
@@ -9669,9 +9816,7 @@ bool FarCry5Stereo::weapon_draw_impl(ID3D11DeviceContext* ctx, UINT count, UINT 
             // Bait: the game draws it with the skin's material (below: 2334 indices, #D31033ED), which with bare arms is the shader kept as the hands, so it was never looked at as a
             // throwable. A hand has bones and bait has none: a draw with no blend indices is not a hand (an indirect draw, count 0, cannot be told and stays).
             if (bare && count > 0) {
-                ID3D11InputLayout* il = nullptr;
-                ctx->IAGetInputLayout(&il);
-                if (il) il->Release();
+                ID3D11InputLayout* il = bait_il;
                 if (auto it = m_layouts.find(il); it != m_layouts.end() && std::none_of(it->second.begin(), it->second.end(), [](const LayoutElem& e) { return _stricmp(e.semantic.c_str(), "BLENDINDICES") == 0; })) {
                     arm   = true;
                     glove = false;
@@ -10126,14 +10271,20 @@ void WINAPI FarCry5Stereo::hk_draw_indexed(ID3D11DeviceContext* ctx, UINT count,
 // a clip rectangle. Laid out for the tall headset image, some menus (Skills, Challenges, the main menu's video and its
 // darkening) keep the profile's 16:9 corner (0, 0, 1920, 1080) as that rectangle: everything below and right of it was cut.
 // While a menu shows on the flat screen, that exact rectangle is opened to the whole image as the game writes it.
+// The 16:9 corner is the video's 1920x1080 (menufill <w> <h>) or the game's own resolution (its desktop's in borderless:
+// 2560x1440 on a Pimax tester's PC, 17 Nov, where the Skills menu stayed cut); both are opened.
 void FarCry5Stereo::menu_unclip(float* data, uint32_t size)
 {
-    const float w = float(m_menu_src_w.load()), h = float(m_menu_src_h.load());
+    const float w0 = float(m_menu_src_w.load()), h0 = float(m_menu_src_h.load());
+    const float w1 = float(g_game_w.load()), h1 = float(g_game_h.load());
     for (uint32_t i = 0; i + 4 <= size / 4; i += 4) {
-        if (data[i] == 0.0f && data[i + 1] == 0.0f && data[i + 2] == w && data[i + 3] == h) {
-            data[i + 2] = data[i + 3] = 16384.0f;
-            if (m_menu_unclip_logged++ < 6) spdlog::info("[Menu] menu clip rectangle {:.0f}x{:.0f} opened to the whole image (constants of {} bytes, at byte {})", w, h, size, i * 4);
-        }
+        if (data[i] != 0.0f || data[i + 1] != 0.0f) continue;
+        const float w = data[i + 2], h = data[i + 3];
+        const int   k = (w == w0 && h == h0) ? 0 : (w1 > 0.0f && w == w1 && h == h1) ? 1 : -1;
+        if (k < 0) continue;
+        data[i + 2] = data[i + 3] = 16384.0f;
+        if (m_menu_unclip_logged[k]++ < 3) spdlog::info("[Menu] menu clip rectangle {:.0f}x{:.0f} ({}) opened to the whole image (constants of {} bytes, at byte {})", w, h,
+                                                        k ? "the game's resolution" : "the video's", size, i * 4);
     }
 }
 
@@ -10515,6 +10666,7 @@ void WINAPI FarCry5Stereo::hk_om_set_rts(ID3D11DeviceContext* ctx, UINT n, ID3D1
     FC5_TRACE("hk_om_set_rts");
     static auto& self = Get();
     if (fc5::ownpass::active()) { call_orig<void>(self->m_om_set_rts_hook, 33, ctx, n, rtvs, dsv); return; }   // the mod's own short passes (hidmask)
+    if (other_thread()) { call_orig<void>(self->m_om_set_rts_hook, 33, ctx, n, rtvs, dsv); return; }   // (asmlog's foreign-bind count stays 0)
     if (const DWORD rt = g_wd_render_tid.load(); rt == 0 || GetCurrentThreadId() == rt) {
         // asmfloor: the far-shadow atlas (2560x1792, 16-bit depth) bound as the depth target.
         bool is_atlas = false;
@@ -11139,6 +11291,7 @@ void WINAPI FarCry5Stereo::hk_clear_rtv(ID3D11DeviceContext* ctx, ID3D11RenderTa
 {
     fc5::hitch::HookTimer hitch_t{ fc5::hitch::kStateHooks };   // hitchlog
     static auto& self = Get();
+    if (other_thread()) { call_orig<void>(self->m_clear_rtv_hook, 50, ctx, rtv, color); return; }
     if (self->m_lab_order_state.load(std::memory_order_relaxed) == 2 && !foreign_thread()) self->lab_note(ctx, "ClearRenderTargetView", rtv, nullptr, nullptr);   // shadow lab: passorder
     if (rtv && color && self->m_ssr_out_res[0] && !foreign_thread()) {
         ID3D11Resource* r = nullptr;
@@ -11153,6 +11306,7 @@ void WINAPI FarCry5Stereo::hk_clear_uav_uint(ID3D11DeviceContext* ctx, ID3D11Uno
 {
     fc5::hitch::HookTimer hitch_t{ fc5::hitch::kStateHooks };   // hitchlog
     static auto& self = Get();
+    if (other_thread()) { call_orig<void>(self->m_clear_uavu_hook, 51, ctx, uav, values); return; }
     if (self->m_lab_order_state.load(std::memory_order_relaxed) == 2 && !foreign_thread()) self->lab_note(ctx, "ClearUnorderedAccessViewUint", uav, nullptr, nullptr);   // shadow lab: passorder
     if (uav && values && self->m_ssr_out_res[0] && !foreign_thread()) {
         ID3D11Resource* r = nullptr;
@@ -11168,6 +11322,7 @@ void WINAPI FarCry5Stereo::hk_clear_uav_float(ID3D11DeviceContext* ctx, ID3D11Un
 {
     fc5::hitch::HookTimer hitch_t{ fc5::hitch::kStateHooks };   // hitchlog
     static auto& self = Get();
+    if (other_thread()) { call_orig<void>(self->m_clear_uavf_hook, 52, ctx, uav, values); return; }
     if (self->m_lab_order_state.load(std::memory_order_relaxed) == 2 && !foreign_thread()) self->lab_note(ctx, "ClearUnorderedAccessViewFloat", uav, nullptr, nullptr);   // shadow lab: passorder
     if (uav && values && self->m_ssr_out_res[0] && !foreign_thread()) {
         ID3D11Resource* r = nullptr;
@@ -21129,6 +21284,11 @@ void FarCry5Stereo::poll_commands()
             else if (cmd == "gputime") fc5::gputime::set_enabled(on);
             else if (cmd == "probeoff") m_probe_off = on;
             else if (cmd == "fastlights") m_fast_lights = on;
+            else if (cmd == "mapshadow") {   // mapshadow on|off|auto (not saved; default auto: on when the game's GPU is not NVIDIA's)
+                g_map_shadow_mode = arg == "on" ? 1 : arg == "off" ? 0 : 2;
+                spdlog::info("[MapShadow] mapshadow {} (in use now: {})", arg == "on" || arg == "off" ? arg : std::string{ "auto" },
+                             g_map_shadow_mode.load() == 2 ? (g_map_shadow_auto.load() == 1 ? "on" : g_map_shadow_auto.load() == 0 ? "off" : "not decided yet") : arg.c_str());
+            }
             else if (cmd == "logbuffered") set_log_buffered(on);
             else if (cmd == "snapresetfix") m_snap_reset_fix = on;
             else if (cmd == "pairjumps") m_pair_jumps = on;
@@ -21598,7 +21758,7 @@ void FarCry5Stereo::poll_commands()
         else if (cmd == "depthprobe") m_probe_depth = true;
         else if (cmd == "afw") m_afw_test = on;
         else if (cmd == "render") {
-            // render afw | stereo: the headset rendering mode (F11 "Rendering", F8 toggles), saved.
+            // render afw | stereo: the headset rendering mode (F11 "Rendering"), saved.
             const bool st = arg == "stereo";
             m_stereo2     = st;
             m_afw_test    = !st;
@@ -22243,6 +22403,9 @@ void FarCry5Stereo::on_post_present()
                 spdlog::info("[Perf] last 5 s: {} eye pairs ({:.1f}/s), mean {:.2f} ms, longest {:.1f} ms, {} pairs over 20.8 ms; video memory {} of {} MB budget{}", pairs,
                              pairs / std::chrono::duration<double>(now - last_log).count(), pairs ? sum_ms / pairs : 0.0, max_ms, slow,
                              vm_ok ? int(vm.CurrentUsage >> 20) : -1, vm_ok ? int(vm.Budget >> 20) : -1, vm_ok && vm.CurrentUsage > vm.Budget ? " (OVER BUDGET: paging)" : "");
+                if (const uint64_t n = g_map_shadow_n.exchange(0), full = g_map_shadow_full.exchange(0), lost = g_map_shadow_lost.exchange(0); n || full || lost)
+                    spdlog::info("[MapShadow] last 5 s: {} game buffer writes through the mod's copy ({:.1f} MB, {:.0f}/s), {} read from the driver's memory (table full), {} not unmapped through the hook",
+                                 n, g_map_shadow_bytes.exchange(0) / 1048576.0, n / std::chrono::duration<double>(now - last_log).count(), full, lost);
                 last_log = now;
                 pairs = slow = 0;
                 max_ms = sum_ms = 0.0;
@@ -22456,18 +22619,8 @@ void FarCry5Stereo::on_post_present()
         m_body_valid = false;
         spdlog::info("[Motion] {} (F7)", m_motion.load() ? "on" : "off");
     }
-    if (hotkey(VK_F8)) {
-        // F8: AFW <-> stereo (from the mode shown: AFW while afwstartstereo stands in with Stereo).
-        const bool st = !(m_stereo2.load() && !m_afw_start_held);
-        m_stereo2     = st;
-        m_afw_test    = !st;
-        m_afw_start_held = false;
-        m_afw_start_done = true;
-        m_persist.erase("afw");
-        m_persist["render"] = st ? "render stereo" : "render afw";
-        save_settings();
-        spdlog::info("[Render] {} (F8, saved)", st ? "stereo" : "AFW");
-    }
+    // F8 no longer switches AFW / Stereo (author 19 Nov 21:24): F8 is CheekyFoveatedDLSS's menu key. F11 > Rendering and the
+    // render command still switch it.
     if (vr->is_hmd_active() && hotkey(VK_F9)) m_recenter_requested = true;
     if (const uint32_t n = runtimes::OpenXR::s_fc5_local_space_changes.load(); n != m_local_changes_seen) {
         // headsetrecenter: the headset's own recenter moved the runtime's LOCAL space (the view jumped with it, height
@@ -22992,7 +23145,7 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
         // Stereo first (29 Oct, the author's 14:50 log: the list opens under the pointer, so a stray click lands on the first entry;
         // AFW first turned one into a switch to AFW). Only the list order changed: the saved line is still "render stereo|afw".
         int mode = m_stereo2.load() && !m_afw_start_held ? 0 : 1;   // AFW shown while afwstartstereo stands in with Stereo
-        if (combo("Rendering (F8)", &mode, "Stereo\0AFW (early experimental, visible artifacts)\0")) {
+        if (combo("Rendering", &mode, "Stereo\0AFW (early experimental, visible artifacts)\0")) {
             const bool st = mode == 0;
             m_stereo2  = st;
             m_afw_test = !st;
@@ -24693,7 +24846,7 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
             table("gesture", kGesture, 2);
             hint("Holding the weapon with two hands (left grip at the fore-end) does not count as the modifier. Thumbrest and trigger touches do nothing. "
                  "Gestures work on foot only. Both stick clicks open and close this menu. In this menu: point and press A or the trigger, right stick up / down scrolls, left / right "
-                 "nudges the slider under the pointer. Keys: F6 capture, F7 motion controls, F8 Stereo / AFW, F9 recenter, F11 this menu, F12 flat screen.");
+                 "nudges the slider under the pointer. Keys: F6 capture, F7 motion controls, F9 recenter, F11 this menu, F12 flat screen.");
         }
         // stickjump, footbuttons (FarCry5FootPad.cpp; author 11 Nov): the on-foot buttons.
         section("On foot: switches");

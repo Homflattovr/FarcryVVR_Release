@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.4 (21 November 2026)
+Full notes: [release/RELEASE_NOTES_v1.0.4.md](release/RELEASE_NOTES_v1.0.4.md).
+- **Fixed:** AMD (Radeon) cards no longer drop to 2-5 fps in the world (not tried in real play yet).
+- **Fixed:** the game no longer freezes with CheekyFoveatedDLSS's frame generation (not tried in real play yet).
+- **Fixed:** menus are no longer cut off on 2560x1440 screens.
+- **Changed:** the game's reticle is turned off for you in VR (`reticleoff off` keeps it).
+- **Changed:** CheekyFoveatedDLSS, when installed, is loaded by the mod; F8 is left to it (Stereo / AFW in F11 > Display > Rendering).
+- **Changed:** the launcher window can be resized.
+- **Added:** built-in hand positions for the bows, the slingshot and a pipe, and six more grip points.
+
 ## 1.0.3 (17 November 2026): hotfix
 Full notes: [release/RELEASE_NOTES_v1.0.3.md](release/RELEASE_NOTES_v1.0.3.md).
 - **Fixed:** magnifying scopes (ACOG, SPECTER...) get the scope picture again, also after an optic change; data from

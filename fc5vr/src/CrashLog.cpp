@@ -885,6 +885,8 @@ void log_bin_dlls()
             std::string plow = product;
             for (auto& ch : plow) ch = (char)tolower((unsigned char)ch);
             if (low == L"openvr_api.dll") warnings.push_back("openvr_api.dll is in bin: the mod tries OpenVR first; remove it to use OpenXR");
+            else if (low == L"version.dll" && GetFileAttributesW((std::wstring{ g_exe_dir } + L"CheekyFoveatedDLSS\\CheekyFoveatedDLSSHost.dll").c_str()) != INVALID_FILE_ATTRIBUTES)
+                ;   // CheekyFoveatedDLSS's loader: the mod loads it itself ([Cheeky] lines, Main.cpp LoadCheekyIfInstalled)
             else if (low == L"d3d11.dll" || low == L"dinput8.dll" || low == L"version.dll" || low == L"winmm.dll" || low == L"d3d9.dll" || low == L"dxgi_.dll")
                 warnings.push_back(utf8(name) + " is in bin: another mod or overlay loads itself into the game this way and may clash with the VR mod");
             if (plow.find("reshade") != std::string::npos) warnings.push_back(utf8(name) + " is ReShade: it can clash with the VR mod");

@@ -122,7 +122,7 @@ namespace
     R wa_call_orig(safetyhook::InlineHook& h, int idx, ID3D11DeviceContext* ctx, A... a)
     {
         if (fc5::rec::is_deferred(ctx)) return reinterpret_cast<R(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, A...)>(fc5::rec::deferred_method(idx))(ctx, a...);
-        return h.call<R>(ctx, a...);
+        return h.unsafe_call<R>(ctx, a...);
     }
 
     // The glyphs: polylines (one per stroke) in a 0.56 x 1 cell, y up, as segments: 0-9, '/', '-' (the table of research\2026-11-05_wristammo2\glyphs.py).

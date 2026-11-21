@@ -82,7 +82,7 @@ template <typename R, typename... A>
 static R call_orig(safetyhook::InlineHook& h, int idx, ID3D11DeviceContext* ctx, A... a)
 {
     if (fc5::rec::is_deferred(ctx)) return reinterpret_cast<R(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, A...)>(fc5::rec::deferred_method(idx))(ctx, a...);
-    return h.call<R>(ctx, a...);
+    return h.unsafe_call<R>(ctx, a...);
 }
 
 // hudmarklabel on|off (test, not saved; default on): an objective marker with an action label beside its icon stays in the world (kGroups).

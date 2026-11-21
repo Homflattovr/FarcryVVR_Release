@@ -8,7 +8,11 @@
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <d3d12.h>
+#include <ShlObj.h>
 #include <algorithm>
+#include <cctype>
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 #include <filesystem>
 #include <fstream>
 #include <vector>
@@ -199,6 +203,178 @@ static LauncherChoice ReadLauncherChoice() {
     return c;
 }
 
+// reticleoff (default on; a line "reticleoff off" in fc5vr_settings.txt leaves the player's choice): the game's reticle off in
+// VR (Options > Interface > Reticle). It stays fixed in the middle of the HUD whatever the gun does. Author 19 Nov: many testers
+// still had it (the launcher only offered it, with a Yes/No for all the game options, and a game started without the launcher
+// was never checked). HelpCrosshair="0" in Documents\My Games\Far Cry 5\gamerprofile.xml, set here before the game reads the
+// file (this thread starts while the game loads dxgi.dll), added when the file does not have it (the game's default is on).
+// The file as it was is kept as gamerprofile.xml.fc5vr_backup (the first time, never overwritten) and .fc5vr_last, as the
+// launcher does; the new text goes to a temporary file first, then replaces it.
+static void ReticleOffInProfile() {
+    try {
+        {
+            std::ifstream s{ fc5::mod_file("fc5vr_settings.txt") };
+            std::string   l;
+            while (std::getline(s, l)) {
+                while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back();
+                if (l == "reticleoff off") {
+                    spdlog::info("[Launcher] reticleoff off (fc5vr_settings.txt): the game's Reticle option left as it is");
+                    return;
+                }
+            }
+        }
+        PWSTR docs = nullptr;
+        if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs)) || docs == nullptr) {
+            if (docs) CoTaskMemFree(docs);
+            spdlog::info("[Launcher] reticleoff: no Documents folder, the game's Reticle option not checked");
+            return;
+        }
+        const std::filesystem::path p = std::filesystem::path{ docs } / L"My Games" / L"Far Cry 5" / L"gamerprofile.xml";
+        CoTaskMemFree(docs);
+        std::string t;
+        {
+            std::ifstream f{ p, std::ios::binary };
+            if (!f) {
+                spdlog::info("[Launcher] reticleoff: no Documents\\My Games\\Far Cry 5\\gamerprofile.xml yet (the game writes it at its first start)");
+                return;
+            }
+            t.assign(std::istreambuf_iterator<char>{ f }, std::istreambuf_iterator<char>{});
+        }
+        const std::string el  = "<ProfileSpecificGameProfile";
+        const size_t      tag = t.find(el + ' ');
+        const size_t      end = tag == std::string::npos ? std::string::npos : t.find('>', tag);
+        if (end == std::string::npos) {
+            spdlog::info("[Launcher] reticleoff: gamerprofile.xml has no ProfileSpecificGameProfile, the game's Reticle option not checked");
+            return;
+        }
+        const std::string at = "HelpCrosshair=\"";
+        size_t            a  = t.find(at, tag);
+        while (a != std::string::npos && a < end && !std::isspace((unsigned char)t[a - 1])) a = t.find(at, a + 1);
+        std::string was = "missing";
+        if (a != std::string::npos && a < end) {
+            const size_t v = a + at.size();
+            const size_t q = t.find('"', v);
+            if (q == std::string::npos || q > end) return;
+            was = t.substr(v, q - v);
+            if (was == "0") {
+                spdlog::info("[Launcher] reticleoff: the game's Reticle is already off");
+                return;
+            }
+            t.replace(v, q - v, "0");
+        } else {
+            t.insert(tag + el.size(), " HelpCrosshair=\"0\"");
+        }
+        std::error_code ec;
+        auto            with = [&](const wchar_t* ext) { auto c = p; c += ext; return c; };
+        if (!std::filesystem::exists(with(L".fc5vr_backup"), ec)) std::filesystem::copy_file(p, with(L".fc5vr_backup"), ec);
+        std::filesystem::copy_file(p, with(L".fc5vr_last"), std::filesystem::copy_options::overwrite_existing, ec);
+        const DWORD fa = GetFileAttributesW(p.c_str());
+        if (fa != INVALID_FILE_ATTRIBUTES && (fa & FILE_ATTRIBUTE_READONLY)) SetFileAttributesW(p.c_str(), fa & ~FILE_ATTRIBUTE_READONLY);
+        {
+            std::ofstream o{ with(L".fc5vr_tmp"), std::ios::binary | std::ios::trunc };
+            o.write(t.data(), (std::streamsize)t.size());
+            if (!o) {
+                spdlog::warn("[Launcher] reticleoff: could not write gamerprofile.xml.fc5vr_tmp, the game's Reticle option left as it is");
+                return;
+            }
+        }
+        if (!MoveFileExW(with(L".fc5vr_tmp").c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            spdlog::warn("[Launcher] reticleoff: could not replace gamerprofile.xml (error {}), the game's Reticle option left as it is", GetLastError());
+            return;
+        }
+        spdlog::info("[Launcher] reticleoff: the game's Reticle turned off in gamerprofile.xml (HelpCrosshair was {}; the file as it was: gamerprofile.xml.fc5vr_last)", was);
+    } catch (...) {
+        spdlog::warn("[Launcher] reticleoff: gamerprofile.xml not changed (error)");
+    }
+}
+
+// cheeky (default on; a line "cheeky off" in fc5vr_settings.txt skips it): CheekyFoveatedDLSS (ClarkCheekyKent, GPL v3; the player
+// installs it, the mod neither ships nor links it) loaded by the mod. Its Standalone package puts version.dll and a
+// CheekyFoveatedDLSS\ folder beside FarCry5.exe, but Windows never loads that version.dll in this game: only the mod's dxgi.dll
+// imports VERSION.dll, and System32's copy is already in the process by then (author 19 Nov 21:00: no Cheeky log, no ini; the
+// same on the 5 Nov trial). So when both are there, the mod loads bin\version.dll itself, by full path, before its early hooks
+// and before the game makes its D3D11 device. Cheeky's loader forwards the VERSION exports to System32 and starts its host
+// (CheekyFoveatedDLSS\CheekyFoveatedDLSSHost.dll) on its own thread; its log and ini are written in that folder.
+// Cheeky keeps its own menu key, F8 (author 19 Nov 21:24); the mod no longer uses F8 (AFW / Stereo is in F11 only).
+static bool g_cheeky_loaded = false;
+
+static void LoadCheekyIfInstalled() {
+    try {
+        const std::filesystem::path bin    = std::filesystem::path{ fc5::exe_dir() };
+        const std::filesystem::path folder = bin / L"CheekyFoveatedDLSS";
+        const std::filesystem::path host   = folder / L"CheekyFoveatedDLSSHost.dll";
+        const std::filesystem::path loader = bin / L"version.dll";
+        std::error_code             ec;
+        if (!std::filesystem::exists(host, ec)) {
+            return;   // not installed: nothing to say
+        }
+        {
+            std::ifstream s{ fc5::mod_file("fc5vr_settings.txt") };
+            std::string   l;
+            while (std::getline(s, l)) {
+                while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back();
+                if (l == "cheeky off") {
+                    spdlog::info("[Cheeky] CheekyFoveatedDLSS found in bin but not loaded: cheeky off (fc5vr_settings.txt)");
+                    return;
+                }
+            }
+        }
+        if (!std::filesystem::exists(loader, ec)) {
+            spdlog::warn("[Cheeky] bin\\CheekyFoveatedDLSS found but no version.dll beside FarCry5.exe: copy Cheeky's version.dll from its "
+                         "Standalone zip too (not its dxgi.dll, which would replace the mod's). Cheeky not loaded");
+            return;
+        }
+        // Cheeky's loader names its host's entry point; another mod's version.dll is left alone.
+        std::string bytes;
+        {
+            std::ifstream f{ loader, std::ios::binary };
+            bytes.assign(std::istreambuf_iterator<char>{ f }, std::istreambuf_iterator<char>{});
+        }
+        if (bytes.find("CheekyHost_Start") == std::string::npos) {
+            spdlog::warn("[Cheeky] bin\\CheekyFoveatedDLSS found but bin\\version.dll is not Cheeky's loader (another mod's?): Cheeky not loaded");
+            return;
+        }
+        if (GetModuleHandleW(loader.c_str()) != nullptr) {
+            g_cheeky_loaded = true;
+            spdlog::info("[Cheeky] Windows already loaded bin\\version.dll (Cheeky's loader): nothing to do");
+            return;
+        }
+        std::string sys_version = "not loaded yet";
+        if (HMODULE v = GetModuleHandleW(L"version.dll")) {
+            wchar_t p[MAX_PATH]{};
+            GetModuleFileNameW(v, p, MAX_PATH);
+            sys_version = std::filesystem::path{ p }.string();
+        }
+        fc5::crash::step("cheeky");
+        HMODULE     h   = LoadLibraryW(loader.c_str());
+        const DWORD err = h ? 0 : GetLastError();
+        if (!h) {
+            spdlog::warn("[Cheeky] LoadLibrary of bin\\version.dll (Cheeky's loader) FAILED, Windows error {}: Cheeky not running", err);
+            return;
+        }
+        g_cheeky_loaded = true;
+        spdlog::info("[Cheeky] Cheeky's loader bin\\version.dll loaded by the mod at {} (the game's version.dll: {}); its host starts on its own "
+                     "thread, log and ini in bin\\CheekyFoveatedDLSS. cheeky off in fc5vr_settings.txt skips it",
+                     fmt::ptr(h), sys_version);
+    } catch (...) {
+        spdlog::warn("[Cheeky] not loaded (error while checking bin\\CheekyFoveatedDLSS)");
+    }
+}
+
+// A few seconds later (framework done): did Cheeky's host and runtime come up?
+static void LogCheekyState() {
+    if (!g_cheeky_loaded) return;
+    const std::filesystem::path folder = std::filesystem::path{ fc5::exe_dir() } / L"CheekyFoveatedDLSS";
+    std::error_code             ec;
+    const bool                  host    = GetModuleHandleW(L"CheekyFoveatedDLSSHost.dll") != nullptr;
+    const bool                  runtime = GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll") != nullptr;
+    const bool                  log     = std::filesystem::exists(folder / L"CheekyFoveatedDLSS-Host.log", ec);
+    const bool                  ini     = std::filesystem::exists(folder / L"CheekyFoveatedDLSS.ini", ec);
+    spdlog::info("[Cheeky] host {}, runtime {}, host log {}, CheekyFoveatedDLSS.ini {}{}", host ? "loaded" : "NOT loaded",
+                 runtime ? "loaded" : "not loaded", log ? "written" : "missing", ini ? "present" : "missing",
+                 host ? "" : " (see bin\\CheekyFoveatedDLSS for Cheeky's own log)");
+}
+
 void InitThread(HINSTANCE hModule) {
     fc5::crash::step("init thread");
     const LauncherChoice launcher = ReadLauncherChoice();
@@ -216,11 +392,14 @@ void InitThread(HINSTANCE hModule) {
     }
     InstallFileLogger();
     fc5::crash::step("log open");
+    ReticleOffInProfile();
     fc5::crash::cleanup_old_reports();
     EnableDredIfRequested();
     UseTestRuntimeIfRequested();
     fc5::crash::log_boot_header();
     fc5::crash::start_boot_watchdog();
+    // Before the early hooks, where Windows would have loaded it as the mod's own import (its DllMain then ran before the mod's).
+    LoadCheekyIfInstalled();
     // Before the game makes its D3D11 device: the shader catalogue needs every shader it creates.
     fc5::crash::step("early hooks");
     FarCry5Stereo::install_early_hooks();
@@ -231,6 +410,7 @@ void InitThread(HINSTANCE hModule) {
     g_framework = std::make_unique<Framework>(hModule);
     RestoreFileLogger();
     fc5::crash::step("framework done");
+    LogCheekyState();
     // AFW shaders compiled while the game boots (they cost the first frame ~4 s when compiled there).
     fc5::afw::precompile();
     FarCry5Stereo::log_start_notes();
