@@ -87,7 +87,8 @@ namespace fc5::reload
     bool ledger_low();                  // the ledger's gun with 4 real rounds or fewer (its clip read every update: the game's may read full after a top-up)
     bool ledger_now();                  // ammoledger: the gun in hand is the ledger's this poll (its clip read every update while low, as keep_one's)
     bool b_heal_only();                 // bheal (manualreload38, default on): right B held heals, never switches weapon
-    bool b_heal_y(bool b_down);         // bheal: whether right B is the pad's Y now (held back for reloadtap ms, then held at least bhealms ms)
+    bool b_heal_y(bool b_down, bool menu = false);   // bheal: whether right B is the pad's Y now (held back for reloadtap ms, then held at least bhealms ms;
+                                                     // menu: the game's menu screen, where it is the pad's Y at the press)
     void b_heal_throw();                // bheal: this right B press is the throw (left grip + B): no Y
     bool b_quick_taken();               // bheal: a quick right B was let go since the last ask (cleared by asking)
     bool veh_b_reload();                // vehbreload (saved, default on): in a vehicle a quick right B is the game's reload (ModConfig.cpp)

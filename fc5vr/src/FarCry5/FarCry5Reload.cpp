@@ -746,6 +746,9 @@ namespace
     // in the hands, ModConfig.cpp taps the game's reload (pad X) for it. Off: a quick right B does nothing in a vehicle, as before.
     std::atomic<bool>  g_veh_b_reload{ true };
     std::atomic<bool>  g_hb_quick{ false };     // a quick right B was let go since ModConfig last asked (b_quick_taken)
+    // menubinstant (always on, no switch; author 21 Nov 19:47Z: no F11 switch) (author 21 Nov): on the game's menu screen (flat_screen_on: the store, the pause menu, the map) a right B
+    // press is the pad's Y from the press, not after reloadtap ms (there is no reload or heal there), still held at least bhealms ms. Such a press
+    // is never a quick B (vehbreload) nor held back by the manual reload (ModConfig.cpp).
     std::atomic<float> g_drop_floor{ 1.6f };
     std::atomic<uint32_t> g_ejects{ 0 };   // rounds ejected by a pull of the handle (FarCry5ReloadMag.cpp draws each)
     std::atomic<bool>  g_pump_shot{ true };   // reloadpumpshot: a pump shotgun's pump must be worked after each shot
@@ -810,7 +813,7 @@ namespace
     // of the last main draw as it was, a frame or an eye's pass old, so it trailed the gun by the walk's step. On: that body carried into the
     // pass as the drawn gun is held (on the weapon controller); ReloadMag. Off: as before.
     std::atomic<bool>  g_held_follow{ true };
-    // reloadballfollow on|off (not saved, default on; author 16 Nov 10:37, build DE0001F3, the M133 modern long 29841; his picture: the yellow ball out past the muzzle while a shell was in the left hand). Since
+    // reloadballfollow on|off (saved since 21 Nov, default on; author 16 Nov 10:37, build DE0001F3, the M133 modern long 29841; his picture: the yellow ball out past the muzzle while a shell was in the left hand). Since
     // reloadzonesfollow (8 Nov) the pad poll measures the gun-attached points (well, handle, highlight boxes) and catches the shell on the gun
     // as DRAWN (Gesture.cpp ri.gun_pos / gun_rot: the gunstock calibration's one-hand turn, two hands, stockeye), but GestureZones still drew
     // the well's yellow ball, the shell sliding in, the handle's blue ball and the highlight boxes on the raw weapon controller. His M133 is
@@ -1896,7 +1899,7 @@ bool highlight(uint32_t sig, int which, HlBox& b)
     b = it->second[which];
     return true;
 }
-bool b_heal_y(bool b_down)
+bool b_heal_y(bool b_down, bool menu)
 {
     std::lock_guard _{ g_heal_mtx };
     const auto now      = clock::now();
@@ -1906,6 +1909,12 @@ bool b_heal_y(bool b_down)
         g_hb_t0    = now;
         g_hb_throw = false;
         if (!y_runs) g_hb_y = false;   // a new press during the minimum hold carries it on (no tap in between)
+        if (menu && !g_hb_y) {   // menubinstant: the game's menu screen, the pad's Y at once
+            g_hb_y  = true;
+            g_hb_y0 = now;
+            static int said = 0;
+            if (said++ < 60) spdlog::info("[Reload] menubinstant: right B on the menu screen: the pad's Y at once (held at least {} ms)", hold_ms);
+        }
     } else if (!b_down && g_hb_down && !g_hb_y && !g_hb_throw) {
         g_hb_quick = true;   // vehbreload: the game's reload in a vehicle (ModConfig.cpp)
         if (g_log.load()) spdlog::info("[Reload] bheal: quick right B ({:.0f} ms): no weapon switch", ms_since(g_hb_t0, now));
@@ -4465,6 +4474,7 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
     }
     if (cmd == "reloadballfollow") {
         g_ball_follow = arg.empty() || on;
+        persist       = true;   // saved since 21 Nov (F11 settings audit: its F11 checkbox was the only one of Hip and left hand not kept)
         spdlog::info("[Reload] reloadballfollow {}", g_ball_follow.load() ? "on: the well's ball, the shell going in and the handle's ball drawn on the gun as drawn (its turn off the controller)"
                                                                           : "off: drawn on the raw weapon controller, as before (off the gun when it is drawn turned)");
         return true;

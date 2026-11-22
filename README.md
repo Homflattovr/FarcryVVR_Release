@@ -6,7 +6,7 @@ own hands, a full body (on by default), body gestures to switch, sling and holst
 hands on the real steering wheel, a HUD that floats in front of you, and comfort options for driving, flying and
 cutscenes.
 
-**[Download version 1.0.4](https://github.com/Homflattovr/FarcryVVR_Release/releases/latest)** (the `FC5VR_v1.0.4.zip` file)
+**[Download version 1.0.5](https://github.com/Homflattovr/FarcryVVR_Release/releases/latest)** (the `FC5VR_v1.0.5.zip` file)
 
 **Support this project**: https://ko-fi.com/homard47885
 
@@ -143,9 +143,10 @@ folder. With OptiScaler installed, OFXR Bridge's DLSS motion vectors do not work
 
 ## Game options the mod needs
 
-The launcher checks these when you press Play in VR and offers to set them (its **Change to correct settings**
-button; it keeps a backup of your options file, `Documents\My Games\Far Cry 5\gamerprofile.xml.fc5vr_backup`). You
-can also set them in the game's Options:
+The mod sets these for you each time the game starts in VR, also without the launcher; **Play in VR** in the
+launcher sets them too. Your other options are kept, and the first time a backup of your options file is kept
+(`Documents\My Games\Far Cry 5\gamerprofile.xml.fc5vr_backup`). To keep your own values, add the line
+`gameoptions off` to `fc5vr_settings.txt` and set them in the game's Options:
 
 | Option | Value |
 | --- | --- |

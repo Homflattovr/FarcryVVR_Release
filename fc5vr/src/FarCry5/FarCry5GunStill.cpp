@@ -2613,9 +2613,15 @@ bool FarCry5Stereo::gun_still_command(const std::string& cmd, const std::string&
         spdlog::info("[Motion] gunposebuiltin {} (from the next launch)", on ? "on: a gun not learnt yet starts from its built-in pose, grip point and right hand" : "off: each gun learnt in play only");
         return true;
     }
-    if (cmd == "reticleoff") {   // on (default) | off, saved, read at start (Main.cpp ReticleOffInProfile): the game's Reticle option set off in gamerprofile.xml
+    if (cmd == "reticleoff") {   // on (default) | off, saved, read at start (Main.cpp EnforceGameOptionsAtLoad): the game's Reticle option set off in gamerprofile.xml
         persist = true;
-        spdlog::info("[Launcher] reticleoff {} (from the next launch)", on ? "on: the game's Reticle option set off at each start" : "off: the game's Reticle option left as the player sets it");
+        spdlog::info("[GameOptions] reticleoff {} (from the next launch)", on ? "on: the game's Reticle option set off at each start" : "off: the game's Reticle option left as the player sets it");
+        return true;
+    }
+    if (cmd == "gameoptions") {   // on (default) | off, saved, read at start (Main.cpp EnforceGameOptionsAtLoad): the game options the mod needs set in gamerprofile.xml
+        persist = true;
+        spdlog::info("[GameOptions] gameoptions {} (from the next launch)", on ? "on: the game options the mod needs (Borderless, FOV 120, SMAA, V-Sync off, ...) set at each VR start"
+                                                                             : "off: the game options left as the player sets them (the Reticle still follows reticleoff)");
         return true;
     }
     if (cmd == "cheeky") {   // on (default) | off, saved, read at start (Main.cpp LoadCheekyIfInstalled): CheekyFoveatedDLSS loaded when it is in bin

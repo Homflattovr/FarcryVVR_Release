@@ -160,6 +160,8 @@ private:
 
 public:
     static void install_early_hooks();
+    // The resolution hooks alone, once (Main.cpp calls it before loading CheekyFoveatedDLSS; install_early_hooks calls it again, a no-op).
+    static void install_swap_chain_hooks();
     // Before the framework makes its OpenXR instance: the start headset check (other headsets) is finished first;
     // then the start notes (eye size, headset check) are written to the log file, which did not exist yet.
     static void wait_headset_check();

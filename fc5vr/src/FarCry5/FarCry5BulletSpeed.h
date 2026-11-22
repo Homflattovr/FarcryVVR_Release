@@ -33,8 +33,16 @@ namespace fc5::bullet
     // the player's trigger down within 500 ms, and (shotowner) the first call after each of the mod's releases or a later one from the
     // player's weapon objects so found, so other characters' shots are left out.
     void  set_player_shot_callback(void (*cb)());
-    // drivegunthrottle rt's guard (ModConfig.cpp): every shot code call so far, any character's (the hook above; 0 while it is off).
+    // Every shot code call so far, any character's (the hook above; 0 while it is off).
     uint64_t shot_calls();
+    // drivegunthrottle rt's guard (ModConfig.cpp; gunthrottle3, 22 Nov): the driver's own sidearm told from other characters' guns.
+    // note_drive_pad: each poll of the drive buttons layout, whether the pad sends LB (the drive-and-shoot fire) and right A's throttle.
+    // A weapon object (r14) firing within 300 ms of LB is the driver's sidearm (up to 4 kept); one of them firing with LB and the
+    // throttle both up for over 1.5 s is someone else's gun and is dropped. driver_shot_calls: shot code calls from those objects so far;
+    // other_shot_calls: every other call (enemies, other characters).
+    void     note_drive_pad(bool lb, bool throttle);
+    uint64_t driver_shot_calls();
+    uint64_t other_shot_calls();
     // shotowner on|off (default on, not saved; F11 Tests): off is the rule before 15 Nov (the weapon of the press's first shot code call).
     void  set_shot_owner(bool on);
     bool  shot_owner();

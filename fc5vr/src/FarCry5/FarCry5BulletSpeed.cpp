@@ -272,6 +272,11 @@ namespace fc5::bullet
         std::atomic<uint64_t>              g_rel_seq{ 0 }, g_rel_ms{ 0 };
         std::atomic<bool>                  g_owner_on{ true };   // shotowner on|off (not saved; F11 Tests)
         std::mutex                         g_owner_mtx;
+        // gunthrottle3 (drivegunthrottle rt's guard, BulletSpeed.h): GetTickCount64 of the drive layout's last LB and last throttle,
+        // the driver's sidearm objects learnt from LB (g_owner_mtx), the calls counted each way.
+        std::atomic<uint64_t>              g_drive_lb_ms{ 0 }, g_drive_rt_ms{ 0 }, g_driver_shots{ 0 }, g_other_shots{ 0 };
+        std::atomic<int>                   g_drive_said{ 0 };
+        uint64_t                           g_drive_objs[4]{};
 
         // shotowner-begin (kept free of Windows and game code: research\2026-11-15_norecoil\shotowner_harness.cpp compiles this part)
         // shotowner (author 15 Nov 21:22, his play of 21:35-22:17):
@@ -375,10 +380,39 @@ namespace fc5::bullet
                 const uint64_t       trig     = g_player_fire_ms.load();
                 const uint64_t       rel_seq  = g_rel_seq.load();   // read before its time (note_shot_release writes the time first)
                 const uint64_t       rel_ms   = g_rel_ms.load();
+                // gunthrottle3: the driver's sidearm (learnt within 300 ms of the drive layout's LB), or someone else's gun.
+                bool driver = false, drv_new = false, drv_drop = false;
                 {
                     std::lock_guard _{ g_owner_mtx };
                     why = g_owner.take(c.r14, GetTickCount64(), trig, press, rel_seq, rel_ms, old_take);
+                    if (c.r14 != 0) {
+                        const uint64_t t  = GetTickCount64();
+                        const uint64_t lb = g_drive_lb_ms.load(), th = g_drive_rt_ms.load();
+                        int at = -1;
+                        for (int k = 0; k < 4; ++k)
+                            if (g_drive_objs[k] == c.r14) at = k;
+                        if (lb != 0 && t - lb <= 300) {
+                            if (at < 0) {
+                                for (int k = 3; k > 0; --k) g_drive_objs[k] = g_drive_objs[k - 1];
+                                g_drive_objs[0] = c.r14;
+                                drv_new         = true;
+                            }
+                            driver = true;
+                        } else if (at >= 0 && (lb == 0 || t - lb > 1500) && (th == 0 || t - th > 1500)) {
+                            for (int k = at; k < 3; ++k) g_drive_objs[k] = g_drive_objs[k + 1];
+                            g_drive_objs[3] = 0;
+                            drv_drop        = true;
+                        } else if (at >= 0) {
+                            driver = true;
+                        }
+                    }
                 }
+                if (driver) ++g_driver_shots;
+                else ++g_other_shots;
+                if ((drv_new || drv_drop) && g_drive_said.fetch_add(1) < 20)
+                    spdlog::info("[Drive] drivegunthrottle rt: weapon object {:x} {}", c.r14,
+                                 drv_new ? "fired within 300 ms of LB while driving: the driver's sidearm"
+                                         : "fired with LB and the throttle up for over 1.5 s: someone else's gun, no longer taken for the driver's sidearm");
                 const bool new_take = why == ShotOwner::kReleased || why == ShotOwner::kMine;
                 const bool mine     = g_owner_on.load() ? new_take : old_take;
                 if (mine) {
@@ -486,6 +520,14 @@ namespace fc5::bullet
     bool  speed_available() { return (bool)g_speed_hook; }
     void  set_player_shot_callback(void (*cb)()) { g_shot_cb = cb; }
     uint64_t shot_calls() { return g_shots.load(); }
+    void     note_drive_pad(bool lb, bool throttle)
+    {
+        const uint64_t t = GetTickCount64();
+        if (lb) g_drive_lb_ms = t;
+        if (throttle) g_drive_rt_ms = t;
+    }
+    uint64_t driver_shot_calls() { return g_driver_shots.load(); }
+    uint64_t other_shot_calls() { return g_other_shots.load(); }
 
     void speed_status()
     {

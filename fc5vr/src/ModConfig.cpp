@@ -283,7 +283,9 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
 
     // bheal (manualreload38, default on; author 3 Nov 12:00): right B is the pad's Y only
     // once held past a quick press, then for at least bhealms ms (heal, never the game's previous weapon).
-    if (fc5::reload::b_heal_only() ? fc5::reload::b_heal_y(is_right_b_button_down) : is_right_b_button_down) {
+    // menubinstant (FarCry5Reload.cpp): on the game's menu screen (the store, the pause menu, the map) the pad's Y at the press.
+    const bool menu_b_now = FarCry5Stereo::Get()->flat_screen_on();
+    if (fc5::reload::b_heal_only() ? fc5::reload::b_heal_y(is_right_b_button_down, menu_b_now) : is_right_b_button_down) {
         pXinputGamepad->wButtons |= XINPUT_GAMEPAD_Y;
     }
     // vehbreload (FarCry5Reload.cpp; author 16 Nov 14:39): in a vehicle seat with no manual
@@ -369,7 +371,8 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     const auto gesture           = FarCry5Stereo::Get()->gesture_poll(lh ? is_left_grip_raw : is_right_grip_raw, lh ? is_right_grip_raw : is_left_grip_raw,
                                                                       is_right_b_button_down,
                                                                       (lh ? is_right_grip_raw : is_left_grip_raw && (!dpad_ear || left_at_ear)) || lt_mod);
-    if (gesture.y_off) pXinputGamepad->wButtons &= ~XINPUT_GAMEPAD_Y;
+    // menubinstant: no hold-back on the menu screen (a listed gun on the sling would otherwise keep the store's Y from the game).
+    if (gesture.y_off && !menu_b_now) pXinputGamepad->wButtons &= ~XINPUT_GAMEPAD_Y;
     const int  left_role         = lh ? fc5::gesture::kWeaponHand : fc5::gesture::kOtherHand;
     const int  right_role        = lh ? fc5::gesture::kOtherHand : fc5::gesture::kWeaponHand;
     if (gesture.buzz[left_role] > 0.0f) trigger_haptic_vibration(0.0f, gesture.buzz_s[left_role], 1.0f, gesture.buzz[left_role], left_joystick);
@@ -1062,7 +1065,11 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     {
         const int64_t now_ms  = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         const bool    gun_now = FarCry5Stereo::Get()->game_gun_out();
-        if (btn_layout && (pXinputGamepad->wButtons & (XINPUT_GAMEPAD_Y | XINPUT_GAMEPAD_LEFT_SHOULDER))) s_drive_draw_ms = now_ms;
+        // gunthrottle3 (author 22 Nov 20:24Z): LB counts as a draw only while the
+        // sidearm is not out yet. With it out, LB is the drive-and-shoot fire: his 21:23:19.8 A press just after shooting sent no RT and
+        // the car stopped (0.0 m/s), and every A held while shooting got none.
+        const bool pad_lb = (pXinputGamepad->wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0;
+        if (btn_layout && ((pXinputGamepad->wButtons & XINPUT_GAMEPAD_Y) || (pad_lb && !gun_now))) s_drive_draw_ms = now_ms;
         if (s_drive_gun_was.exchange(gun_now) && !gun_now) s_drive_gun_off_ms = now_ms;
         const bool gun_live = btn_layout && (gun_now || now_ms - s_drive_draw_ms.load() < 1000 || now_ms - s_drive_gun_off_ms.load() < 1500);
         static std::atomic<int> gt_said{ 0 };
@@ -1074,23 +1081,34 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         // in the stick-driving layout, research\2026-11-05_vehctl\PATCH9/PATCH10), so right A is RT while the sidearm is out. Not just after a Y
         // or LB (1 s), when the sidearm may still be coming out. Guard: a shot code call in the first 600 ms of such a press with no LB for
         // 500 ms means the game shot on RT: A goes back to sending no RT with the sidearm out until the layout ends (the next drive tries again).
-        static std::atomic<bool>    gt_rt_was{ false }, gt_rt_bad{ false };
-        static std::atomic<uint64_t> gt_rt_shots{ 0 };
+        // gunthrottle3 (22 Nov): only the driver's own sidearm's shots count (fc5::bullet::driver_shot_calls, learnt from the shots that
+        // follow LB). His 21:23:21.1 drive tripped on a shot 105 ms into his fourth A press, though his three presses before had sent RT
+        // with no shot at all (and the 17 Nov drive's two): another character's gun. A then sent nothing for the rest of the drive.
+        static std::atomic<bool>    gt_rt_was{ false }, gt_rt_bad{ false }, gt_rt_other_said{ false };
+        static std::atomic<uint64_t> gt_rt_shots{ 0 }, gt_rt_other{ 0 };
+        static std::atomic<int>     gt_other_said{ 0 };
         static std::atomic<int64_t> gt_rt_start{ 0 }, gt_lb_ms{ -100000 };
         if (btn_layout && (pXinputGamepad->wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER)) gt_lb_ms = now_ms;
         if (!btn_layout && gt_rt_bad.exchange(false)) spdlog::info("[Drive] drivegunthrottle rt: tried again at the next drive");
         const bool rt_ok = btn_layout && gun_now && fc5::drive::gun_throttle() == 2 && !gt_rt_bad.load() && now_ms - s_drive_draw_ms.load() >= 1000;
+        if (btn_layout) fc5::bullet::note_drive_pad(pad_lb, btn.rt && rt_ok);
         if (!btn.rt || !rt_ok) gt_rt_was = false;
         if (btn.rt && rt_ok) {
             gt_was = false;
             if (!gt_rt_was.exchange(true)) {
                 gt_rt_start = now_ms;
-                gt_rt_shots = fc5::bullet::shot_calls();
+                gt_rt_shots = fc5::bullet::driver_shot_calls();
+                gt_rt_other = fc5::bullet::other_shot_calls();
+                gt_rt_other_said = false;
                 if (gt_said.fetch_add(1) < 20) spdlog::info("[Drive] drivegunthrottle rt: right A held with the sidearm out: RT sent (the throttle)");
             }
-            if (now_ms - gt_rt_start.load() < 600 && fc5::bullet::shot_calls() != gt_rt_shots.load() && now_ms - gt_lb_ms.load() > 500) {
+            if (now_ms - gt_rt_start.load() < 600 && fc5::bullet::other_shot_calls() != gt_rt_other.load() && !gt_rt_other_said.exchange(true) &&
+                gt_other_said.fetch_add(1) < 20)
+                spdlog::info("[Drive] drivegunthrottle rt: another gun shot {} ms into an A press (not the driver's sidearm): A still drives",
+                             now_ms - gt_rt_start.load());
+            if (now_ms - gt_rt_start.load() < 600 && fc5::bullet::driver_shot_calls() != gt_rt_shots.load() && now_ms - gt_lb_ms.load() > 500) {
                 gt_rt_bad = true;
-                spdlog::warn("[Drive] drivegunthrottle rt: the game shot {} ms into an A press with the sidearm out and no LB: A sends no RT with the sidearm out "
+                spdlog::warn("[Drive] drivegunthrottle rt: the driver's sidearm shot {} ms into an A press with no LB: A sends no RT with the sidearm out "
                              "until this drive ends", now_ms - gt_rt_start.load());
             } else {
                 pXinputGamepad->bRightTrigger = 255;

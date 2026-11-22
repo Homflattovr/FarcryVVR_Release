@@ -1,4 +1,5 @@
 #include "FarCry5MemScan.h"
+#include "FarCry5SessionLogs.h"
 #include "FarCry5CineTravel.h"
 #include "FarCry5ScriptWatch.h"
 #include "FarCry5GameWeapon.h"
@@ -266,6 +267,23 @@ namespace
         if (rt == 0 || me == rt) return false;
         g_foreign_calls.fetch_add(1, std::memory_order_relaxed);
         g_foreign_tid.store(me, std::memory_order_relaxed);
+        return true;
+    }
+    // The game's immediate context, noted on the render thread at Present (foreignpass deferred exemption).
+    std::atomic<ID3D11DeviceContext*> g_imm_ctx{ nullptr };
+    // other_thread() for the upload hooks (Map, Unmap, UpdateSubresource): a call from another thread on the immediate
+    // context (Cheeky's OpenXR thread, inside D3D11's lock) still goes straight to D3D11, but the game's own worker
+    // threads, recording on their deferred contexts, get the 1.0.3 handling again. 1.0.4 passed those through too, so
+    // the camera and scan rewrites never reached the cbuffers the workers upload (suspected cause of the flat picture an
+    // AMD tester saw in 1.0.4, 21 Nov; a new device leaves g_imm_ctx stale, and then every call is handled as in 1.0.3).
+    inline bool other_thread_imm(ID3D11DeviceContext* ctx)
+    {
+        if (!other_thread()) return false;
+        ID3D11DeviceContext* const imm = g_imm_ctx.load(std::memory_order_relaxed);
+        if (imm != nullptr && ctx != imm) {
+            g_foreign_calls.fetch_sub(1, std::memory_order_relaxed);
+            return false;
+        }
         return true;
     }
 
@@ -1919,10 +1937,18 @@ void FarCry5Stereo::log_start_notes()
                  g_size_tag.empty() ? std::string{ "-" } : g_size_tag, g_headset_fallback[0] ? fmt::format(", launcher's typical size {}x{}", g_headset_fallback[0], g_headset_fallback[1]) : std::string{});
 }
 
+void FarCry5Stereo::install_swap_chain_hooks()
+{
+    static bool done = false;   // InitThread only
+    if (done) return;
+    done = true;
+    install_resolution_hooks();
+}
+
 void FarCry5Stereo::install_early_hooks()
 {
     fc5::lodfov::install_early();   // before the game reads its render config
-    install_resolution_hooks();
+    install_swap_chain_hooks();
     auto d3d11 = LoadLibraryA("d3d11.dll");
     if (!d3d11) {
         return;
@@ -2984,7 +3010,7 @@ HRESULT WINAPI FarCry5Stereo::hk_map(ID3D11DeviceContext* ctx, ID3D11Resource* r
     fc5::hitch::HookTimer hitch_t{ fc5::hitch::kMapHooks };   // hitchlog
     FC5_TRACE("hk_map");
     static auto& self = Get();
-    if (other_thread()) return call_orig<HRESULT>(self->m_map_hook, 14, ctx, res, sub, type, flags, mapped);
+    if (other_thread_imm(ctx)) return call_orig<HRESULT>(self->m_map_hook, 14, ctx, res, sub, type, flags, mapped);
     HRESULT hr;
     {
         fc5::hitch::HookTimer ht{ fc5::hitch::kMapOrig };
@@ -3100,7 +3126,7 @@ void WINAPI FarCry5Stereo::hk_unmap(ID3D11DeviceContext* ctx, ID3D11Resource* re
     FC5_TRACE("hk_unmap");
     static auto& self = Get();
     fc5::locallights::note_write(res);   // lampeye: a lamp list uploaded again is copied again (every thread)
-    if (other_thread()) {
+    if (other_thread_imm(ctx)) {
         map_shadow_end(ctx, res);   // mapshadow: a copy handed out on the render thread still reaches the driver if the Unmap comes from another thread
         call_orig<void>(self->m_unmap_hook, 15, ctx, res, sub);
         return;
@@ -3888,7 +3914,7 @@ void WINAPI FarCry5Stereo::hk_update_subresource(ID3D11DeviceContext* ctx, ID3D1
     fc5::padglyph::on_update_subresource(dst, sub, box, src, row);   // padglyphs: a button icon written whole gets the controller's
     fc5::locallights::note_write(dst);            // lampeye
     // These three stay on every thread (texture streaming writes the game's icons from its own threads); the rest only on the render thread.
-    if (other_thread()) { call_orig<void>(self->m_update_sub_hook, 48, ctx, dst, sub, box, src, row, depth); return; }
+    if (other_thread_imm(ctx)) { call_orig<void>(self->m_update_sub_hook, 48, ctx, dst, sub, box, src, row, depth); return; }
     if (self->m_lp_watch_log.load() > 0 && dst && (dst == self->m_lp_watch[0] || dst == self->m_lp_watch[1])) {
         self->m_lp_watch_log--;
         spdlog::info("[LightProbe] UpdateSubresource on light buffer {} box {} (frame {}, thread {})", (void*)dst, box ? fmt::format("{}..{}", box->left, box->right) : std::string("whole"),
@@ -7689,7 +7715,7 @@ bool FarCry5Stereo::weapon_draw(ID3D11DeviceContext* ctx, UINT count, UINT start
     m_hud_prim_now  = false;
     m_fp_draw_glove = false;   // afwhandfresh: set by weapon_draw_impl for the gloves or bare hands
     const bool skip = weapon_draw_impl(ctx, count, start, base, instances);
-    if (m_part_watch.load() && m_vs_cb0 && is_weapon_cb(m_vs_cb0) && !m_scope_call && !m_menu_screen_on) part_watch_draw(ctx, count, skip);   // partwatch (log only)
+    if (m_part_watch.load() && fc5::sessionlogs::on() && m_vs_cb0 && is_weapon_cb(m_vs_cb0) && !m_scope_call && !m_menu_screen_on) part_watch_draw(ctx, count, skip);   // partwatch (log only)
     if (census_now() && m_vs_cb0 && is_weapon_cb(m_vs_cb0)) {
         // census / firecensus: what became of this weapon-pass draw (the [Census] weapon draw line before it gives its shaders and
         // buffers), and gunstilllate's state at it: the pass guessed from the last update (Stereo's left eye) or placed with its own pose.
@@ -11847,6 +11873,11 @@ void FarCry5Stereo::on_present()
         if (--m_camtrack_left == 0) fc5::camscan::report(0.9f);
     }
     g_wd_render_tid   = GetCurrentThreadId();
+    if (g_imm_ctx.load(std::memory_order_relaxed) == nullptr) {   // foreignpass deferred exemption
+        ID3D11DeviceContext* ictx = nullptr;
+        g_framework->get_d3d11_hook()->get_device()->GetImmediateContext(&ictx);
+        if (ictx) { g_imm_ctx = ictx; ictx->Release(); }   // the device keeps it alive
+    }
     if (!m_ssr_restore.empty()) {
         ID3D11DeviceContext* rctx = nullptr;
         g_framework->get_d3d11_hook()->get_device()->GetImmediateContext(&rctx);
@@ -19838,6 +19869,7 @@ void FarCry5Stereo::update_menu_screen()
                     }).detach();
                 }
             }
+            if (!m_played_once) fc5::sessionlogs::play_started();   // sessionlogs off: only warnings and errors from here on
             m_played_once = true;
         }
         m_menu_screen_on                                = want;
@@ -20276,7 +20308,7 @@ void FarCry5Stereo::poll_commands()
         }
         const bool on  = arg == "on" || arg == "1" || arg == "true";
         const float fv = arg.empty() ? 0.0f : std::strtof(arg.c_str(), nullptr);
-        static const std::unordered_set<std::string> kPersistent{ "hidmask", "hidmaskturn", "fastlights", "helipitch", "stickview", "stickspeed", "rumble", "rumblegain", "shotbuzz", "hapticthread", "shotbuzzamp", "shotbuzzms", "snapturn", "snapdeg", "turnspeed", "hudmode", "huddist", "hudscale", "hudheight", "dlss", "dlsssharp", "dlsspreset",
+        static const std::unordered_set<std::string> kPersistent{ "hidmask", "hidmaskturn", "fastlights", "helipitch", "stickview", "stickspeed", "rumble", "rumblegain", "shotbuzz", "hapticthread", "shotbuzzamp", "shotbuzzms", "snapturn", "snapdeg", "turnspeed", "scale", "hudmode", "huddist", "hudscale", "hudheight", "dlss", "dlsssharp", "dlsspreset",
                                                                    "upright", "lensdirt", "skipps", "keeprunning", "mapflat", "mapsticky", "binoczoom", "grip", "grippitch", "modelyaw", "modelpitch",
                                                                    "aimdotsize", "twohand", "foregrip", "hidetracers", "tracersfromgun", "vehtracers", "framedouble", "reflections", "cinematics", "vehicles", "wheelstick", "wheelmouse", "hipspread", "norecoil", "nosway", "vehrecenter", "aircraftguard", "headlook", "menulevel", "weaponsmooth", "fovexact", "fovsize", "dlsscammv", "afw", "aniso", "mipbias", "mipbiasauto",
                                                                    "gputime", "probeoff", "logbuffered", "snapresetfix", "pairjumps", "vehicleperpair", "fovmargin", "fovnarrow", "dlsstrim", "aimstickretry", "hudscreen", "hudsize", "hudfullres", "f11image", "hudpanel", "foreignpass", "hudmask", "firesplit", "firemeasure", "snapsync", "snapready", "snapstick", "vehstick", "vehentryfollow", "vehcullheads", "airfollow", "airroll", "vehplayerfov", "cullnarrow", "chutelook", "chutemin", "chuteland", "chuteopen", "chuteground", "chuteprobe", "downedfoot", "vehscript", "gamestate", "soundwatch", "lakeoverscan", "dlssmvbest", "dlssmvcheck", "dlssmvsway",
@@ -20292,7 +20324,14 @@ void FarCry5Stereo::poll_commands()
             spdlog::info("[FC5 cmd] {}: ignored in the settings (a one-off capture, not saved any more)", line);
             continue;
         }
-        if (kPersistent.contains(cmd) && !gputime_once) {
+        // F11 settings audit (21 Nov, players: "some F11 settings do not save"): options F11 saves with keep() whose command, replayed at
+        // the next start, did not put its line back in m_persist; the next save of any other setting then dropped them from the file, so
+        // they were lost one start later. lefthanded and menudistance are F11 options that were not saved at all.
+        static const std::unordered_set<std::string> kSavedFromF11{ "menuwhole", "cinefollow", "vrpost", "menudistance", "lefthanded", "skyeye", "slinghand", "slinghandtilt", "gripbyhand",
+                                                                    "afwcopies", "afwfoliage", "afwfoot", "afwgunmvpose", "afwrail", "afwroot", "afwspeck", "afwstartstereo", "afwvehbody",
+                                                                    "afwvehmv", "afwvehown",
+                                                                    "sessionlogs" };   // sessionlogs: F11 Main "Logs during sessions (slower)" (22 Nov)
+        if ((kPersistent.contains(cmd) || kSavedFromF11.contains(cmd)) && !gputime_once) {
             if (!from_settings) persist_changed = true;
             m_persist[cmd] = line;
         }
@@ -20809,6 +20848,16 @@ void FarCry5Stereo::poll_commands()
         if (cmd == "simprojection") runtimes::OpenXR::s_fc5_sim_projection = on;   // own line (nesting limit): Meta XR Simulator, projection layer kept under the flat screen
         if (cmd == "flamehold") {   // own block (nesting limit); flamehold S (saved): seconds after firing before they go back on the gun
             m_flame_hold = std::clamp(fv, 0.0f, 10.0f);
+            spdlog::info("[FC5 cmd] {}", line);
+            continue;
+        }
+        if (cmd == "sessionlogs") {   // own block (nesting limit); sessionlogs on|off (saved, default on; F11 Main and the launcher; FarCry5SessionLogs.h)
+            fc5::sessionlogs::set(arg != "off" && arg != "0" && arg != "false");
+            spdlog::info("[FC5 cmd] {}", line);
+            continue;
+        }
+        if (cmd == "lefthanded") {   // own block (nesting limit); lefthanded on|off (saved, default off; F11 Motion control): the weapon on the left controller
+            m_left_handed = on;
             spdlog::info("[FC5 cmd] {}", line);
             continue;
         }
@@ -21743,7 +21792,7 @@ void FarCry5Stereo::poll_commands()
         else if (cmd == "hudfullres") VR::s_fc5_hud_full_res = on;
         else if (cmd == "snapturn") m_snap_turn = on;
         else if (cmd == "snapdeg") m_snap_deg = std::clamp(fv, 5.0f, 90.0f);
-        else if (cmd == "turnspeed") m_turn_speed = fv;
+        else if (cmd == "turnspeed") m_turn_speed = std::clamp(fv, 30.0f, 360.0f);
         else if (cmd == "stereo") m_stereo_enabled = on;
         else if (cmd == "offset") m_debug_eye_offset = fv;
         else if (cmd == "alternate") m_debug_alternate = on;
@@ -21751,7 +21800,7 @@ void FarCry5Stereo::poll_commands()
         else if (cmd == "jitter") m_keep_game_jitter = on;
         else if (cmd == "rot") m_use_hmd_rotation = on;
         else if (cmd == "pos") m_use_hmd_position = on;
-        else if (cmd == "scale") m_world_scale = fv;
+        else if (cmd == "scale") m_world_scale = std::clamp(fv, 0.5f, 2.0f);
         else if (cmd == "recenter") m_recenter_requested = true;
         else if (cmd == "dump") m_dump_requests = arg.empty() ? 1 : (int)fv;
         else if (cmd == "dumpout") m_dump_requests = arg.empty() ? -1 : -(int)fv;
@@ -21914,7 +21963,7 @@ void FarCry5Stereo::poll_commands()
         else if (cmd == "mousedrop") m_mouse_drop = on;   // test (not saved): aim loop mouse moves not sent, for the stick fallback and aimstickretry in the simulator
         else if (cmd == "vigem") m_use_vigem = on;
         else if (cmd == "menuscreen") m_menu_screen = on;
-        else if (cmd == "menudistance") m_menu_distance = fv;
+        else if (cmd == "menudistance") m_menu_distance = std::clamp(fv, 0.8f, 5.0f);
         else if (cmd == "stickgain") m_stick_gain = fv;
         else if (cmd == "firegate") m_fire_gate_deg = fv;
         else if (cmd == "fire") {
@@ -23190,7 +23239,11 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
             }
         } else {
             float ts = m_turn_speed.load();
-            if (slider("Smooth turn speed", ts, 30.0f, 360.0f, "%.0f deg/s", 10.0f)) m_turn_speed = ts;
+            // Saved (a Pimax tester, 21 Nov: "smooth turn speed does not save"; the slider set it for the session only).
+            if (slider("Smooth turn speed", ts, 30.0f, 360.0f, "%.0f deg/s", 10.0f)) {
+                m_turn_speed = ts;
+                keep("turnspeed", fmt::format("turnspeed {:.0f}", ts));
+            }
         }
     };
 
@@ -23227,6 +23280,15 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
         draw_walk_basis(keep, hint);                  // Motion control > Walking
         turn_choice();                                // Comfort > Turning
         fc5::reload::draw_hint_choice(m_ui_cmds, hint);   // Gestures > Manual reload: Show hints (reloadhighlight)
+        {
+            // sessionlogs (author 22 Nov 12:36Z; also in the launcher): the default-on probes and the log while playing (FarCry5SessionLogs.h).
+            bool sl = fc5::sessionlogs::on();
+            if (ImGui::Checkbox("Logs during sessions (slower)", &sl)) {
+                fc5::sessionlogs::set(sl);
+                keep("sessionlogs", sl ? "sessionlogs on" : "sessionlogs off");
+            }
+            hint("On: the mod logs and measures everything while you play, for bug reports (a little slower). Off: once you are in the game, only warnings and errors are logged.");
+        }
         ImGui::EndChild();
         ImGui::EndTabItem();
     }
@@ -23471,7 +23533,11 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
         if (level >= 1 && ImGui::CollapsingHeader("Scale", ImGuiTreeNodeFlags_DefaultOpen)) {
             // From Comfort (author 24 Oct).
             float s = m_world_scale.load();
-            if (slider("World scale", s, 0.5f, 2.0f, "%.2f", 0.05f)) m_world_scale = s;
+            // Saved as "scale" (21 Nov: like the smooth turn speed, the slider set it for the session only).
+            if (slider("World scale", s, 0.5f, 2.0f, "%.2f", 0.05f)) {
+                m_world_scale = s;
+                keep("scale", fmt::format("scale {:.2f}", s));
+            }
             hint("Above 1 the world looks bigger.");
         }
         // The "Desktop window" section (normal desktop window with a title bar) left F11 (author 20 Oct 15:04); `window on|off` remains.
@@ -23582,7 +23648,10 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
             }
             hint("How long menus fade in and out. 0: instant.");
             float md = m_menu_distance.load();
-            if (slider("Flat screen distance (m)", md, 0.8f, 5.0f, "%.1f", 0.1f)) m_menu_distance = md;
+            if (slider("Flat screen distance (m)", md, 0.8f, 5.0f, "%.1f", 0.1f)) {
+                m_menu_distance = md;
+                keep("menudistance", fmt::format("menudistance {:.1f}", md));   // saved (21 Nov: it was for the session only)
+            }
             bool mw = m_menu_whole.load();
             if (ImGui::Checkbox("Menu and loading pictures shown whole", &mw)) {
                 m_menu_whole = mw;
@@ -23912,7 +23981,10 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
             }
             hint("The weapon sits in your hand and shoots where the barrel points.");
             v = m_left_handed.load();
-            if (ImGui::Checkbox("Left-handed (weapon on the left controller; not tested)", &v)) m_left_handed = v;
+            if (ImGui::Checkbox("Left-handed (weapon on the left controller; not tested)", &v)) {
+                m_left_handed = v;
+                keep("lefthanded", v ? "lefthanded on" : "lefthanded off");   // saved (21 Nov: it was for the session only)
+            }
             // "Hand models" (hands) removed 13 Nov (author 20:25Z): the hands are always drawn (m_hands_float true; typed, the command
             // still acts for a session, never saved).
             // "Aim dot" (aimdot): one choice with the red dot, Weapon > Sights "Red dot and laser" (author 24 Oct, 5 Nov).
@@ -24449,6 +24521,7 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
             m_grip_off[0] = g[0];
             m_grip_off[1] = g[1];
             m_grip_off[2] = g[2];
+            keep("grip", fmt::format("grip {:.3f} {:.3f} {:.3f}", g[0], g[1], g[2]));   // saved (21 Nov: "grip" was a saved command, the slider set it for the session only)
         }
         hint("Where the gun's grip sits relative to the game's camera.");
         float gp = m_grip_pitch.load();
@@ -24798,8 +24871,8 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
             const char* const kRight[][3]{ { "Trigger", "Fire", vt_on || bt_on ? "Shoot (driving)" : "Throttle" },
                                            { "Grip", "Hold the weapon (sling on)", vt_on || bt_on ? "Hold the weapon" : "Brake / reverse" },
                                            { "A", sj_on ? "Jump (as the right stick up)" : "Jump", bt_on ? "Throttle (cars, quads, bikes, boats); aircraft: change seat" : "Change seat" },
-                                           { "B", fb_on ? "Hold: heal (a quick press: previous weapon only with bheal off); with the left trigger held: throw; on a tutorial pop-up: close it (Esc)"
-                                                        : "Hold: heal (a quick press: previous weapon only with bheal off); on a tutorial pop-up: close it (Esc)",
+                                           { "B", fb_on ? "Hold: heal (a quick press: previous weapon only with bheal off); with the left trigger held: throw; in the game's menus: Y at once (store: buy); on a tutorial pop-up: close it (Esc)"
+                                                        : "Hold: heal (a quick press: previous weapon only with bheal off); in the game's menus: Y at once (store: buy); on a tutorial pop-up: close it (Esc)",
                                              fc5::reload::b_heal_only() && fc5::reload::veh_b_reload() ? "Quick press: reload (a weapon in the hands); hold: heal"
                                                                                                        : "Hold: heal (change weapon only with bheal off)" },
                                            { "Stick", sj_on ? (fb_on ? "Turn (left / right); up: jump, down: crouch / slide; in the weapon wheel: pick a slot; with the left trigger or grip held: D-pad"

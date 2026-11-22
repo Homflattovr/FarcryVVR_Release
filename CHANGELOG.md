@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.5 (22 November 2026)
+Full notes: [release/RELEASE_NOTES_v1.0.5.md](release/RELEASE_NOTES_v1.0.5.md).
+- **Fixed:** vehicles: A keeps accelerating while shooting with the sidearm out (other characters' shots no longer
+  turn it off for the drive).
+- **Fixed:** with CheekyFoveatedDLSS the game no longer stays at 1920x1080 stretched into each eye.
+- **Fixed:** AMD (Radeon) cards: the 3D picture that 1.0.4 could turn flat (not tried on an AMD card yet).
+- **Fixed:** F11 settings that did not save (Smooth turn speed, World scale, Grip, flat screen distance, Left-handed and others).
+- **Changed:** the game options the mod needs are set at every VR start (`gameoptions off` keeps your own).
+- **Changed:** in the game's menus a quick B is Y at once (the store buys with one press).
+- **Added:** Logs during sessions (slower), in F11 > Main and the launcher (default on).
+
 ## 1.0.4 (21 November 2026)
 Full notes: [release/RELEASE_NOTES_v1.0.4.md](release/RELEASE_NOTES_v1.0.4.md).
 - **Fixed:** AMD (Radeon) cards no longer drop to 2-5 fps in the world (not tried in real play yet).

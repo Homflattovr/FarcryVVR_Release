@@ -1,5 +1,6 @@
 // memwatch: a memory line a minute, to tell a leak of the mod's from the game's own streaming (see FarCry5MemWatch.h).
 #include "FarCry5MemWatch.h"
+#include "FarCry5SessionLogs.h"
 
 #include <Windows.h>
 #include <d3d11.h>
@@ -583,6 +584,7 @@ namespace fc5::memwatch
                 const int iv2 = g_interval.load();
                 if (req == 0 && (iv2 <= 0 || clock::now() < last + std::chrono::seconds(iv2))) continue;   // the interval changed: wait again
                 last = clock::now();
+                if (req == 0 && !fc5::sessionlogs::on()) continue;   // sessionlogs off: no minute line (a typed memwatch still asks for one)
                 write_lines(req);
             }
         }

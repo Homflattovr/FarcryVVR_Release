@@ -1,6 +1,6 @@
 FAR CRY 5 VR MOD - {RELEASE}, build of {DATE} (commit {SHA})
 
-Version 1.0.4. Read KNOWN_ISSUES.txt before you report something.
+Version 1.0.5. Read KNOWN_ISSUES.txt before you report something.
 It works with the Steam copy and the Ubisoft Connect copy of Far Cry 5. A copy bought on the Epic Games Store
 runs through Ubisoft Connect too: follow the Ubisoft Connect steps for it.
 
@@ -66,9 +66,11 @@ STRONGLY RECOMMENDED (foliage: trees and grass judder at a low frame rate and sm
   (Play in Steam, Ubisoft Connect or Epic) also starts the mod, with the last choices made in the launcher.
 
 5. REQUIRED GAME OPTIONS
-The launcher checks these in the game's options file (Documents\My Games\Far Cry 5\gamerprofile.xml) when you
-press Play in VR. If some are not set, it lists them and offers to set them for you (the first time it keeps a copy
-of the file as gamerprofile.xml.fc5vr_backup). You can also set them yourself in the game's Options.
+The mod sets these for you in the game's options file (Documents\My Games\Far Cry 5\gamerprofile.xml) each time
+the game starts in VR, also when you start it without the launcher; Play in VR sets them too. Your other options
+are kept (the first time, a copy of the file is kept as gamerprofile.xml.fc5vr_backup). The log (fc5vr_log.txt)
+says what was set in its [GameOptions] lines. To keep your own values, add the line "gameoptions off" to
+fc5vr_settings.txt.
 - Window mode: Borderless (not Fullscreen). In VR the mod makes the game's picture headset-sized in a window of
   its own, so exclusive Fullscreen is not needed and is not tested.
 - Field of view: 120
@@ -80,8 +82,7 @@ of the file as gamerprofile.xml.fc5vr_backup). You can also set them yourself in
 - HDR: Off
 - Controls: the game's default gamepad layout (not checked by the launcher)
 - Crosshair: Off (Options > Interface > Reticle: Off). The game's crosshair stays fixed in the middle of the HUD and
-  does not follow the gun in your hand. The mod and the launcher now turn it off for you in VR, also when you start
-  the game without the launcher. To keep it, add the line "reticleoff off" to fc5vr_settings.txt.
+  does not follow the gun in your hand. To keep it, add the line "reticleoff off" to fc5vr_settings.txt.
 
 Tips: F11 opens the mod's menu (its Main tab has the common choices). If the hands or legs look wrong, change
 your skin (outfit) first. If the picture looks blurry on the very first start, restart the game once.

@@ -6,6 +6,7 @@
 // first and last seen against the landing (a canopy should be drawn above the head and vanish at the landing). A skinned canopy may
 // carry the player's root as its position (under the camera), so all heights are kept. Nothing on screen changes.
 #include "FarCry5Stereo.h"
+#include "FarCry5SessionLogs.h"
 
 #include <spdlog/spdlog.h>
 
@@ -73,7 +74,7 @@ void FarCry5Stereo::chute_probe(ID3D11DeviceContext* ctx, UINT count)
 void FarCry5Stereo::chute_probe_tick()
 {
     const auto now  = std::chrono::steady_clock::now();
-    const bool want = m_chute_probe.load() && (m_falling || m_co_suit || m_chute_vehicle);
+    const bool want = m_chute_probe.load() && fc5::sessionlogs::on() && (m_falling || m_co_suit || m_chute_vehicle);
     if (want) {
         if (!m_cp_on.load()) {
             std::lock_guard _{ m_cp_mtx };

@@ -1,4 +1,5 @@
 #include "FarCry5GpuTime.h"
+#include "FarCry5SessionLogs.h"
 
 #include <algorithm>
 #include <atomic>
@@ -130,7 +131,7 @@ namespace fc5::gputime
     void begin_pair(ID3D11DeviceContext* ctx, uint64_t id)
     {
         g_cur = -1;
-        if (!g_on.load() || !ctx || !create(ctx)) return;
+        if (!g_on.load() || !fc5::sessionlogs::on() || !ctx || !create(ctx)) return;   // sessionlogs off: no timestamps (gputime stays as saved)
         Set& s = g_sets[g_next];
         if (s.pending && !read(ctx, s)) { g_skipped++; return; }   // the GPU is more than kSets pairs behind
         g_next = (g_next + 1) % kSets;

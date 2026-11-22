@@ -284,6 +284,14 @@ static class Report
             foreach (var c in Launcher.InstallChecks())
                 sb.AppendLine("Install check " + c.State.ToString().ToUpperInvariant() + ": " + c.Name + ": " + c.Summary);
         } catch (Exception e) { sb.AppendLine("Install checks: " + e.Message); }
+        try {
+            var gp = Launcher.GameProfilePath;
+            if (File.Exists(gp)) {
+                var fi = new FileInfo(gp);
+                sb.AppendLine("Game options file: " + gp + ", " + fi.Length + " bytes, written " + fi.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) +
+                              (fi.IsReadOnly ? ", read-only" : "") + (File.Exists(gp + ".fc5vr_last") ? ", changed by the mod or the launcher before (.fc5vr_last beside it)" : ""));
+            } else sb.AppendLine("Game options file: " + gp + " not there");
+        } catch (Exception e) { sb.AppendLine("Game options file: " + e.Message); }
         var opts = Launcher.WrongGameOptions();
         if (opts == null) sb.AppendLine("Game options: no gamerprofile.xml read");
         else if (opts.Count == 0) sb.AppendLine("Game options: all set as the mod needs");

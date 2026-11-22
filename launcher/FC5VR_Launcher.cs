@@ -2,7 +2,7 @@
 // It lives in the game's bin folder (next to FarCry5.exe and the mod's dxgi.dll) and writes there:
 //   fc5vr_launcher.txt   "mode vr" or "mode flat", "headset quest3" and the headset's typical eye size "headsetsize <w> <h>"
 //                        (read by the mod at start, src\Main.cpp and FarCry5Stereo.cpp load_forced_resolution)
-//   fc5vr_settings.txt   only its "render", "resscale", "dlss", "cinematics" and "loadpopup" lines, the same ones F11 changes
+//   fc5vr_settings.txt   only its "render", "resscale", "dlss", "cinematics", "loadpopup" and "sessionlogs" lines, the same ones F11 changes
 // Built by build_launcher.bat (C# 5, so the compiler in Windows' .NET Framework can build it too).
 // After Play in VR it stays minimised until the game closes; if the game closed during the start (VR never ran) or
 // crashed, it offers a report zip (FC5VR_report_<date>.zip in bin: logs, crash report, system and Windows event
@@ -230,6 +230,21 @@ static class Launcher
         return skip;
     }
 
+    // Logs during sessions: fc5vr_settings.txt "sessionlogs on|off" (F11 Main "Logs during sessions (slower)", src\FarCry5\FarCry5SessionLogs.h).
+    // No line: on, the mod's default for now.
+    public static bool ReadSessionLogs()
+    {
+        bool on = true;
+        try {
+            if (File.Exists(SettingsFile))
+                foreach (var raw in File.ReadAllLines(SettingsFile)) {
+                    var l = raw.Trim();
+                    if (l.StartsWith("sessionlogs ")) on = !(l == "sessionlogs off" || l == "sessionlogs 0" || l == "sessionlogs false");
+                }
+        } catch { }
+        return on;
+    }
+
     public static void ReadChoice(out bool flat, out string headset, out float scale)
     {
         flat = false;
@@ -270,7 +285,7 @@ static class Launcher
 
     // dlssMode -1: fc5vr_resolution.txt left as it is.
     // cutscenes 2: the "cinematics" line left as it is.
-    public static void WriteChoice(bool flat, string headset, bool stereo, float scale, bool dlss, int dlssMode, int cutscenes, bool skipPopup)
+    public static void WriteChoice(bool flat, string headset, bool stereo, float scale, bool dlss, int dlssMode, int cutscenes, bool skipPopup, bool sessionLogs)
     {
         var hs = FindHeadset(headset);
         File.WriteAllText(LauncherFile, "mode " + (flat ? "flat" : "vr") + "\r\nheadset " + headset + "\r\n" +
@@ -288,6 +303,7 @@ static class Launcher
         if (cutscenes != 2) SetLine(lines, "cinematics", cutscenes == 0 ? "cinematics flat" : "cinematics 3d");
         // The loading popup's line only when it is skipped or already there (no line: shown).
         if (skipPopup || lines.Exists(l => l.Trim().StartsWith("loadpopup "))) SetLine(lines, "loadpopup", skipPopup ? "loadpopup off" : "loadpopup on");
+        SetLine(lines, "sessionlogs", sessionLogs ? "sessionlogs on" : "sessionlogs off");
         // The mod writes with \n; keep it.
         var tmp = SettingsFile + ".launcher.tmp";
         File.WriteAllText(tmp, string.Join("\n", lines) + "\n", new UTF8Encoding(false));
@@ -341,7 +357,12 @@ static class Launcher
 
     // ---- the game's own options (Documents\My Games\Far Cry 5\gamerprofile.xml) ----
     // The game reads this file when it starts and writes it when its options change, so it is checked and set only
-    // while the game is closed. The values are the README's "Required game options" (the author's own file, 24 Oct):
+    // while the game is closed. Play in VR sets them without asking (author 21 Nov: the settings the mod needs forced;
+    // players had answered Yes and still had them wrong), and the mod sets them again at each VR start (Main.cpp
+    // EnforceGameOptionsAtLoad), also when the game is started without the launcher. "gameoptions off" in fc5vr_settings.txt
+    // leaves them as the player sets them (the Reticle: "reticleoff off").
+    // The file is read and written byte for byte (Latin-1 maps each byte to one char and back): it used to go through UTF-8,
+    // which changed any non-ASCII byte of an ANSI file (an accented audio device name) into a replacement character. The values are the README's "Required game options" (the author's own file, 24 Oct):
     // VideoModeProfile 1 = the window profile, whose windowMode 3 is Borderless (0 = the exclusive Fullscreen profile),
     // AntiAliasingMode 1 = SMAA (DLSS runs inside the game's SMAA pass), HelpCrosshair 0 = Interface > Reticle off.
     public class GameOption
@@ -368,16 +389,49 @@ static class Launcher
         };
     }
 
+    static readonly Encoding ProfileBytes = Encoding.GetEncoding(28591);
+    static string ReadGameProfile(string p) { return ProfileBytes.GetString(File.ReadAllBytes(p)); }
+
+    // fc5vr_settings.txt "gameoptions off" / "reticleoff off" (the mod's switches, last line wins). No line: on.
+    static bool SettingOn(string name)
+    {
+        bool on = true;
+        try {
+            if (File.Exists(SettingsFile))
+                foreach (var raw in File.ReadAllLines(SettingsFile)) {
+                    var l = raw.Trim();
+                    if (l.StartsWith(name + " ")) on = !(l == name + " off" || l == name + " 0");
+                }
+        } catch { }
+        return on;
+    }
+
+    // The options the mod's switches leave to the launcher and the mod (HelpCrosshair: reticleoff, the others: gameoptions).
+    static List<GameOption> SwitchedOptions()
+    {
+        bool all = SettingOn("gameoptions"), reticle = SettingOn("reticleoff");
+        var l = new List<GameOption>();
+        foreach (var o in RequiredOptions()) if (o.Attr == "HelpCrosshair" ? reticle : all) l.Add(o);
+        return l;
+    }
+
     public static string GameProfilePath
     {
         get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), @"My Games\Far Cry 5\gamerprofile.xml"); }
+    }
+
+    // Where the element's opening tag starts (the first one), or -1.
+    static int FindTag(string t, string element)
+    {
+        var m = new Regex("<" + Regex.Escape(element) + "[\\s/>]").Match(t);
+        return m.Success ? m.Index : -1;
     }
 
     // The span of an attribute's value inside the element's opening tag, or false.
     static bool FindAttr(string t, string element, string attr, out int start, out int length)
     {
         start = length = 0;
-        int tag = t.IndexOf("<" + element + " ", StringComparison.Ordinal);
+        int tag = FindTag(t, element);
         if (tag < 0) return false;
         int end = t.IndexOf('>', tag);
         if (end < 0) return false;
@@ -403,12 +457,12 @@ static class Launcher
         try {
             var p = GameProfilePath;
             if (!File.Exists(p)) return null;
-            var t = File.ReadAllText(p);
+            var t = ReadGameProfile(p);
             var wrong = new List<GameOption>();
-            foreach (var o in RequiredOptions()) {
+            foreach (var o in SwitchedOptions()) {
                 int s, n;
                 if (FindAttr(t, o.Element, o.Attr, out s, out n)) o.Have = t.Substring(s, n);
-                else if (t.IndexOf("<" + o.Element + " ", StringComparison.Ordinal) < 0) continue;
+                else if (FindTag(t, o.Element) < 0) continue;
                 if (o.Have == null || !SameValue(o.Have, o.Want)) wrong.Add(o);
             }
             return wrong;
@@ -423,56 +477,60 @@ static class Launcher
         return l;
     }
 
-    // Sets the required options in the game's file (the game must be closed). Backups first: the file as it was the first
-    // time is kept as gamerprofile.xml.fc5vr_backup (never overwritten), and the file as it was just before this change as
-    // gamerprofile.xml.fc5vr_last. Missing attributes are left alone (the game writes them itself).
-    public static void FixGameOptions()
+    // Sets the required options in the game's file (the game must be closed), a missing attribute added to its element (it
+    // used to be left missing, so the option stayed as the game's default and Play in VR asked again). Backups first: the file
+    // as it was the first time is kept as gamerprofile.xml.fc5vr_backup (never overwritten), and the file as it was just before
+    // this change as gamerprofile.xml.fc5vr_last. Read back afterwards: throws when the file still is not as the mod needs.
+    // True when the file was changed.
+    public static bool FixGameOptions()
     {
-        var p = GameProfilePath;
-        var t = File.ReadAllText(p);
-        foreach (var o in RequiredOptions()) {
-            int s, n;
-            if (FindAttr(t, o.Element, o.Attr, out s, out n) && !SameValue(t.Substring(s, n), o.Want)) t = t.Substring(0, s) + o.Want + t.Substring(s + n);
-        }
-        t = ReticleOffText(t) ?? t;
-        WriteGameProfile(p, t);
+        return SetOptions(SwitchedOptions());
     }
 
-    // reticleoff: Play in VR turns the game's reticle off without asking (author 19 Nov: many testers still had it, it stays
-    // fixed in the middle of the HUD). HelpCrosshair="0" in <ProfileSpecificGameProfile>, added when the file does not have it
-    // (the game's default is on). The same backups as FixGameOptions. True when the file was changed.
-    public static bool ForceReticleOff()
+    static bool SetOptions(List<GameOption> options)
     {
         var p = GameProfilePath;
-        if (!File.Exists(p)) return false;
-        var t = ReticleOffText(File.ReadAllText(p));
-        if (t == null) return false;
+        var was = ReadGameProfile(p);
+        var t = was;
+        foreach (var o in options) t = SetAttrText(t, o.Element, o.Attr, o.Want) ?? t;
+        if (t == was) return false;
         WriteGameProfile(p, t);
+        var left = WrongGameOptions();
+        if (left == null) throw new IOException("the file could not be read back after the change");
+        left = left.FindAll(w => options.Exists(o => o.Element == w.Element && o.Attr == w.Attr));
+        if (left.Count > 0) throw new IOException("the file still has " + string.Join(", ", left.ConvertAll(o => o.Attr + "=" + (o.Have ?? "missing"))) + " after the change");
         return true;
     }
 
-    // The file's text with HelpCrosshair="0" (set, or added to the element), or null when nothing changes.
-    static string ReticleOffText(string t)
+    // The file's text with attr="want" in element's opening tag (set, or added after the element's name), or null when
+    // nothing changes or the file has no such element.
+    static string SetAttrText(string t, string element, string attr, string want)
     {
         int s, n;
-        if (FindAttr(t, "ProfileSpecificGameProfile", "HelpCrosshair", out s, out n))
-            return SameValue(t.Substring(s, n), "0") ? null : t.Substring(0, s) + "0" + t.Substring(s + n);
-        int tag = t.IndexOf("<ProfileSpecificGameProfile ", StringComparison.Ordinal);
+        if (FindAttr(t, element, attr, out s, out n))
+            return SameValue(t.Substring(s, n), want) ? null : t.Substring(0, s) + want + t.Substring(s + n);
+        int tag = FindTag(t, element);
         if (tag < 0) return null;
-        int at = tag + "<ProfileSpecificGameProfile".Length;
-        return t.Substring(0, at) + " HelpCrosshair=\"0\"" + t.Substring(at);
+        int at = tag + 1 + element.Length;
+        return t.Substring(0, at) + " " + attr + "=\"" + want + "\"" + t.Substring(at);
     }
 
     // Backups first: the file as it was the first time is kept as gamerprofile.xml.fc5vr_backup (never overwritten), and the
-    // file as it was just before this change as gamerprofile.xml.fc5vr_last.
+    // file as it was just before this change as gamerprofile.xml.fc5vr_last. Written byte for byte; a file the player made
+    // read-only is made read-only again.
     static void WriteGameProfile(string p, string t)
     {
         var bak = p + ".fc5vr_backup";
         if (!File.Exists(bak)) File.Copy(p, bak);
         File.Copy(p, p + ".fc5vr_last", true);
         var attrs = File.GetAttributes(p);
-        if ((attrs & FileAttributes.ReadOnly) != 0) File.SetAttributes(p, attrs & ~FileAttributes.ReadOnly);
-        File.WriteAllText(p, t, new UTF8Encoding(false));
+        bool readOnly = (attrs & FileAttributes.ReadOnly) != 0;
+        if (readOnly) File.SetAttributes(p, attrs & ~FileAttributes.ReadOnly);
+        try {
+            File.WriteAllBytes(p, ProfileBytes.GetBytes(t));
+        } finally {
+            if (readOnly) File.SetAttributes(p, File.GetAttributes(p) | FileAttributes.ReadOnly);
+        }
     }
 
     // The system's OpenXR runtime (the one the headset uses), from the Khronos registry key.
@@ -836,12 +894,13 @@ static class Launcher
         all.Add(go);
         var wrong = WrongGameOptions();
         if (wrong == null) go.Set(CheckState.Warn, "not checked: the game has not saved its options yet",
-                                  "The game's options file (" + GameProfilePath + ") is not there yet: start the game once (Flatscreen is fine), then Play in VR offers to set the options the mod needs.");
+                                  "The game's options file (" + GameProfilePath + ") is not there yet: start the game once (Flatscreen is fine). Play in VR and the mod then set the options the mod needs.");
         else if (wrong.Count == 0) go.Set(CheckState.Pass, "set as the mod needs", "Every game option the mod needs is set (" + GameProfilePath + ").");
         else {
             go.Set(CheckState.Warn, WrongLabels(wrong).Count + " not set as the mod needs",
-                   "Game options the VR mod needs, not set yet:\n- " + string.Join("\n- ", WrongLabels(wrong)) + "\n\n\"Change to correct settings\" under this line " +
-                   "(or Play in VR) sets them in " + GameProfilePath + ". Your file is backed up first, beside it.");
+                   "Game options the VR mod needs, not set yet:\n- " + string.Join("\n- ", WrongLabels(wrong)) + "\n\nPlay in VR sets them in " + GameProfilePath +
+                   " (so does \"Change to correct settings\" under this line), and the mod sets them again each time the game starts in VR. " +
+                   "Your other options are kept, and your file is backed up first, beside it. To keep your own: the line \"gameoptions off\" in fc5vr_settings.txt.");
             go.FixLabel = "Change to correct settings";
         }
         return all;
@@ -898,6 +957,8 @@ class LauncherForm : Form
     readonly Label cutscenesInfo = new Label();
     readonly CheckBox skipPopup = new CheckBox();
     readonly Label popupInfo = new Label();
+    readonly CheckBox sessionLogs = new CheckBox();
+    readonly Label sessionLogsInfo = new Label();
     bool dlssKeepFile;   // fc5vr_resolution.txt is not "auto" (a test setup): kept unless the mode is changed
     readonly Button play = new Button();
     // Install checks: one line per Launcher.InstallChecks() entry, a PASS / WARN / FAIL badge each; a line's click shows how to fix it.
@@ -1004,6 +1065,11 @@ class LauncherForm : Form
         AddRow(table, "After a load", skipPopup);
         AddInfo(table, popupInfo);
 
+        // Logs during sessions: F11 Main "Logs during sessions (slower)" ("sessionlogs off" keeps only warnings and errors once in the game).
+        sessionLogs.Text = "Logs during sessions (slower)"; sessionLogs.AutoSize = true;
+        AddRow(table, "Logs", sessionLogs);
+        AddInfo(table, sessionLogsInfo);
+
         // Headset
         headset.DropDownStyle = ComboBoxStyle.DropDownList;
         headset.Width = 200;
@@ -1077,6 +1143,7 @@ class LauncherForm : Form
         dlssKeepFile = dm < 0;
         dlssMode.SelectedIndex = Math.Max(0, dm);
         skipPopup.Checked = Launcher.ReadSkipPopup();
+        sessionLogs.Checked = Launcher.ReadSessionLogs();
 
         vr.CheckedChanged += delegate { UpdateInfo(); };
         scale.SelectedIndexChanged += delegate { UpdateInfo(); };
@@ -1084,6 +1151,7 @@ class LauncherForm : Form
         dlss.CheckedChanged += delegate { UpdateInfo(); };
         cutscenes.SelectedIndexChanged += delegate { UpdateInfo(); };
         skipPopup.CheckedChanged += delegate { UpdateInfo(); };
+        sessionLogs.CheckedChanged += delegate { UpdateInfo(); };
         dlssMode.SelectedIndexChanged += delegate { dlssKeepFile = false; UpdateInfo(); };
         headset.SelectedIndexChanged += delegate { UpdateInfo(); };
         play.Click += delegate { Play(); };
@@ -1161,7 +1229,8 @@ class LauncherForm : Form
         var changed = before.FindAll(l => !left.Contains(l));
         var msg = new StringBuilder();
         if (changed.Count > 0) msg.Append("Set:\n- " + string.Join("\n- ", changed) + "\n\n");
-        if (left.Count > 0) msg.Append("Not in the file yet, so set them in the game's Options:\n- " + string.Join("\n- ", left) + "\n\n");
+        if (left.Count > 0) msg.Append("Not in the file yet (the game has not written that part), so set them in the game's Options:\n- " + string.Join("\n- ", left) + "\n\n");
+        if (changed.Count == 0 && left.Count == 0) msg.Append("Every game option the mod needs was already set.\n\n");
         msg.Append("Your file as it was is kept beside it: " + Path.GetFileName(Launcher.GameProfilePath) + ".fc5vr_last (just before this change) and " +
                    Path.GetFileName(Launcher.GameProfilePath) + ".fc5vr_backup (the first time the launcher changed it). To undo, copy one over gamerprofile.xml.");
         FillChecks();
@@ -1469,6 +1538,10 @@ class LauncherForm : Form
         popupInfo.Text = !isVr ? "Not used in Flatscreen."
                        : skipPopup.Checked ? "Play starts at once after a load; the first seconds can hitch and the sidearm shows once the mod has seen it."
                                            : "After a load, \"VR mod loading\" counts down in the headset while the mod gets your weapons ready; the controllers wait until it closes.";
+        sessionLogs.Enabled = isVr;
+        sessionLogsInfo.Text = !isVr ? "Not used in Flatscreen."
+                             : sessionLogs.Checked ? "The mod logs and measures everything while you play, for bug reports. A little slower. F11 Main can change it in game."
+                                                   : "Once you are in the game, only warnings and errors are logged (the start and crash reports are kept). F11 Main can change it in game.";
         headsetInfo.Text = isVr ? HeadsetText() : "";
     }
 
@@ -1484,7 +1557,7 @@ class LauncherForm : Form
             if (upscaler.SelectedIndex > 0) dlss.Checked = true;   // with DLSS off the mod never calls the upscaler
             if (upscaler.SelectedIndex >= 0) Launcher.WriteUpscaler(upscaler.SelectedIndex);
             Launcher.WriteChoice(flat.Checked, HeadsetId(), render.SelectedIndex == 0, Multiplier(),
-                                 dlss.Checked, dlssKeepFile ? -1 : Math.Max(0, dlssMode.SelectedIndex), cutscenes.SelectedIndex, skipPopup.Checked);
+                                 dlss.Checked, dlssKeepFile ? -1 : Math.Max(0, dlssMode.SelectedIndex), cutscenes.SelectedIndex, skipPopup.Checked, sessionLogs.Checked);
         } catch (Exception e) {
             MessageBox.Show(this, "Could not save the choice in " + Launcher.GameDir + ":\n" + e.Message, "Far Cry 5 VR", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;
@@ -1512,35 +1585,25 @@ class LauncherForm : Form
         watch.Start();
     }
 
-    // VR: the game's own options the mod needs (README "Required game options"), set in the game's file before it starts.
+    // VR: the game's own options the mod needs (README "Required game options"), set in the game's file before it starts,
+    // without asking (author 21 Nov: players answered Yes and still had them wrong; the mod sets them again at its start).
     // False: the player went back to the launcher.
     bool CheckGameOptions()
     {
+        if (Launcher.WrongGameOptions() == null) return true;   // no file yet: the mod sets them once the game has written one
+        var before = Launcher.WrongLabels(Launcher.WrongGameOptions());
         try {
-            Launcher.ForceReticleOff();   // the reticle off without asking (no file yet: the mod sets it once the game has written one)
-        } catch { }
-        var wrong = Launcher.WrongGameOptions();
-        if (wrong == null || wrong.Count == 0) return true;
-        var list = new StringBuilder();
-        foreach (var o in wrong)
-            list.AppendLine("- " + o.Label + "   (" + o.Attr + " is " + (o.Have == null ? "missing" : "\"" + o.Have + "\"") + ")");
-        var answer = MessageBox.Show(this, "These Far Cry 5 options are not the ones the VR mod needs:\n\n" + list +
-                                     "\nSet them now? Yes changes them in the game's options file (" + Launcher.GameProfilePath + "); " +
-                                     "a copy of the file as it was is kept as gamerprofile.xml.fc5vr_last (and the first time as .fc5vr_backup).\n" +
-                                     "No starts the game with your options unchanged. Cancel goes back to the launcher.",
-                                     "Far Cry 5 VR: game options", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning);
-        if (answer == DialogResult.Cancel) return false;
-        if (answer == DialogResult.Yes) {
-            try {
-                Launcher.FixGameOptions();
-            } catch (Exception e) {
-                MessageBox.Show(this, "Could not change the game's options file:\n" + e.Message + "\nSet them in the game's Options instead.", "Far Cry 5 VR",
-                                MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return false;
-            }
-            UpdateInfo();
-            FillChecks();
+            Launcher.FixGameOptions();
+        } catch (Exception e) {
+            var answer = MessageBox.Show(this, "Could not set the game options the VR mod needs in " + Launcher.GameProfilePath + ":\n" + e.Message +
+                                         (before.Count > 0 ? "\n\nNot set:\n- " + string.Join("\n- ", before) : "") +
+                                         "\n\nThe mod tries again when the game starts (its log, fc5vr_log.txt, says how it went in its [GameOptions] lines). " +
+                                         "If they are still wrong in the game, set them in the game's Options.\n\nOK starts the game, Cancel goes back to the launcher.",
+                                         "Far Cry 5 VR: game options", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning);
+            if (answer == DialogResult.Cancel) return false;
         }
+        UpdateInfo();
+        FillChecks();
         return true;
     }
 
