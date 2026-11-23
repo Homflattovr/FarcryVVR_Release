@@ -920,6 +920,16 @@ bool FarCry5Stereo::veh_hands_draw(ID3D11DeviceContext* ctx, UINT count, UINT st
     // A pair of gloves is drawn as the game draws it. Either way the slots no vertex of the mesh uses are zeroed (the padding's triangles).
     if (indirect) {
         const GloveMesh* gm = fc5::rec::is_deferred(ctx) ? nullptr : glove_mesh(ctx, n, start, base);
+        // vehbodyindirect (default on since 23 Nov 14:05Z, author): with the game's
+        // sidearm out while driving the seated body comes only as indirect draws (7725 and 3210 indices; the direct 8988/13545 that gave the
+        // shoulders stop), so the left hand's arm had no fresh shoulder ("[BodyIk] seated: the left hand moved but its arm has no solve yet:
+        // drivehands' fold kept" every 2 s, 13:58-15:04) and only the hand showed. Such a draw is read for its joints (bodyik_veh_joints) and
+        // stays hidden: the hand draws' arms are solved from it, and no sleeve shows in the game's own pose. Off: hidden unread, as before.
+        if (gm && gm->ok && !gm->gloves && gm->arm_side < 0 && m_veh_body_indirect.load() && bodyik_veh_joints(ctx, n, start, base, palette_cb)) {
+            st.hidden++;
+            say(n, 13, fmt::format("hidden, its shoulders read for the arms ({} bones, the seated body drawn indirect; vehbodyindirect)", gm->bones));
+            return false;
+        }
         if (!gm || !gm->ok || (!gm->gloves && gm->arm_side < 0)) {
             st.hidden++;
             say(n, 10, gm && gm->ok ? fmt::format("hidden: its mesh is neither one arm with its hand nor a pair of gloves ({} bones)", gm->bones)

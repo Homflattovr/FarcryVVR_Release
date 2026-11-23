@@ -6,7 +6,7 @@ own hands, a full body (on by default), body gestures to switch, sling and holst
 hands on the real steering wheel, a HUD that floats in front of you, and comfort options for driving, flying and
 cutscenes.
 
-**[Download version 1.0.5](https://github.com/Homflattovr/FarcryVVR_Release/releases/latest)** (the `FC5VR_v1.0.5.zip` file)
+**[Download version 1.0.6](https://github.com/Homflattovr/FarcryVVR_Release/releases/latest)** (the `FC5VR_v1.0.6.zip` file)
 
 **Support this project**: https://ko-fi.com/homard47885
 

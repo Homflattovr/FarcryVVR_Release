@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.6 (23 November 2026)
+Full notes: [release/RELEASE_NOTES_v1.0.6.md](release/RELEASE_NOTES_v1.0.6.md).
+- **Fixed:** driving with the sidearm out, the shots follow the gun (they went straight ahead of the vehicle).
+- **Fixed:** driving with the sidearm out, both arms show (the gun hand's arm and the arm on the wheel or bars).
+- **Fixed:** no more accidental punches with an open hand: a punch needs the grip held (`meleefist off` for the old way).
+- **Changed:** gesture driving: a hand pulled 25 cm off the wheel, bars or stick lets go of it, grip held or not (`drivebreakaway 0` for the old way).
+
 ## 1.0.5 (22 November 2026)
 Full notes: [release/RELEASE_NOTES_v1.0.5.md](release/RELEASE_NOTES_v1.0.5.md).
 - **Fixed:** vehicles: A keeps accelerating while shooting with the sidearm out (other characters' shots no longer

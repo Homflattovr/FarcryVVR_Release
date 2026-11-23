@@ -133,6 +133,34 @@ bool FarCry5Stereo::vehtrans_command(const std::string& cmd, const std::string& 
         persist = true;
         return true;
     }
+    if (cmd == "drivegunaim") {                                                             // drivegunaim on|off (saved, default on; 23 Nov)
+        m_drive_gun_aim = on;
+        spdlog::info("[Vehicle] drivegunaim {}", on ? "on (driving with a weapon out, the game's aim follows the barrel: the shots follow the gun)"
+                                                    : "off (driving, the game's aim stays on the vehicle's front, as before 23 Nov)");
+        persist = true;
+        return true;
+    }
+    if (cmd == "vehgunarm") {                                                               // vehgunarm on|off (saved, default on; 23 Nov)
+        m_veh_gun_arm = on;
+        spdlog::info("[Vehicle] vehgunarm {}", on ? "on (driving with a weapon out, the gun hand's forearm and upper arm from the body under the headset)"
+                                                  : "off (driving with a weapon out, the gun hand alone, as before 23 Nov)");
+        persist = true;
+        return true;
+    }
+    if (cmd == "vehbodyindirect") {                                                         // vehbodyindirect on|off (saved, default on; 23 Nov)
+        m_veh_body_indirect = on;
+        spdlog::info("[Vehicle] vehbodyindirect {}", on ? "on (driving with a weapon out, the seated body's indirect draws read for the arms' shoulders, still hidden)" : "off (the seated body's indirect draws hidden unread, as before 23 Nov)");
+        persist = true;
+        return true;
+    }
+    if (cmd == "drivegunaimgain") {                                                         // drivegunaimgain N (test, not saved)
+        try {
+            m_dga_gain = std::clamp(std::stof(arg), 0.05f, 1.0f);
+        } catch (...) {
+        }
+        spdlog::info("[Vehicle] drivegunaimgain {:.2f}", m_dga_gain.load());
+        return true;
+    }
     if (cmd == "vehdrivegun") { m_veh_drive_gun = on; persist = true; return true; }       // vehdrivegun on|off (saved)
     if (cmd == "ridegun") {                                                                 // ridegun on|off (saved)
         m_ride_gun = on;
@@ -356,6 +384,24 @@ void FarCry5Stereo::draw_vehtrans_menu(const std::function<void(const char*, std
         keep("vehheadingkeep", v ? "vehheadingkeep on" : "vehheadingkeep off");
     }
     hint("The view keeps facing the car's front through slides and jumps.");
+    v = m_drive_gun_aim.load();
+    if (ImGui::Checkbox("Vehicles: driving with a gun out, the shots follow the gun", &v)) {
+        m_drive_gun_aim = v;
+        keep("drivegunaim", v ? "drivegunaim on" : "drivegunaim off");
+    }
+    hint("Shooting while you drive, the bullets go where the gun in your hand points. Off: they go straight ahead of the vehicle.");
+    v = m_veh_gun_arm.load();
+    if (ImGui::Checkbox("Vehicles: driving with a gun out, the gun hand has its arm", &v)) {
+        m_veh_gun_arm = v;
+        keep("vehgunarm", v ? "vehgunarm on" : "vehgunarm off");
+    }
+    hint("Shooting while you drive, your forearm and upper arm are drawn with the hand on the gun. Off: the hand alone.");
+    v = m_veh_body_indirect.load();
+    if (ImGui::Checkbox("Vehicles: driving with a gun out, the other hand keeps its arm", &v)) {
+        m_veh_body_indirect = v;
+        keep("vehbodyindirect", v ? "vehbodyindirect on" : "vehbodyindirect off");
+    }
+    hint("Shooting while you drive, the hand on the wheel or bars keeps its forearm and upper arm. Off: the hand alone.");
     v = m_veh_seat_hold.load();
     if (ImGui::Checkbox("Vehicles: stay in the vehicle while in its seat (boats)", &v)) {
         m_veh_seat_hold = v;

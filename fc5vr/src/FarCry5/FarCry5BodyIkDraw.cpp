@@ -1263,7 +1263,9 @@ bool FarCry5Stereo::bodyik_draw(ID3D11DeviceContext* ctx, UINT count, UINT start
         }
         return false;
     };
-    if (in_vehicle()) return false;   // drivehands places the arms there
+    // drivehands places the arms there. vehgunarm (23 Nov): driving with a weapon out, the weapon pass's hand on the gun (the game's one bare arm
+    // or glove) gets its forearm and upper arm from the body under the headset, as on foot (the author's 08:38 quad drive: the gun hand had no arm).
+    if (in_vehicle() && !(how == 0 && m_veh_gun_arm.load() && game_gun_out())) return false;
     const auto& hm = active_hand_map();   // (mountedhands: on a mount the mounted pass's map, the identity)
     if (!world) {
         if (!m_vs_cb0 || !is_weapon_cb(m_vs_cb0)) return false;
@@ -1602,6 +1604,24 @@ bool FarCry5Stereo::bodyik_veh_hidden(ID3D11DeviceContext* ctx, UINT count, UINT
     st.veh_pal = st.veh_game;
     if (!bodyik_veh(ctx, st.veh_pal, st.veh_game, count, start, base, false)) return false;
     return hands_cb_swap(ctx, st.veh_pal);
+}
+
+// vehbodyindirect (FarCry5VehHands.cpp): a seated body draw that comes indirect (the game's sidearm out while driving: 7725 and 3210 indices)
+// read for its shoulders, elbows and wrists only (bodyik::seat keeps them for the hand draws' arms); the draw itself stays hidden (no palette
+// swapped in, so nothing of it is drawn: no sleeve in the game's own pose next to the arms the mod places). true: read.
+bool FarCry5Stereo::bodyik_veh_joints(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, ID3D11Buffer* palette_cb)
+{
+    if (!fc5::bodyik::on() || !fc5::bodyik::opts().veh || count == 0 || !palette_cb || !veh_hands_active()) return false;
+    if (!m_bk) m_bk = new BodyIkState{};
+    auto& st = *m_bk;
+    {
+        std::lock_guard _{ m_obj_mtx };
+        auto            it = m_bone_data.find(palette_cb);
+        if (it == m_bone_data.end() || it->second.size() < 3072) return false;
+        st.veh_game = it->second;
+    }
+    std::vector<float> scratch = st.veh_game;   // the posed palette is not used: only the joints bodyik::seat keeps
+    return bodyik_veh(ctx, scratch, st.veh_game, count, start, base, false);
 }
 
 // ---- handroles: a mesh's hands from the rest skeleton (fc5::bodyik::hand_roles) ----

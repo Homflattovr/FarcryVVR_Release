@@ -2,7 +2,8 @@
 //
 // Everything is worked out in the recentred reference (x right, y up, z back, origin at the head at the last recentre): the player's real body
 // does not turn with the vehicle, and the game camera sits at that origin, so a control fixed there stays where the vehicle's own wheel is.
-//  - A press that starts within drivegrab of the control holds it until the grip is let go (sticky), wherever the hand goes meanwhile.
+//  - A press that starts within drivegrab of the control holds it until the grip is let go (sticky), or (drivebreakaway cm, saved, default 25,
+//    0 = off; 23 Nov) until the hand has been over that far from the control for 0.2 s.
 //  - Wheel: each holding hand's angle round the wheel's centre, in the wheel's plane; the wheel turns by the holding hands' mean change per poll
 //    (a hand within 4 cm of the centre adds nothing). Clamped to drivewheellock either way. No hand: back to straight in drivecentre seconds.
 //  - Bars: the same about the vertical through the bar's centre (a hand within 6 cm of it horizontally adds nothing).
@@ -115,6 +116,7 @@ namespace fc5::drive
             // and a stick that starts at 0.24 starts with a jump. 0.05 until the dead zone is measured (a smaller step series); full at 1.
             float stick_dead{ 0.05f };
             float grab{ 0.10f };
+            float breakaway{ 0.25f };     // drivebreakaway: m from the control a holding hand lets go of it, grip still held (0: never, as before 23 Nov)
             float centre_s{ 0.30f };
             bool  react{ true };          // drivereact (see the top)
             float react_gain{ 2.0f };     // drivereactgain: the wheel's steering times this
@@ -156,6 +158,7 @@ namespace fc5::drive
         const char* g_why   = "off";
         uint64_t    g_veh   = 0;
         bool        g_held[2]{}, g_grip_was[2]{}, g_near[2]{};
+        clock::time_point g_far_since[2]{};   // drivebreakaway: when each holding hand went past drivebreakaway (zero: within it)
         clock::time_point g_let_go[2]{};      // drivereadyaway: when each hand last let go of the control
         float       g_hand_ang[2]{};          // wheel, bars: each holding hand's angle at the last poll (rad)
         bool        g_hand_ang_ok[2]{};
@@ -550,10 +553,30 @@ namespace fc5::drive
             if (g_held[h] && !grip) {
                 g_held[h] = false;
                 g_let_go[h] = now;
+                g_far_since[h] = {};
                 out.buzz[h] = 0.25f;
                 if (o.log) spdlog::info("[Drive] {} hand let go of the {}{}", side_name(h), style_name(style),
                                         style == kStick ? std::string{} : fmt::format(" (turned {:.0f} deg)", glm::degrees(g_angle)));
                 continue;
+            }
+            // drivebreakaway (author 23 Nov 08:24Z; his 09:22 drive, sidearm out: the left controller went 30-40 cm off the wheel, up to 25 cm above the head's level at 09:22:31.6-32.5,
+            // with the left grip still held, so the hold stayed (sticky: only a grip release let go), the drawn hand stayed on the rim and the hand's
+            // angle about the far wheel kept steering). A holding hand more than drivebreakaway from the control for 0.2 s lets go of it as a
+            // release does; taking it again needs a new press within drivegrab.
+            if (g_held[h] && o.breakaway > 0.0f && in.hand[h].tracked) {
+                if (d <= o.breakaway) g_far_since[h] = {};
+                else if (g_far_since[h] == clock::time_point{}) g_far_since[h] = now;
+                else if (now - g_far_since[h] >= std::chrono::milliseconds(200)) {
+                    g_held[h]        = false;
+                    g_let_go[h]      = now;
+                    g_far_since[h]   = {};
+                    g_hand_ang_ok[h] = false;
+                    out.buzz[h]      = 0.25f;
+                    if (o.log) spdlog::info("[Drive] {} hand pulled off the {} ({:.0f} cm from it, grip still held): let go (drivebreakaway {:.0f} cm){}", side_name(h),
+                                            style_name(style), d * 100.0f, o.breakaway * 100.0f,
+                                            style == kStick ? std::string{} : fmt::format("; turned {:.0f} deg", glm::degrees(g_angle)));
+                    continue;
+                }
             }
             if (!g_held[h] && press && d <= o.grab) {
                 g_held[h]        = true;
@@ -1225,6 +1248,12 @@ namespace fc5::drive
         } else if (cmd == "drivegrab") {
             o.grab = std::clamp(num(0.10f), 0.03f, 0.30f);
             spdlog::info("[Drive] drivegrab {:.3f} m", o.grab);
+        } else if (cmd == "drivebreakaway") {   // drivebreakaway cm (saved, default 25; 0 = off)
+            o.breakaway = std::clamp(num(25.0f), 0.0f, 100.0f) * 0.01f;
+            if (o.breakaway > 0.0f && o.breakaway < o.grab + 0.05f) o.breakaway = o.grab + 0.05f;
+            spdlog::info("[Drive] drivebreakaway {}", o.breakaway > 0.0f ? fmt::format("{:.0f} cm: a hand pulled that far off the wheel, bars or stick lets go of it, grip held or not",
+                                                                                    o.breakaway * 100.0f)
+                                                                         : std::string{ "off: a hand holds until its grip is let go, wherever it goes (as before 23 Nov)" });
         } else if (cmd == "drivereact") {
             o.react = on;
             spdlog::info("[Drive] drivereact {}", on ? fmt::format("on: wheel steering x{:.1f}, the game's dead zone {:.2f} skipped, lead {:.3f} s", o.react_gain, o.react_dead, o.react_lead)
@@ -1657,6 +1686,9 @@ namespace fc5::drive
         float g = o.grab * 100.0f;
         if (ImGui::SliderFloat("Reach to grab (cm)##drivegrab", &g, 3.0f, 30.0f, "%.0f")) cmds += fmt::format("drivegrab {:.3f}\n", g * 0.01f);
         hint("How close your hand must be to the wheel, handlebars or stick to grab it.");
+        float ba = o.breakaway * 100.0f;
+        if (ImGui::SliderFloat("Pull away to let go (cm, 0: only the grip)##drivebreakaway", &ba, 0.0f, 60.0f, "%.0f")) cmds += fmt::format("drivebreakaway {:.0f}\n", ba);
+        hint("Pull your hand this far off the wheel, handlebars or stick and it lets go, even with the grip still held. 0: it holds until you let go of the grip.");
         float c = o.centre_s;
         if (ImGui::SliderFloat("Back to straight when let go (s)##drivecentre", &c, 0.0f, 3.0f, "%.2f")) cmds += fmt::format("drivecentre {:.2f}\n", c);
         hint("How quickly the wheel goes back to straight when you let go. 0: at once.");

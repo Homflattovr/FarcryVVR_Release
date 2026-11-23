@@ -1,6 +1,6 @@
 FAR CRY 5 VR MOD - {RELEASE}, build of {DATE} (commit {SHA})
 
-Version 1.0.5. Read KNOWN_ISSUES.txt before you report something.
+Version 1.0.6. Read KNOWN_ISSUES.txt before you report something.
 It works with the Steam copy and the Ubisoft Connect copy of Far Cry 5. A copy bought on the Epic Games Store
 runs through Ubisoft Connect too: follow the Ubisoft Connect steps for it.
 

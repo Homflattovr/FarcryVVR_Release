@@ -1,4 +1,4 @@
-Far Cry 5 VR - 1.0.5: known issues
+Far Cry 5 VR - 1.0.6: known issues
 
 Things we already know about (no need to report them, unless they look worse than described):
 

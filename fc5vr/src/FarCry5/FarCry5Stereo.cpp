@@ -16479,7 +16479,7 @@ bool FarCry5Stereo::update_motion(int frame, const glm::mat3& game_rot, const gl
         // planelook (FarCry5PlaneLook.cpp): in a flying vehicle, what the game held back of the head look is put right from the
         // vehicle's own model (looking down no longer reads as the nose going up).
         v2w_a = glm::transpose(plane_look_fix(frame, glm::transpose(v2w_a)));
-        if (m_veh_pitch_guard.load() && !m_veh_aircraft && !(m_plane_blend > 0.0f)) {
+        if (m_veh_pitch_guard.load() && !m_veh_aircraft && !(m_plane_blend > 0.0f) && !m_dga_on) {   // drivegunaim: the aim's pitch is the gun's, not the car's
             // vehpitchguard (author 23 Oct):
             // if the game holds its vehicle camera at a pitch limit, the camera minus the offset handed reads as the car nosing up
             // while the head looks down, and the view (which follows the car's attitude) is pushed up. With the head look's pitch
@@ -17346,7 +17346,16 @@ void FarCry5Stereo::motion_post_present(float dt)
         m_last_sent_x = 0;
         const bool pairs = m_frame_double.load() && m_stereo2.load();
         if (!pairs || (m_frame.load() & 1) == 1) {
-            veh_aim_front_step(yaw_c);   // vehaimfront: after a settle, the game's aim turned onto the vehicle's front (FarCry5VehTransition.cpp)
+            // drivegunaim: a weapon out while driving: the game's aim onto the barrel (the shots follow the gun), else the vehicle's front.
+            const bool dga = drive_gun_aim_now();
+            if (dga != m_dga_on) {
+                m_dga_on = dga;
+                spdlog::info("[Vehicle] drivegunaim: {}", dga ? "a weapon out while driving: the game's aim follows the barrel (the head look keeps the view on the head)"
+                                                              : "no weapon out: the game's aim back onto the vehicle's front");
+                if (!dga && m_veh_aim_front.load() && m_in_vehicle.load() && m_veh_driving.load()) veh_aim_front_arm(std::chrono::steady_clock::now(), "drivegunaim: the weapon put away");
+            }
+            if (dga) drive_gun_aim_step(yaw_c, pit_c);
+            else veh_aim_front_step(yaw_c);   // vehaimfront: after a settle, the game's aim turned onto the vehicle's front (FarCry5VehTransition.cpp)
             const glm::vec3 h  = glm::normalize(m_mo.head_world);
             // The head's direction in the game camera's own frame (left / up of its view): world yaw and pitch flip when a
             // nose passes vertical in a loop (the culled camera ended up behind the head, the author's 14 Oct flights).
@@ -18814,6 +18823,54 @@ void FarCry5Stereo::veh_aim_front_step(float yaw_c)
     m_vaf_aim_at_send = aim;
     m_vaf_sends++;
     m_vaf_wait_until  = m_ev_updates + 8;   // the send lands in 1-3 game updates, the camera carrying it ~3 more
+}
+
+// drivegunaim (see FarCry5Stereo.h): a weapon in the game's hands while driving a ground vehicle with the head look on.
+bool FarCry5Stereo::drive_gun_aim_now() const
+{
+    const int  type   = m_veh_game_type;
+    const bool ground = type == 0 || type == 1 || type == 3;
+    return m_drive_gun_aim.load() && m_in_vehicle.load() && m_veh_driving.load() && m_veh_settle.load() == 0 && ground && !m_veh_aircraft && !m_chute_vehicle &&
+           !m_bomb_on && !air_follow_attitude() && game_gun_out() && m_mo.ctrl_valid && m_mo.ev_ok && !m_mo.slung && !m_menu_screen_on && foreground_is_game() &&
+           glm::length(m_mo.aim_world) > 0.5f;
+}
+
+// drivegunaim: once per head look update. The game's aim (the camera less the Extended View offset it carries) is turned onto the barrel's
+// line (aim_world: from the game camera to where the barrel's ray meets the scene) by the mouse, a share of the error each update (a send
+// shows in the camera about three updates later; the whole error each update would overshoot). vehaimfront and vehheadingkeep stand idle.
+void FarCry5Stereo::drive_gun_aim_step(float yaw_c, float pit_c)
+{
+    m_vaf_state     = 0;
+    m_vhk_aim_off_n = 0;
+    const glm::vec3 b     = glm::normalize(m_mo.aim_world);
+    const float     ay    = yaw_c - m_mo.ev_oy, ap = pit_c - m_mo.ev_op;
+    const float     ey    = std::remainder(yaw_of(b) - ay, glm::two_pi<float>());
+    const float     ep    = std::asin(std::clamp(b.z, -1.0f, 1.0f)) - ap;
+    const float     err   = glm::degrees(std::sqrt(ey * ey + ep * ep));
+    const float     g     = std::clamp(m_dga_gain.load(), 0.05f, 1.0f);
+    const float     scale = std::clamp(m_deg_per_count, 0.002f, 2.0f);
+    const int       mx    = int(20.0f / scale);   // at most 20 deg a send
+    int dx = std::abs(glm::degrees(ey)) < 0.1f ? 0 : std::clamp(int(std::lround(-glm::degrees(ey) * g / scale)), -mx, mx);
+    int dy = std::abs(glm::degrees(ep)) < 0.1f ? 0 : std::clamp(int(std::lround(-glm::degrees(ep) * g / scale)), -mx, mx);
+    if ((dx != 0 || dy != 0) && !m_mouse_drop.load()) {
+        send_mouse(dx, dy, false, false);
+        record_send(dx, dy);
+        m_dga_sends++;
+    }
+    m_aim_err_deg = err;
+    m_aim_err_max = std::max(m_aim_err_max, err);
+    m_dga_n++;
+    m_dga_err_sum += err;
+    m_dga_err_max = std::max(m_dga_err_max, err);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - m_dga_said >= std::chrono::seconds(5)) {
+        m_dga_said = now;
+        spdlog::info("[Vehicle] drivegunaim last 5 s: the game's aim {:.2f} deg from the barrel's line on average, worst {:.2f}, over {} updates, {} sends ({:.4f} deg per count, "
+                     "gain {:.2f}); the head look's offset now yaw {:.0f} pitch {:.0f} deg", m_dga_n ? m_dga_err_sum / float(m_dga_n) : -1.0f, m_dga_err_max, m_dga_n, m_dga_sends,
+                     scale, g, glm::degrees(m_ev_yaw), glm::degrees(m_ev_pitch));
+        m_dga_n = m_dga_sends = 0;
+        m_dga_err_sum = m_dga_err_max = 0.0f;
+    }
 }
 
 // Mouse counts by the game Tobii update they were sent at (firemeasure: which sends a camera already holds).

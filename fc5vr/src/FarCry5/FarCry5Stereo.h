@@ -1835,6 +1835,29 @@ public:
     void              veh_aim_front_arm(std::chrono::steady_clock::time_point now, const char* why);
     void              veh_aim_front_step(float yaw_c);
     bool              veh_cam_in_axes(glm::vec3& out) const;
+    // drivegunaim on|off (saved, default on; 23 Nov, the author's 08:38 quad drive: the driver's sidearm shots went to the vehicle's front, not
+    // where the gun pointed): while driving with the head look on, the game's aim stayed on the front (vehaimfront, vehheadingkeep) and only
+    // the Extended View offset followed the head, so the drive-and-shoot shots never followed the gun. With a weapon in the game's hands
+    // while driving a ground vehicle, the head look's update turns the game's aim (the camera less the offset it carries) onto the barrel
+    // by the mouse, as on foot; the Extended View offset, read against that aim, keeps the culled camera on the head. Put away: the aim
+    // goes back onto the front (vehaimfront). Not with groundfollow (that body frame follows the aim's attitude). Off: as before.
+    std::atomic<bool> m_drive_gun_aim{ true };
+    std::atomic<float> m_dga_gain{ 0.35f };      // drivegunaimgain (test, not saved): the share of the error sent each update (the send shows ~3 updates later)
+    bool              m_dga_on{ false };          // drivegunaim steering now
+    uint64_t          m_dga_n{ 0 }, m_dga_sends{ 0 };
+    float             m_dga_err_sum{ 0.0f }, m_dga_err_max{ 0.0f };
+    std::chrono::steady_clock::time_point m_dga_said{};
+    // vehgunarm on|off (saved, default on; 23 Nov, author): driving with a weapon out, the
+    // weapon pass's hand on the gun gets its forearm and upper arm from the body under the headset (bodyik_draw, as on foot; until now every
+    // arm draw returned at "drivehands places the arms there", and drivehands has no arm for the gun hand). Off: the hand alone, as before.
+    std::atomic<bool> m_veh_gun_arm{ true };
+    // vehbodyindirect on|off (saved, default on since 23 Nov 14:05Z; author): the seated
+    // body's indirect draws (the game's sidearm out while driving) read for their shoulders (bodyik_veh_joints) and kept hidden, so the left hand's
+    // arm on the wheel or bars is solved as without the weapon. Off: hidden unread, as before.
+    std::atomic<bool> m_veh_body_indirect{ true };
+    bool              bodyik_veh_joints(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, ID3D11Buffer* palette_cb);
+    bool              drive_gun_aim_now() const;
+    void              drive_gun_aim_step(float yaw_c, float pit_c);
     bool              m_vf_init{ false };        // the running follow's start is taken (reset when a settle starts)
     float             m_vf_body0{ 0.0f };        // the body yaw at the follow's start
     float             m_vf_cam_last{ 0.0f };     // the game camera's yaw at the last step
@@ -4345,6 +4368,7 @@ private:
     // Instant melee (author 26 Oct 12:44).
     std::atomic<bool>  m_mel_ray{ false };         // meleeray on|off (saved): the game's physics rays instead of the capsules (FarCry5GameRay.cpp)
     std::atomic<bool>  m_mel_collide{ true };      // meleecollide (saved, default on, only with meleeray): a melee weapon's drawn blade lies against what it meets
+    std::atomic<bool>  m_mel_fist{ true };         // meleefist (saved, default on; 23 Nov): the bare hand presses the game's melee only as a fist (the weapon hand's grip held)
     std::atomic<bool>  m_mel_grip_fist{ true };    // meleegripfist (saved, default on; 15 Nov): the hand on a melee weapon is the empty hand's fist (grip pose, centre on the controller)
     glm::quat          m_mel_col_q{ 1.0f, 0.0f, 0.0f, 0.0f };   // the blade's turn now, in the controller's axes (under m_mel_mtx)
     std::atomic<bool>  m_mel_ray_sound{ true };    // meleeraysound (saved): the game's melee hit sound at a contact

@@ -71,6 +71,9 @@
 //    (emptyhandalign's), its centre on the controller's point (where the empty hand's centre goes), the weapon where the game holds it in that
 //    hand. Off: melee fix 8's gun hold (the palm as on the last gun, its centre 12 cm off). The weapon's place in the game's hand is kept in
 //    fc5vr_gunposes.txt ("mhold" lines) either way, so a session's first grab no longer shows the game's pose for 2 s.
+//  - meleefist on|off (saved, default on; 23 Nov, author 07:39Z): the bare hand (no weapon,
+//    or the weapon on the sling) presses the game's melee only while the weapon hand's grip is held, a closed fist; an open hand that meets
+//    someone still pulses and logs "not pressed: the bare hand was open", and the game does no blow. Off: as before.
 //  - Tests: meleetest x y z [s] (a body standing at x right, y ahead, z up from the game camera, for s seconds, default 20), meleepress
 //    (the press now, straight ahead), meleelog N (N seconds of the bodies seen, one line a second).
 #include "FarCry5Stereo.h"
@@ -575,6 +578,12 @@ bool FarCry5Stereo::melee_command(const std::string& cmd, const std::string& arg
         m_mel_grip_fist = arg != "off" && arg != "0";
         persist         = true;
         spdlog::info("[Melee] meleegripfist {}", m_mel_grip_fist.load() ? "on (a melee weapon held by the empty hand's fist on the controller)" : "off (held by the gun hold)");
+        return true;
+    }
+    if (cmd == "meleefist") {
+        m_mel_fist = arg != "off" && arg != "0";
+        persist    = true;
+        spdlog::info("[Melee] meleefist {}", m_mel_fist.load() ? "on (the bare hand hits only as a fist: the weapon hand's grip held)" : "off (the open hand hits too, as before 23 Nov)");
         return true;
     }
     if (cmd == "meleecollide") { m_mel_collide = arg != "off" && arg != "0"; persist = true; spdlog::info("[Melee] meleecollide {}", m_mel_collide.load() ? "on" : "off"); return true; }
@@ -1749,6 +1758,16 @@ void FarCry5Stereo::melee_hit_frame()
     // of a grab from the sling or an equip (the grab's own fast motion past the body is no blow); and only at a contact with a drawn character
     // (kEarlyPress false: no press on a swing that has not touched one, whatever meleeearly says).
     auto press_blocked = [&]() {
+        // meleefist (author 23 Nov 07:39Z; his 08:37:43 log: weapon on the sling, the open
+        // hand 3.6 m/s, then 6.3 m/s, into an NPC 0.6 m in front after a sprint, no grip pressed: two presses of the game's melee, the NPC killed):
+        // the bare hand (no weapon, or the weapon on the sling or kept) presses the game's melee only while its grip is held (a closed fist).
+        if (!armed && m_mel_fist.load() && !m_grip_held.load()) {
+            if (now - m_mel_nopress_said > std::chrono::milliseconds(500)) {
+                m_mel_nopress_said = now;
+                spdlog::info("[Melee] the game's melee not pressed: the bare hand was open (meleefist: a punch needs the grip held)");
+            }
+            return true;
+        }
         const auto g = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_mel_grab_t).count();
         const auto e = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_wsig_t).count();
         if (g >= 500 && (e >= 500 || (kEquipBareNoBlock && fc5::gameweapon::bare_hands(m_weapon_sig.load())))) return false;
@@ -2185,6 +2204,12 @@ void FarCry5Stereo::draw_melee_menu(const std::function<void(const char*, std::s
         keep("meleegripfist", gf ? "meleegripfist on" : "meleegripfist off");
     }
     hint("Your hand on a melee weapon sits as it does in a closed fist.");
+    bool mf = m_mel_fist.load();
+    if (ImGui::Checkbox("Punch only with a closed fist (grip held)##meleefist", &mf)) {
+        m_mel_fist = mf;
+        keep("meleefist", mf ? "meleefist on" : "meleefist off");
+    }
+    hint("With no weapon in your hand, a hit counts only while you hold the grip. Off: an open hand moving into someone hits too.");
     if (m != 0) {
         if (sub("Swing and button##melsub")) {
             float sp = m_melee_speed.load();
